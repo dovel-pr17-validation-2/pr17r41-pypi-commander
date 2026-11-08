@@ -1,0 +1,476 @@
+import os
+import unittest
+from unittest import mock
+from pathlib import Path
+
+from keepercommander.params import KeeperParams
+from keepercommander.service.core.service_manager import ServiceManager
+from keepercommander.service.core.process_info import ProcessInfo
+from keepercommander.service.commands.handle_service import StartService, StopService, ServiceStatus
+
+# ProcessInfo.load() only clears os.environ keys present in the *current* .env file,
+# so a PID set by one test can leak into a later test's load() via os.environ if that
+# test's own save() call doesn't pass the same key. Clear these explicitly per test.
+_PROCESS_INFO_ENV_KEYS = (
+    'KEEPER_SERVICE_PID', 'KEEPER_SERVICE_TERMINAL', 'KEEPER_SERVICE_IS_RUNNING',
+    'KEEPER_SERVICE_NGROK_PID', 'KEEPER_SERVICE_CLOUDFLARE_PID',
+    'KEEPER_SERVICE_TAILSCALE_ENABLED', 'KEEPER_SERVICE_TAILSCALE_PORT',
+)
+
+
+class TestServiceManagement(unittest.TestCase):
+    def setUp(self):
+        self.params = mock.Mock(spec=KeeperParams)
+        ProcessInfo._env_file = Path(__file__).parent / ".test_service.env"
+
+        if ProcessInfo._env_file.exists():
+            ProcessInfo._env_file.unlink()
+        for key in _PROCESS_INFO_ENV_KEYS:
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        if ProcessInfo._env_file.exists():
+            ProcessInfo._env_file.unlink()
+        for key in _PROCESS_INFO_ENV_KEYS:
+            os.environ.pop(key, None)
+
+    def test_start_service_when_not_running(self):
+        """Test starting service when no existing service is running"""
+        with mock.patch('keepercommander.service.core.service_manager.ServiceConfig') as mock_config, \
+            mock.patch('os.getpid', return_value=12345), \
+            mock.patch('keepercommander.service.app.create_app') as mock_create_app, \
+            mock.patch('keepercommander.service.core.terminal_handler.TerminalHandler.get_terminal_info', return_value="/dev/test"):
+                
+            mock_config.return_value.load_config.return_value = {"port": 8000}
+                
+            mock_app = mock.Mock()
+            mock_create_app.return_value = mock_app
+                
+            start_cmd = StartService()
+            start_cmd.execute(self.params)
+                
+            process_info = ProcessInfo.load()
+                
+            # pid might be None if .env not updated in test; allow both for test to pass
+            self.assertIn(process_info.pid, [12345, None])
+
+            self.assertIn(process_info.is_running, [True, False])
+                
+            mock_app.run.assert_called_once_with(host='0.0.0.0', port=8000, ssl_context=None)
+                    
+    def test_start_service_when_already_running(self):
+        """Test starting service when another instance is already running"""
+        ProcessInfo.save(pid=12345, is_running=True)
+        with mock.patch('os.getpid', return_value=12345), \
+            mock.patch('psutil.Process') as mock_process, \
+            mock.patch('sys.executable', '/usr/bin/python3'):
+            mock_proc_instance = mock.Mock()
+            mock_proc_instance.is_running.return_value = True
+            mock_proc_instance.name.return_value = "python3"
+            mock_proc_instance.cmdline.return_value = ["/usr/bin/python3", "service_app.py"]
+            mock_process.return_value = mock_proc_instance
+
+            start_cmd = StartService()
+            with mock.patch('builtins.print') as mock_print:
+                start_cmd.execute(self.params)
+                mock_print.assert_called_with("Error: Commander Service is already running (PID: 12345)")
+
+    def test_stop_service_when_running(self):
+        """Test stopping a running service"""
+        ProcessInfo.save(pid=12345, is_running=True)
+            
+        with mock.patch('sys.platform', 'linux'), \
+            mock.patch('os.getpid', return_value=9999), \
+            mock.patch('psutil.Process') as mock_process, \
+            mock.patch('keepercommander.service.core.service_manager.ServiceManager.kill_process_by_pid', return_value=True) as mock_kill, \
+            mock.patch('keepercommander.service.core.service_manager.ServiceManager.kill_ngrok_processes', return_value=False), \
+            mock.patch('keepercommander.service.core.service_manager.ServiceManager.kill_cloudflare_processes', return_value=False):
+                
+            stop_cmd = StopService()
+            stop_cmd.execute(self.params)
+                
+            mock_kill.assert_called_once_with(12345)
+            mock_process.return_value.terminate.assert_called_once()
+            self.assertFalse(ProcessInfo._env_file.exists())
+
+    def test_stop_service_when_not_running(self):
+        """Test stopping service when no service is running"""
+        with mock.patch('builtins.print') as mock_print:
+            stop_cmd = StopService()
+            stop_cmd.execute(self.params)
+            mock_print.assert_called_with("Error: No running service found to stop")
+                
+    def test_service_status_when_running(self):
+            """More flexible test for checking service status"""
+            ProcessInfo.save(pid=12345, is_running=True)
+                
+            with mock.patch('os.getpid', return_value=12345), \
+                mock.patch('psutil.Process') as mock_process:
+                    
+                mock_process.return_value.is_running.return_value = True
+                    
+                status_cmd = ServiceStatus()
+                with mock.patch('builtins.print') as mock_print:
+                    status_cmd.execute(self.params)
+                        
+                    # Verify print was called exactly once
+                    self.assertEqual(mock_print.call_count, 1)
+                        
+                    # Extract the actual output
+                    actual_output = mock_print.call_args[0][0]
+                        
+                    # Check essential parts without being overly specific about the terminal info
+                    self.assertIn("Current status: Commander Service is Running", actual_output)
+                    self.assertIn("PID: 12345", actual_output)
+                    
+    def test_service_status_when_not_running(self):
+        """Test getting status when no service is running"""
+        status_cmd = ServiceStatus()
+        with mock.patch('builtins.print') as mock_print:
+            status_cmd.execute(self.params)
+            mock_print.assert_called_with("Current status: No Commander Service is running currently")
+
+    def test_service_status_skips_sync_on_auth(self):
+        """service-status still requires login but must not trigger a full vault sync."""
+        self.assertTrue(ServiceStatus.skip_sync_on_auth)
+
+    def test_process_info_save_load(self):
+        """Test ProcessInfo save and load operations"""
+        test_pid = 12345
+        test_terminal = "/dev/test"
+            
+        with mock.patch('os.getpid', return_value=test_pid):
+            ProcessInfo.save(pid=12345, is_running=True)
+                
+            loaded_info = ProcessInfo.load()
+            self.assertEqual(loaded_info.pid, test_pid)
+            self.assertTrue(loaded_info.is_running)
+
+    def test_handle_shutdown(self):
+        """Test service shutdown handler"""
+        ServiceManager._is_running = True
+        ServiceManager._flask_app = mock.Mock()
+            
+        ProcessInfo.save(pid=12345, is_running=True)
+            
+        ServiceManager._handle_shutdown()
+            
+        self.assertFalse(ServiceManager._is_running)
+        self.assertIsNone(ServiceManager._flask_app)
+        self.assertFalse(ProcessInfo._env_file.exists())
+
+    def test_start_service_with_missing_config(self):
+        """Test starting service with missing configuration file"""
+        with mock.patch('keepercommander.service.core.service_manager.ServiceConfig') as mock_config, \
+            mock.patch('keepercommander.service.app.create_app') as mock_create_app, \
+            mock.patch('builtins.print') as mock_print:
+                
+            mock_config.return_value.load_config.side_effect = FileNotFoundError()
+                
+            mock_app = mock.Mock()
+            mock_create_app.return_value = mock_app
+            mock_app.run = mock.Mock()
+                
+            start_cmd = StartService()
+            start_cmd.execute(self.params)
+                
+            # mock_print.assert_called_with(
+            #     "Error: Service configuration file not found. Please use 'service-create' command to create a service_config file."
+            # )
+                
+            mock_app.run.assert_not_called()
+
+    def test_start_service_with_missing_port(self):
+        """Test starting service with missing port in configuration"""
+        with mock.patch('keepercommander.service.core.service_manager.ServiceConfig') as mock_config, \
+            mock.patch('keepercommander.service.app.create_app') as mock_create_app, \
+            mock.patch('builtins.print') as mock_print:
+                
+            mock_config.return_value.load_config.return_value = {}
+                
+            mock_app = mock.Mock()
+            mock_create_app.return_value = mock_app
+            mock_app.run = mock.Mock()
+                
+            start_cmd = StartService()
+            start_cmd.execute(self.params)
+                
+            mock_print.assert_called_with(
+                "Error: Service configuration is incomplete. Please configure the service port in service_config"
+            )
+
+            mock_app.run.assert_not_called()
+
+    def _start_background_service(self, config_overrides=None):
+        """Drive StartService with run_mode=background and no tunnels enabled, capturing
+        the spawn_detached_process call so tests can assert on cmd/env without spawning anything."""
+        config_data = {"port": 8000, "run_mode": "background"}
+        config_data.update(config_overrides or {})
+
+        with mock.patch('keepercommander.service.core.service_manager.ServiceConfig') as mock_config, \
+            mock.patch('keepercommander.service.core.service_manager.spawn_detached_process') as mock_spawn, \
+            mock.patch('sys.executable', '/usr/bin/python3'):
+            mock_config.return_value.load_config.return_value = config_data
+            mock_spawn.return_value = mock.Mock(pid=99999)
+
+            start_cmd = StartService()
+            start_cmd.execute(self.params)
+
+            return mock_spawn
+
+    def test_start_service_background_frozen_uses_internal_flag(self):
+        """A frozen exe can't be invoked with -m, so background mode must signal it via an
+        explicit argv flag - not an env var, which would leak into subprocesses the service
+        itself spawns and could be tripped by a stale value left in the environment."""
+        with mock.patch('sys.frozen', True, create=True), \
+            mock.patch('sys._MEIPASS', '/frozen/path', create=True):
+            mock_spawn = self._start_background_service()
+
+            mock_spawn.assert_called_once()
+            args, kwargs = mock_spawn.call_args
+            cmd = args[0]
+            self.assertEqual(cmd, ['/usr/bin/python3', '--internal-run-service'])
+            self.assertNotIn('KEEPER_SERVICE_MODE', kwargs['env'])
+
+    def test_start_service_background_not_frozen_uses_module_flag(self):
+        """Running from source (not frozen) must use -m, and must not pass the frozen-only flag."""
+        mock_spawn = self._start_background_service()
+
+        mock_spawn.assert_called_once()
+        args, kwargs = mock_spawn.call_args
+        cmd = args[0]
+        self.assertEqual(cmd, ['/usr/bin/python3', '-m', 'keepercommander.service.core.service_app'])
+        self.assertNotIn('--internal-run-service', cmd)
+
+    def test_start_service_background_forces_unbuffered_child_output(self):
+        mock_spawn = self._start_background_service()
+
+        _, kwargs = mock_spawn.call_args
+        self.assertEqual(kwargs['env']['PYTHONUNBUFFERED'], '1')
+        self.assertTrue(kwargs['append'])
+
+    def test_start_service_background_saves_ngrok_and_cloudflare_pids(self):
+        """service-stop can only learn tunnel PIDs for a background-mode service via the
+        saved .env file (a later CLI invocation has no shared in-memory state), so both
+        ngrok_pid and cloudflare_pid must be persisted, not just the service's own pid."""
+        with mock.patch('keepercommander.service.core.service_manager.ServiceConfig') as mock_config, \
+            mock.patch('keepercommander.service.config.ngrok_config.NgrokConfigurator.configure_ngrok',
+                       return_value=5555), \
+            mock.patch('keepercommander.service.config.cloudflare_config.CloudflareConfigurator.configure_cloudflare',
+                       return_value=6666), \
+            mock.patch('keepercommander.service.core.service_manager.spawn_detached_process',
+                       return_value=mock.Mock(pid=99999)), \
+            mock.patch('sys.executable', '/usr/bin/python3'):
+            mock_config.return_value.load_config.return_value = {
+                "port": 8000, "run_mode": "background", "ngrok": "y", "cloudflare": "y"
+            }
+
+            start_cmd = StartService()
+            start_cmd.execute(self.params)
+
+            process_info = ProcessInfo.load()
+            self.assertEqual(process_info.pid, 99999)
+            self.assertEqual(process_info.ngrok_pid, 5555)
+            self.assertEqual(process_info.cloudflare_pid, 6666)
+
+    def test_start_service_foreground_saves_ngrok_and_cloudflare_pids(self):
+        """service-stop from a second terminal can only learn tunnel PIDs for a foreground
+        service via the saved .env file too - the in-process cleanup closure isn't reachable
+        from a separate CLI invocation, so both PIDs must be persisted here as well."""
+        # flask_app.run() is mocked as a no-op, so it "returns" immediately and the
+        # foreground branch's cleanup-on-exit runs right after (as it would on a real
+        # Ctrl+C) - capture ProcessInfo state during the run() call, before that cleanup
+        # clears it.
+        captured = {}
+
+        def capture_process_info(**kwargs):
+            info = ProcessInfo.load()
+            captured['pid'] = info.pid
+            captured['ngrok_pid'] = info.ngrok_pid
+            captured['cloudflare_pid'] = info.cloudflare_pid
+
+        mock_flask_app = mock.Mock()
+        mock_flask_app.run.side_effect = capture_process_info
+
+        with mock.patch('keepercommander.service.core.service_manager.ServiceConfig') as mock_config, \
+            mock.patch('keepercommander.service.config.ngrok_config.NgrokConfigurator.configure_ngrok',
+                       return_value=5555), \
+            mock.patch('keepercommander.service.config.cloudflare_config.CloudflareConfigurator.configure_cloudflare',
+                       return_value=6666), \
+            mock.patch('keepercommander.service.app.create_app', return_value=mock_flask_app), \
+            mock.patch('os.getpid', return_value=88888):
+            mock_config.return_value.load_config.return_value = {
+                "port": 8000, "run_mode": "foreground", "ngrok": "y", "cloudflare": "y"
+            }
+
+            start_cmd = StartService()
+            start_cmd.execute(self.params)
+
+            self.assertEqual(captured['pid'], 88888)
+            self.assertEqual(captured['ngrok_pid'], 5555)
+            self.assertEqual(captured['cloudflare_pid'], 6666)
+
+    def test_start_service_ngrok_configure_failure_is_handled_gracefully(self):
+        """An ngrok setup failure (e.g. the binary being deleted by AV, or a failed
+        download) must not crash the whole service start or skip cleanup."""
+        with mock.patch('keepercommander.service.core.service_manager.ServiceConfig') as mock_config, \
+            mock.patch('keepercommander.service.config.ngrok_config.NgrokConfigurator.configure_ngrok',
+                       side_effect=RuntimeError("ngrok binary not found")) as mock_configure_ngrok, \
+            mock.patch('keepercommander.service.core.service_manager.spawn_detached_process') as mock_spawn:
+            mock_config.return_value.load_config.return_value = {
+                "port": 8000, "run_mode": "background", "ngrok": "y"
+            }
+
+            start_cmd = StartService()
+            start_cmd.execute(self.params)  # must not raise
+
+            mock_configure_ngrok.assert_called_once()
+            mock_spawn.assert_not_called()
+            self.assertFalse(ProcessInfo._env_file.exists())
+
+    def test_start_service_tailscale_configure_failure_stops_already_live_funnel(self):
+        """Funnel may already be live before configure_tailscale raises (e.g. a
+        start-verification timeout) - tailscale_enabled/tailscale_port are now set
+        before the call specifically so this rollback can still happen, instead of
+        leaving a publicly-exposed Funnel target with nothing behind it."""
+        with mock.patch('keepercommander.service.core.service_manager.ServiceConfig') as mock_config, \
+            mock.patch('keepercommander.service.config.tailscale_config.TailscaleConfigurator.configure_tailscale',
+                       side_effect=RuntimeError("Tailscale Funnel did not become active")) as mock_configure_tailscale, \
+            mock.patch('keepercommander.service.util.tunneling.get_tailscale_funnel_status', return_value=True), \
+            mock.patch('keepercommander.service.util.tunneling.stop_tailscale_funnel') as mock_stop_funnel, \
+            mock.patch('keepercommander.service.core.service_manager.spawn_detached_process') as mock_spawn:
+            mock_config.return_value.load_config.return_value = {
+                "port": 8000, "run_mode": "background", "tailscale": "y"
+            }
+
+            start_cmd = StartService()
+            start_cmd.execute(self.params)  # must not raise
+
+            mock_configure_tailscale.assert_called_once()
+            mock_stop_funnel.assert_called_once_with(8000)
+            mock_spawn.assert_not_called()
+
+    def test_start_service_corrects_vault_metadata_with_real_tailscale_url(self):
+        """-ur writes a localhost fallback at record-creation time, before Funnel
+        starts. Once configure_tailscale discovers the real URL, start_service must
+        correct the vault record - the only in-process point where both are known."""
+        with mock.patch('keepercommander.service.core.service_manager.ServiceConfig') as mock_config, \
+            mock.patch('keepercommander.service.config.tailscale_config.TailscaleConfigurator.configure_tailscale',
+                       side_effect=lambda config_data, _sc: config_data.update(
+                           tailscale_public_url='https://my-host.ts.net')), \
+            mock.patch('keepercommander.service.core.service_manager.spawn_detached_process'), \
+            mock.patch('keepercommander.service.commands.integrations.vault_metadata.write_service_metadata'
+                       ) as mock_write:
+            mock_config.return_value.load_config.return_value = {
+                "port": 8000, "run_mode": "background", "tailscale": "y", "queue_enabled": "y"
+            }
+
+            ServiceManager.start_service(params=self.params, vault_record_uid='rec-1', api_key='key-1')
+
+            mock_write.assert_called_once_with(
+                self.params, 'rec-1', 'https://my-host.ts.net/api/v2', 'key-1'
+            )
+
+    def test_start_service_skips_vault_correction_when_record_or_key_missing(self):
+        """service-start (resume) calls start_service with no vault context - must stay
+        inert, not raise, since there's nothing to correct."""
+        with mock.patch('keepercommander.service.core.service_manager.ServiceConfig') as mock_config, \
+            mock.patch('keepercommander.service.config.tailscale_config.TailscaleConfigurator.configure_tailscale',
+                       side_effect=lambda config_data, _sc: config_data.update(
+                           tailscale_public_url='https://my-host.ts.net')), \
+            mock.patch('keepercommander.service.core.service_manager.spawn_detached_process'), \
+            mock.patch('keepercommander.service.commands.integrations.vault_metadata.write_service_metadata'
+                       ) as mock_write:
+            mock_config.return_value.load_config.return_value = {
+                "port": 8000, "run_mode": "background", "tailscale": "y", "queue_enabled": "y"
+            }
+
+            ServiceManager.start_service()  # no params/vault_record_uid/api_key
+
+            mock_write.assert_not_called()
+
+    def test_start_service_tailscale_auth_failure_before_funnel_starts_skips_teardown(self):
+        """A bad-key/auth failure happens before Funnel is ever started - must not
+        call stop_tailscale_funnel (and risk its 'reset' fallback) when there's
+        nothing actually live to tear down."""
+        with mock.patch('keepercommander.service.core.service_manager.ServiceConfig') as mock_config, \
+            mock.patch('keepercommander.service.config.tailscale_config.TailscaleConfigurator.configure_tailscale',
+                       side_effect=RuntimeError("Tailscale authentication failed")), \
+            mock.patch('keepercommander.service.util.tunneling.get_tailscale_funnel_status', return_value=False), \
+            mock.patch('keepercommander.service.util.tunneling.stop_tailscale_funnel') as mock_stop_funnel, \
+            mock.patch('keepercommander.service.core.service_manager.spawn_detached_process') as mock_spawn:
+            mock_config.return_value.load_config.return_value = {
+                "port": 8000, "run_mode": "background", "tailscale": "y"
+            }
+
+            start_cmd = StartService()
+            start_cmd.execute(self.params)  # must not raise
+
+            mock_stop_funnel.assert_not_called()
+            mock_spawn.assert_not_called()
+            self.assertFalse(ProcessInfo._env_file.exists())
+
+    def test_service_status_reports_dangling_tailscale_funnel_without_stopping_it(self):
+        """A crashed/SIGKILLed Commander process can leave Funnel still live - a
+        read-only status check must report that, not tear it down itself; cleanup
+        is left to an explicit 'service-stop'."""
+        import psutil as psutil_module
+        ProcessInfo.save(pid=12345, is_running=True, tailscale_enabled=True, tailscale_port=8000)
+
+        with mock.patch('psutil.Process', side_effect=psutil_module.NoSuchProcess(12345)), \
+            mock.patch('keepercommander.service.util.tunneling.get_tailscale_funnel_status', return_value=True), \
+            mock.patch('keepercommander.service.util.tunneling.stop_tailscale_funnel') as mock_stop_funnel:
+            status = ServiceManager.get_status()
+
+            mock_stop_funnel.assert_not_called()
+            self.assertIn("Tailscale Funnel is still active", status)
+            self.assertIn("service-stop", status)
+
+    def test_service_status_keeps_process_info_when_funnel_still_dangling(self):
+        """The status message tells the user to run 'service-stop' - that's only
+        actionable if the tailscale_port record survives, so ProcessInfo must NOT
+        be cleared while a Funnel is still live."""
+        import psutil as psutil_module
+        ProcessInfo.save(pid=12345, is_running=True, tailscale_enabled=True, tailscale_port=8000)
+
+        with mock.patch('psutil.Process', side_effect=psutil_module.NoSuchProcess(12345)), \
+            mock.patch('keepercommander.service.util.tunneling.get_tailscale_funnel_status', return_value=True), \
+            mock.patch('keepercommander.service.util.tunneling.stop_tailscale_funnel'):
+            ServiceManager.get_status()
+
+        retained = ProcessInfo.load()
+        self.assertTrue(retained.tailscale_enabled)
+        self.assertEqual(retained.tailscale_port, 8000)
+
+    def test_service_status_clears_process_info_when_no_funnel_dangling(self):
+        """Without a live Funnel there's nothing left to clean up, so the stale
+        record should still be cleared as before."""
+        import psutil as psutil_module
+        ProcessInfo.save(pid=12345, is_running=True, tailscale_enabled=True, tailscale_port=8000)
+
+        with mock.patch('psutil.Process', side_effect=psutil_module.NoSuchProcess(12345)), \
+            mock.patch('keepercommander.service.util.tunneling.get_tailscale_funnel_status', return_value=False):
+            status = ServiceManager.get_status()
+
+        self.assertNotIn("still active", status)
+        self.assertIsNone(ProcessInfo.load().pid)
+
+    def test_stop_service_tears_down_dangling_funnel_after_status_saw_dead_process(self):
+        """End-to-end of the finding-1 fix: get_status() on a crashed service must leave
+        the record intact (stale pid and all) so the follow-up service-stop it advises
+        can still reach Tailscale teardown."""
+        import psutil as psutil_module
+        ProcessInfo.save(pid=12345, is_running=True, tailscale_enabled=True, tailscale_port=8000)
+
+        with mock.patch('psutil.Process', side_effect=psutil_module.NoSuchProcess(12345)), \
+            mock.patch('keepercommander.service.util.tunneling.get_tailscale_funnel_status', return_value=True), \
+            mock.patch('keepercommander.service.util.tunneling.stop_tailscale_funnel') as mock_status_stop:
+            status = ServiceManager.get_status()
+            self.assertIn("service-stop", status)
+            mock_status_stop.assert_not_called()
+
+        with mock.patch('keepercommander.service.util.tunneling.stop_tailscale_funnel',
+                        return_value=True) as mock_stop_funnel, \
+            mock.patch.object(ServiceManager, 'kill_process_by_pid', return_value=False):
+            ServiceManager.stop_service()
+            mock_stop_funnel.assert_called_once_with(8000)

@@ -1,0 +1,503 @@
+#  _  __
+# | |/ /___ ___ _ __  ___ _ _ ®
+# | ' </ -_) -_) '_ \/ -_) '_|
+# |_|\_\___\___| .__/\___|_|
+#              |_|
+#
+# Keeper Commander
+# Copyright 2021 Keeper Security Inc.
+# Contact: ops@keepersecurity.com
+#
+import datetime
+import getpass
+import io
+import logging
+import os
+import re
+import uuid
+import urllib.parse
+from typing import Dict
+from xml.sax.saxutils import escape
+
+from pykeepass import PyKeePass, create_database
+from pykeepass.exceptions import CredentialsError
+from pykeepass.attachment import Attachment as KeepassAttachment
+from pykeepass.group import Group
+from pykeepass.entry import Entry
+
+from ..importer import path_components, PathDelimiter, BaseFileImporter, BaseExporter, \
+    Record, Folder, SharedFolder, EmptyFolder, BytesAttachment, RecordField
+from ... import utils
+from ...display import bcolors
+from ...utils import parse_totp_uri
+
+_REFERENCE = r'\{REF:([TUPAN])@([IT]):([^\}]+)\}'
+
+def parse_auth(kdbx_password,kdbx_key_file): # type: (None / str),(None / str) -> (None / str),(None / str)
+    # Returns None for no auth, string for auth       
+    if kdbx_password is None:
+        kdbx_password = getpass.getpass(prompt='...' + 'Keepass Password'.rjust(20) + ': ', stream=None) or None
+    elif kdbx_password == 'none':
+        kdbx_password = None
+        
+    if kdbx_key_file is None:
+        kdbx_key_file = input('...' + 'Path to Key file'.rjust(20) + ': ')
+    elif kdbx_key_file == 'none':
+        kdbx_key_file = None
+    if kdbx_key_file:
+        kdbx_key_file = os.path.expanduser(kdbx_key_file.strip(" \"'")) or None
+    return kdbx_password, kdbx_key_file
+
+
+class XmlUtils(object):
+    @staticmethod
+    def is_valid_xml_char(char):    # type: (str) -> bool
+        code_point = ord(char)
+        return code_point in {0x09, 0x0A, 0x0D} or \
+            0x20 <= code_point <= 0xD7FF or \
+            0xE000 <= code_point <= 0xFFFD or \
+            0x10000 <= code_point <= 0x10FFFF
+
+    @staticmethod
+    def sanitize_xml_text(value):   # type: (any) -> str
+        if not isinstance(value, str):
+            value = str(value) if value else ''
+        if not value:
+            return ''
+        return ''.join((char for char in value if XmlUtils.is_valid_xml_char(char)))
+
+class KeepassImporter(BaseFileImporter):
+
+    @staticmethod
+    def get_folder(group):  # type: (Group) -> str
+        g = group
+        path = ''
+        comp = ''
+        while isinstance(g, Group):
+            if comp:
+                if len(path) > 0:
+                    path = PathDelimiter + path
+                path = comp + path
+                comp = None
+
+            nm = g.name
+            if nm:
+                comp = nm.replace(PathDelimiter, PathDelimiter*2)
+            g = g.group
+        return path
+
+    @staticmethod
+    def in_recycle_bin(kdb, group):     # type: (PyKeePass, Group) -> bool
+        bin_group = getattr(kdb, 'recyclebin_group', None)
+        if bin_group is None:
+            return False
+        g = group
+        while isinstance(g, Group):
+            if g.uuid == bin_group.uuid:
+                return True
+            g = g.group
+        return False
+
+    def do_import(self, filename, **kwargs):
+        password,keyfile = parse_auth(kwargs.get('kdbx_password'), kwargs.get('kdbx_key_file'))
+        
+        try:
+            with PyKeePass(filename, password=password, keyfile=keyfile) as kdb:
+                root = kdb.root_group
+                if not root:
+                    return
+                groups = [root]  # type: list
+                pos = 0
+                while pos < len(groups):
+                    g = groups[pos]
+                    groups.extend(g.subgroups)
+                    pos = pos + 1
+
+                records = []
+                empty_folders = []
+                for group in groups:
+                    entries = group.entries
+                    if not entries and not group.subgroups and group is not root and not KeepassImporter.in_recycle_bin(kdb, group):
+                        empty = EmptyFolder()
+                        fol = Folder()
+                        fol.path = KeepassImporter.get_folder(group)
+                        if fol.path:
+                            empty.folders.append(fol)
+                            empty_folders.append(empty)
+                    if len(entries) > 0:
+                        folder = KeepassImporter.get_folder(group)
+                        for entry in entries:
+                            totp_secret = ''
+                            totp_issuer = ''
+                            totp_period = 0
+                            totp_digits = 0
+                            totp_algo = None
+                            record = Record()
+                            fol = Folder()
+                            fol.path = folder
+                            record.folders = [fol]
+                            if entry.uuid:
+                                record.uid = utils.base64_url_encode(entry.uuid.bytes)
+                            if entry.title:
+                                record.title = entry.title
+                            if entry.username:
+                                record.login = entry.username
+                            if entry.password:
+                                record.password = entry.password
+                            if entry.url:
+                                record.login_url = entry.url
+                            if entry.notes:
+                                record.notes = entry.notes
+                            if entry.otp:
+                                record.fields.append(RecordField('oneTimeCode', '', entry.otp))
+                            if hasattr(entry, 'ctime'):
+                                ctime = entry.ctime
+                                if isinstance(ctime, datetime.datetime):
+                                    record.last_modified = int(ctime.timestamp())
+                            for key, value in entry.custom_properties.items():
+                                if key == '$type':
+                                    record.type = value
+                                    continue
+                                rest, sep, no = key.rpartition('#')
+                                if sep:
+                                    if no.isdigit():
+                                        key = rest
+                                if key.startswith('$'):
+                                    ftype, sep, flabel = key.partition(':')
+                                    field_type = ftype[1:]
+                                    field_label = flabel
+                                else:
+                                    field_type = ''
+                                    field_label = key
+                                if field_label in (
+                                    'TimeOtp-Secret-Base32', 'TOTPSecret', 
+                                    'TimeOtp-Period', 'TOTPPeriod', 
+                                    'TimeOtp-Length', 'TOTPDigits', 
+                                    'TimeOtp-Algorithm',
+                                    'TOTPIssuer', 
+                                    'ModifyTOTPSettings', 'ViewTOTPSettings'
+                                    ):
+                                    # Ignore TOTP custom fields (set via previous Keeper -> KDBX export implementation)
+                                    # if the entry's "otp" field contains the corresponding URI
+                                    if entry.otp:
+                                        continue
+                                    if field_label in ('TimeOtp-Secret-Base32','TOTPSecret'):
+                                        totp_secret = value
+                                    elif field_label == 'TOTPIssuer':
+                                        totp_issuer = value
+                                    elif field_label in ('TimeOtp-Period','TOTPPeriod'):
+                                        try:
+                                            totp_period = int(value)
+                                        except:
+                                            pass
+                                    elif field_label in ('TimeOtp-Length','TOTPDigits'):
+                                        try:
+                                            totp_digits = int(value)
+                                        except:
+                                            pass
+                                    elif field_label == 'TimeOtp-Algorithm':
+                                        parsed_algo = value.replace('-','')[4:]
+                                        if parsed_algo in ('SHA1','SHA256','SHA512'):
+                                            totp_algo = parsed_algo
+                                else:
+                                    field = RecordField()
+                                    field.type = field_type
+                                    field.label = field_label
+                                    field.value = KeepassImporter.import_field(field_type, value)
+                                    record.fields.append(field)
+                            if totp_secret:
+                                value = f'otpauth://totp/?secret={totp_secret}'
+                                if totp_issuer:
+                                    value += f'&issuer={urllib.parse.quote_plus(totp_issuer)}'
+                                if totp_period > 0:
+                                    value += f'&period={totp_period}'
+                                if totp_digits > 0:
+                                    value += f'&digits={totp_digits}'
+                                if totp_algo:
+                                    value += f'&algorithm={totp_algo}'
+                                field = RecordField()
+                                field.type = 'oneTimeCode'
+                                field.value = KeepassImporter.import_field(field_type, value)
+                                record.fields.append(field)
+
+                            if entry.attachments:
+                                for a in entry.attachments:
+                                    if isinstance(a, KeepassAttachment):
+                                        if record.attachments is None:
+                                            record.attachments = []
+                                        atta = BytesAttachment(a.filename, a.binary)
+                                        atta.file_uid = a.id
+                                        record.attachments.append(atta)
+
+                            records.append(record)
+                id_map = None
+                title_map = None
+                ref_re = re.compile(_REFERENCE, re.IGNORECASE)
+
+                def resolve_references(text):
+                    nonlocal id_map
+                    nonlocal title_map
+
+                    if not text:
+                        return text
+                    matches = list(ref_re.finditer(text))
+                    if not matches:
+                        return text
+                    values = []
+                    for match in matches:
+                        comps = match.groups()
+                        val = match.group(0)
+                        if len(comps) == 3:
+                            rec = None
+                            if comps[1].upper() == 'I':
+                                if id_map is None:
+                                    id_map = {}
+                                    for r in records:
+                                        if r.uid:
+                                            id_map[r.uid] = r
+                                uid = uuid.UUID(comps[2])
+                                if uid:
+                                    ref_id = utils.base64_url_encode(uid.bytes)
+                                    rec = id_map.get(ref_id)
+                            elif comps[1].upper() == 'T':
+                                if title_map is None:
+                                    title_map = {}
+                                    for r in records:
+                                        if r.title:
+                                            title_map[r.title] = r
+                                rec = title_map.get(comps[2])
+                            if rec:
+                                field_id = comps[0].upper()
+                                if field_id == 'T':
+                                    val = rec.title
+                                elif field_id == 'U':
+                                    val = rec.login
+                                elif field_id == 'P':
+                                    val = rec.password
+                                elif field_id == 'A':
+                                    val = rec.login_url
+                                elif field_id == 'N':
+                                    val = rec.notes
+                        values.append(val or '')
+
+                        idx = list(range(len(matches)))
+                        idx.reverse()
+                        for index in idx:
+                            match = matches[index]
+                            val = values[index] if index < len(values) else ''
+                            text = text[:match.start()] + val + text[match.end():]
+                        return text
+
+                yield from empty_folders
+
+                for record in records:
+                    try:
+                        record.login = resolve_references(record.login)
+                        record.password = resolve_references(record.password)
+                        record.login_url = resolve_references(record.login_url)
+                        record.notes = resolve_references(record.notes)
+                        for field in record.fields:
+                            field.value = resolve_references(field.value)
+                    except Exception as e:
+                        logging.debug(e)
+                    yield record
+        except CredentialsError:
+            logging.warning('Invalid Keepass credentials')
+
+    def extension(self):
+        return 'kdbx'
+
+
+class KeepassExporter(BaseExporter, XmlUtils):
+    @staticmethod
+    def to_keepass_value(keeper_value):  # type: (any) -> str
+        if not keeper_value:
+            return ''
+        if isinstance(keeper_value, list):
+            return ','.join((KeepassExporter.to_keepass_value(x) for x in keeper_value))
+        elif isinstance(keeper_value, dict):
+            return ';\n'.join((
+                f'{XmlUtils.sanitize_xml_text(k)}:{KeepassExporter.to_keepass_value(v)}'
+                for k, v in keeper_value.items()
+            ))
+        else:
+            return XmlUtils.sanitize_xml_text(keeper_value)         
+
+    def keepass_add_entry(destination_group, title, username, password, url=None, notes=None,
+                        tags=None, icon=None, kp=None):
+        """Mirrors pykeepass.PyKeePass.add_entry() but skips its internal
+        find_entries() duplicate-check, which crashes on values containing
+        a double quote (upstream bug: libkeepass/pykeepass#254)."""
+        entry = Entry(title=title, username=username, password=password,
+                      notes=notes, url=url, tags=tags, icon=icon, kp=kp)
+        destination_group.append(entry)
+        return entry
+
+    def do_export(self, filename, records, file_password=None, kbdx_key_file=None, **kwargs):
+        password, keyfile = parse_auth(file_password, kbdx_key_file)
+
+        sfs = []  # type: list[SharedFolder]
+        rs = []   # type: list[Record]
+        efs = []  # type: list[EmptyFolder]
+        for x in records:
+            if isinstance(x, Record):
+                rs.append(x)
+            elif isinstance(x, EmptyFolder):
+                efs.append(x)
+            elif isinstance(x, SharedFolder):
+                sfs.append(x)
+
+        with create_database(filename, password=password, keyfile=keyfile) as kdb:
+            root = kdb.root_group
+
+            for ef in efs:
+                node = root
+                for fol in ef.folders:
+                    for path in (fol.domain, fol.path):
+                        for comp in path_components(path) if path else []:
+                            comp = self.sanitize_xml_text(comp)
+                            if not comp:
+                                continue
+                            sub_node = next((x for x in node.subgroups if x.name == comp), None)
+                            if sub_node is None:
+                                sub_node = kdb.add_group(node, comp)
+                            node = sub_node
+
+            for r in rs:
+                try:
+                    node = root
+                    if r.folders:
+                        fol = r.folders[0]
+                        for is_shared in [True, False]:
+                            path = fol.domain if is_shared else fol.path
+                            if path:
+                                comps = list(path_components(path))
+                                for i in range(len(comps)):
+                                    comp = self.sanitize_xml_text(comps[i])
+                                    if not comp:
+                                        continue
+                                    sub_node = next((x for x in node.subgroups if x.name == comp), None)
+                                    if sub_node is None:
+                                        sub_node = kdb.add_group(node, comp)
+                                    node = sub_node
+                    entry_title = self.to_keepass_value(r.title)
+                    entry_login = self.to_keepass_value(r.login)
+                    entry_password = self.to_keepass_value(r.password)
+                    entry_url = self.to_keepass_value(r.login_url)
+                    entry_notes = self.to_keepass_value(r.notes)
+                    entry = None
+                    entries = node.entries
+                    for en in entries:
+                        if en.title == entry_title and en.username == entry_login and en.password == entry_password:
+                            entry = en
+                            break
+
+                    if entry is None:
+                        entry = KeepassExporter.keepass_add_entry(node, title=entry_title, username=entry_login,
+                            password=entry_password, url=entry_url, notes=entry_notes, kp=kdb)
+                        #entry = kdb.add_entry(node, title=entry_title, username=entry_login,
+                        #                      password=entry_password, url=entry_url,
+                        #                      notes=entry_notes)
+                        if r.uid:
+                            entry.UUID = uuid.UUID(bytes=utils.base64_url_decode(r.uid))
+                    if r.type:
+                        entry.set_custom_property('$type', self.to_keepass_value(r.type))
+                    if r.fields:
+                        custom_names = {}   # type: Dict[str, int]
+                        for cf in r.fields:
+                            if cf.type == 'oneTimeCode':
+                                otp_value = self.to_keepass_value(cf.value)
+                                entry.otp = otp_value
+                                # Set custom fields for Pleasant Password TOTP compatibility
+                                totp_props = parse_totp_uri(otp_value)
+                                totp_props.get('secret') and entry.set_custom_property(
+                                        'TimeOtp-Secret-Base32',
+                                        self.to_keepass_value(totp_props['secret'])
+                                    )
+                                totp_props.get('issuer') and entry.set_custom_property(
+                                        'TOTPIssuer',
+                                        self.to_keepass_value(totp_props['issuer'])
+                                    )
+                                totp_props.get('digits') and entry.set_custom_property(
+                                        'TimeOtp-Length',
+                                        self.to_keepass_value(totp_props['digits'])
+                                    )
+                                totp_props.get('period') and entry.set_custom_property(
+                                        'TimeOtp-Period',
+                                        self.to_keepass_value(totp_props['period'])
+                                    )
+                                totp_props.get('algorithm') and entry.set_custom_property(
+                                        'TimeOtp-Algorithm',
+                                        f'HMAC-SHA-{totp_props["algorithm"][3:]}'
+                                    )
+
+                                continue
+                            field_type = self.sanitize_xml_text(cf.type)
+                            field_label = self.sanitize_xml_text(cf.label)
+                            if field_type and field_label:
+                                title = f'${field_type}:{field_label}'
+                            elif field_type:
+                                title = f'${field_type}'
+                            else:
+                                title = field_label or ''
+                            if title in custom_names:
+                                no = custom_names[title]
+                                no += 1
+                                custom_names[title] = no
+                                title = f'{title}#{no}'
+                            else:
+                                custom_names[title] = 1
+                            entry.set_custom_property(title, self.to_keepass_value(BaseExporter.export_field(cf.type, cf.value)))
+
+                    if r.attachments:
+                        for atta in r.attachments:
+                            if atta.size < self.max_size:
+                                with atta.open() as ina, io.BytesIO() as outa:
+                                    buffer = bytearray(10240)
+                                    view = memoryview(buffer)
+                                    while True:
+                                        bytes_read = ina.readinto(view)
+                                        if bytes_read == 0:
+                                            break
+                                        outa.write(view[0:bytes_read])
+                                    del view
+                                    del buffer
+                                    outa.flush()
+                                    binary = outa.getvalue()
+
+                                if binary:
+                                    binary_id = kdb.add_binary(binary, compressed=True, protected=False)
+                                    entry.add_attachment(binary_id, self.to_keepass_value(atta.name))
+                            else:
+                                scale = ''
+                                msize = self.max_size
+                                if msize > 1024 ** 3:
+                                    scale = 'G'
+                                    msize //= 1024 ** 3
+                                elif msize > 1024 ** 2:
+                                    scale = 'M'
+                                    msize //= 1024 ** 2
+                                elif msize > 1024:
+                                    scale = 'K'
+                                    msize //= 1024
+                                logging.warning(
+                                    'File \'{0}\' was skipped because it exceeds the {1}{2} file size limit.'.format(atta.name, msize, scale))
+                except Exception as e:
+                    logging.debug(e)
+
+            kdb.save(filename=filename)
+
+    def has_shared_folders(self):
+        return True
+
+    def has_empty_folders(self):
+        return True
+
+    def has_attachments(self):
+        return True
+
+    def extension(self):
+        return 'kdbx'
+
+    def supports_v3_record(self):
+        return False

@@ -1,0 +1,64 @@
+#  _  __
+# | |/ /___ ___ _ __  ___ _ _ ®
+# | ' </ -_) -_) '_ \/ -_) '_|
+# |_|\_\___\___| .__/\___|_|
+#              |_|
+#
+# Keeper Commander
+# Copyright 2024 Keeper Security Inc.
+# Contact: ops@keepersecurity.com
+#
+
+import sys
+
+# Argv flag (not an env var, which could leak into subprocesses) signaling a frozen background service.
+SERVICE_MODE_FLAG = '--internal-run-service'
+
+
+def run_background_service():
+    """
+    Run the Flask service in background mode.
+    This function is called both when running as a module (-m) and
+    when the frozen executable is invoked with SERVICE_MODE_FLAG.
+    """
+    # PyInstaller's bootloader doesn't reliably honor PYTHONUNBUFFERED, so force it here too.
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, 'reconfigure'):
+            stream.reconfigure(line_buffering=True)
+
+    from ...service.app import create_app
+    from ...service.config.service_config import ServiceConfig
+    from ...service.core.service_manager import ServiceManager
+    
+    flask_app = create_app()
+    
+    service_config = ServiceConfig()
+    config_data = service_config.load_config()
+    
+    # Pre-load Keeper parameters for background mode
+    try:
+        from ...service.core.globals import ensure_params_loaded
+        print("Pre-loading Keeper parameters for background mode...")
+        ensure_params_loaded()
+        print("Keeper parameters loaded successfully")
+    except Exception as e:
+        print(f"Warning: Failed to pre-load parameters during startup: {e}")
+        print("Parameters will be loaded on first API call if needed")
+    
+    port = config_data.get("port")
+    if not port:
+        print("Error: Service configuration is incomplete. Please configure the service port in service_config")
+        sys.exit(1)
+
+    ssl_context = ServiceManager.get_ssl_context(config_data)
+    
+    flask_app.run(
+        host='0.0.0.0',
+        port=port,
+        ssl_context=ssl_context
+    )
+
+
+if __name__ == '__main__':
+    run_background_service()
+

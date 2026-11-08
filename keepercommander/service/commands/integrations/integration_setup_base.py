@@ -1,0 +1,597 @@
+#  _  __
+# | |/ /___ ___ _ __  ___ _ _ ®
+# | ' </ -_) -_) '_ \/ -_) '_|
+# |_|\_\___\___| .__/\___|_|
+#              |_|
+#
+# Keeper Commander
+# Copyright 2026 Keeper Security Inc.
+# Contact: commander@keepersecurity.com
+#
+
+"""Base class for integration setup commands (Slack, Teams, etc.)."""
+
+import argparse
+import os
+import re
+from abc import ABC, abstractmethod
+from dataclasses import asdict
+from typing import Any, Dict, List, Optional, Tuple
+
+from ....commands.base import Command, raise_parse_exception, suppress_exit
+from ....display import bcolors
+from ....error import CommandError
+from .... import api, vault, utils, record_management
+from ..service_docker_setup import ServiceDockerSetupCommand
+from ...config.config_validation import ConfigValidator, ValidationError
+from ...docker import (
+    SetupResult, DockerSetupPrinter, DockerSetupConstants,
+    ServiceConfig, DockerComposeBuilder, DockerSetupBase, ApprovalsConfig,
+)
+from .approvals_setup import ApprovalsChannelProfile, collect_approvals_config, is_valid_keeper_uid
+from .approvals_sync import merge_approvals_custom_fields, run_approvals_sync_down
+from .command_policy import sanitize_commands
+
+UUID_PATTERN = re.compile(
+    r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+)
+
+
+class IntegrationSetupCommand(Command, DockerSetupBase, ABC):
+    """Base for integration setup commands. All naming conventions are
+    derived from get_integration_name(). Subclasses only implement
+    config collection, record fields, and display."""
+
+    _parser_cache: Dict[type, argparse.ArgumentParser] = {}
+
+    # -- Abstract (subclasses must implement) -----------------------
+
+    @abstractmethod
+    def get_integration_name(self) -> str:
+        """e.g. 'Slack', 'Teams' -- drives all naming conventions."""
+
+    def get_integration_display_name(self) -> str:
+        """User-facing product name. Defaults to get_integration_name()."""
+        return self.get_integration_name()
+
+    @abstractmethod
+    def collect_integration_config(self, params) -> Any:
+        """Prompt user for config values, return a config dataclass."""
+
+    @abstractmethod
+    def build_record_custom_fields(self, config) -> List:
+        """Return list of vault.TypedField for the config record."""
+
+    @abstractmethod
+    def print_integration_specific_resources(self, config) -> None:
+        """Print integration-specific resource lines."""
+
+    @abstractmethod
+    def print_integration_commands(self) -> None:
+        """Print available bot commands for this integration."""
+
+    def get_approvals_profile(self) -> Optional[ApprovalsChannelProfile]:
+        """Return approvals profile when this integration supports multi-channel approvers."""
+        return None
+
+    def get_integration_config_marker_field(self) -> str:
+        """Custom field label that identifies this integration's config record."""
+        return f'{self.get_integration_name().lower()}_app_token'
+
+    # -- Convention defaults (derived from name, override if needed) -
+
+    def get_command_name(self) -> str:
+        return f'{self.get_integration_name().lower()}-app-setup'
+
+    def get_default_folder_name(self) -> str:
+        return f'Commander Service Mode - {self.get_integration_name()} App'
+
+    def get_default_record_name(self) -> str:
+        return f'Commander Service Mode {self.get_integration_name()} App Config'
+
+    def get_docker_service_name(self) -> str:
+        return f'{self.get_integration_name().lower()}-app'
+
+    def get_docker_container_name(self) -> str:
+        return f'keeper-{self.get_integration_name().lower()}-app'
+
+    def get_docker_image(self) -> str:
+        return f'keeper/{self.get_integration_name().lower()}-app:latest'
+
+    def get_record_env_key(self) -> str:
+        return f'{self.get_integration_name().upper()}_RECORD'
+
+    def get_integration_service_ports(self, config) -> List[str]:
+        """Return host:container port mappings for the integration container. Override if needed."""
+        return []
+
+    def get_commander_service_name(self) -> str:
+        return f'commander-{self.get_integration_name().lower()}'
+
+    def get_commander_container_name(self) -> str:
+        return f'keeper-service-{self.get_integration_name().lower()}'
+
+    def get_service_commands(self) -> str:
+        commands = (
+            'search,share-record,nsf-share-record,share-folder,nsf-share-folder,share-report,'
+            'record-add,nsf-record-add,one-time-share,epm,pedm,device-approve,get,tree,server,'
+            'sync-down,list-sf,list-team'
+        )
+        # Allow service API callers to run --sync-down for multi-channel approvals configs.
+        if self.get_approvals_profile() is not None:
+            commands = f'{commands},{self.get_command_name()}'
+        return commands
+
+    def get_banned_commands(self) -> tuple:
+        """Commands to always strip from this integration's command list; override per integration if needed."""
+        return ()
+
+    def sanitize_service_commands(self, commands: str) -> str:
+        """Restrict `commands` to this integration's own get_service_commands() list."""
+        allowed = self.get_service_commands().split(',')
+        return sanitize_commands(commands, allowed, self.get_banned_commands())
+
+    # -- Parser (auto-built from name, cached per subclass) ----------
+
+    def get_parser(self):
+        cls = type(self)
+        if cls not in IntegrationSetupCommand._parser_cache:
+            IntegrationSetupCommand._parser_cache[cls] = self._build_parser()
+        return IntegrationSetupCommand._parser_cache[cls]
+
+    def _build_parser(self) -> argparse.ArgumentParser:
+        name = self.get_integration_name()
+        display_name = self.get_integration_display_name()
+        name_lower = name.lower()
+        default_folder = self.get_default_folder_name()
+        default_record = self.get_default_record_name()
+
+        parser = argparse.ArgumentParser(
+            prog=f'{name_lower}-app-setup',
+            description=f'Automate {display_name} App integration setup with Commander Service Mode',
+            formatter_class=argparse.RawDescriptionHelpFormatter
+        )
+        parser.add_argument(
+            '--folder-name', dest='folder_name', type=str, default=default_folder,
+            help=f'Name for the shared folder (default: "{default_folder}")'
+        )
+        parser.add_argument(
+            '--app-name', dest='app_name', type=str, default=DockerSetupConstants.DEFAULT_APP_NAME,
+            help=f'Name for the secrets manager app (default: "{DockerSetupConstants.DEFAULT_APP_NAME}")'
+        )
+        parser.add_argument(
+            '--config-record-name', dest='config_record_name', type=str,
+            default=DockerSetupConstants.DEFAULT_RECORD_NAME,
+            help=f'Name for the config record (default: "{DockerSetupConstants.DEFAULT_RECORD_NAME}")'
+        )
+        parser.add_argument(
+            f'--{name_lower}-record-name', dest='integration_record_name', type=str,
+            default=default_record,
+            help=f'Name for the {display_name} config record (default: "{default_record}")'
+        )
+        parser.add_argument(
+            '--config-path', dest='config_path', type=str,
+            help='Path to config.json file (default: active session config file)'
+        )
+        parser.add_argument(
+            '--timeout', dest='timeout', type=str, default=DockerSetupConstants.DEFAULT_TIMEOUT,
+            help=f'Device timeout setting (default: {DockerSetupConstants.DEFAULT_TIMEOUT})'
+        )
+        parser.add_argument(
+            '--skip-device-setup', dest='skip_device_setup', action='store_true',
+            help='Skip device registration and setup if already configured'
+        )
+        if self.get_approvals_profile() is not None:
+            parser.add_argument(
+                '--sync-down', dest='sync_down', action='store_true',
+                help=(
+                    'Non-interactively sync multi-channel approvals config with the vault '
+                    '(remove deleted teams; drop missing shared-folder/record UIDs; '
+                    'refresh team names). Requires an existing integration config record.'
+                )
+            )
+            parser.add_argument(
+                '--integration-record', '-r', dest='integration_record_uid', type=str,
+                help=(
+                    'UID of the integration config record for --sync-down '
+                    f'(optional; defaults to "{default_record}" in "{default_folder}")'
+                )
+            )
+        parser.error = raise_parse_exception
+        parser.exit = suppress_exit
+        return parser
+
+    # -- Main flow ---------------------------------------------------
+
+    def execute(self, params, **kwargs):
+        name = self.get_integration_name()
+        display_name = self.get_integration_display_name()
+
+        if kwargs.get('sync_down'):
+            if self.get_approvals_profile() is None:
+                raise CommandError(
+                    self.get_command_name(),
+                    f'{display_name} does not support multi-channel approver sync yet',
+                )
+            record_uid = kwargs.get('integration_record_uid')
+            sync_vault = True
+            if record_uid:
+                record_uid = record_uid.strip()
+                if not is_valid_keeper_uid(record_uid):
+                    raise CommandError(
+                        self.get_command_name(),
+                        f'Invalid integration record UID: {record_uid}',
+                    )
+            else:
+                # Default resolution already syncs the vault.
+                record_uid = self._resolve_default_integration_record(
+                    params, kwargs.get('integration_record_name')
+                )
+                sync_vault = False
+            self._execute_sync_down(params, record_uid, sync_vault=sync_vault)
+            return
+
+        self._require_file_based_config(params, f'{name.lower()}-app-setup')
+
+        # Phase 1 -- Docker service mode setup
+        print(f"\n{bcolors.BOLD}Phase 1: Running Docker Service Mode Setup{bcolors.ENDC}")
+        setup_result, service_config, config_path = self._run_base_docker_setup(params, kwargs)
+        DockerSetupPrinter.print_completion("Service Mode Configuration Complete!")
+
+        # Phase 2 -- Integration-specific setup
+        print(f"\n{bcolors.BOLD}Phase 2: {display_name} App Integration Setup{bcolors.ENDC}")
+        record_name = kwargs.get('integration_record_name', self.get_default_record_name())
+        record_uid, config = self._run_integration_setup(
+            params, setup_result, service_config, record_name
+        )
+
+        # Consolidated success output
+        self._print_success_message(setup_result, service_config, record_uid, config, config_path)
+
+    # -- Phase 1 (docker service mode) --------------------------------
+
+    def _run_base_docker_setup(self, params, kwargs: Dict[str, Any]) -> Tuple[SetupResult, ServiceConfig, str]:
+        docker_cmd = ServiceDockerSetupCommand()
+
+        config_path = self._require_commander_config_file(
+            self.get_command_name(),
+            kwargs.get('config_path'),
+            params,
+        )
+
+        DockerSetupPrinter.print_header("Docker Setup")
+
+        setup_result = docker_cmd.run_setup_steps(
+            params=params,
+            folder_name=kwargs.get('folder_name', self.get_default_folder_name()),
+            app_name=kwargs.get('app_name', DockerSetupConstants.DEFAULT_APP_NAME),
+            record_name=kwargs.get('config_record_name', DockerSetupConstants.DEFAULT_RECORD_NAME),
+            config_path=config_path,
+            timeout=kwargs.get('timeout', DockerSetupConstants.DEFAULT_TIMEOUT),
+            skip_device_setup=kwargs.get('skip_device_setup', False)
+        )
+
+        DockerSetupPrinter.print_completion("Docker Setup Complete!")
+
+        service_config = self._get_integration_service_configuration()
+
+        return setup_result, service_config, config_path
+
+    def _get_integration_service_configuration(self) -> ServiceConfig:
+        DockerSetupPrinter.print_header("Service Mode Configuration")
+
+        print(f"{bcolors.BOLD}Port:{bcolors.ENDC}")
+        print(f"  The port on which Commander Service will listen")
+        while True:
+            port_input = (
+                input(f"{bcolors.OKBLUE}Port [Press Enter for {DockerSetupConstants.DEFAULT_PORT}]:{bcolors.ENDC} ").strip()
+                or str(DockerSetupConstants.DEFAULT_PORT)
+            )
+            try:
+                port = ConfigValidator.validate_port(port_input)
+                break
+            except ValidationError as e:
+                print(f"{bcolors.FAIL}Error: {str(e)}{bcolors.ENDC}")
+
+        ngrok_config = self._get_ngrok_config()
+
+        if ngrok_config['ngrok_enabled']:
+            cloudflare_config = {
+                'cloudflare_enabled': False, 'cloudflare_tunnel_token': '',
+                'cloudflare_custom_domain': '', 'cloudflare_public_url': ''
+            }
+            tailscale_config = self._disabled_tailscale_config()
+        else:
+            cloudflare_config = self._get_cloudflare_config()
+            if cloudflare_config['cloudflare_enabled']:
+                tailscale_config = self._disabled_tailscale_config()
+            else:
+                tailscale_config = self._get_tailscale_config()
+
+        return ServiceConfig(
+            port=port,
+            commands=self.get_service_commands(),
+            queue_enabled=True,
+            ngrok_enabled=ngrok_config['ngrok_enabled'],
+            ngrok_auth_token=ngrok_config['ngrok_auth_token'],
+            ngrok_custom_domain=ngrok_config['ngrok_custom_domain'],
+            ngrok_public_url=ngrok_config.get('ngrok_public_url', ''),
+            cloudflare_enabled=cloudflare_config['cloudflare_enabled'],
+            cloudflare_tunnel_token=cloudflare_config['cloudflare_tunnel_token'],
+            cloudflare_custom_domain=cloudflare_config['cloudflare_custom_domain'],
+            cloudflare_public_url=cloudflare_config.get('cloudflare_public_url', ''),
+            tailscale_enabled=tailscale_config['tailscale_enabled'],
+            tailscale_auth_key=tailscale_config['tailscale_auth_key'],
+            tailscale_advertise_tags=tailscale_config['tailscale_advertise_tags'],
+            tailscale_public_url=tailscale_config.get('tailscale_public_url', '')
+        )
+
+    # -- Phase 2 (integration-specific) --------------------------------
+
+    def _run_integration_setup(self, params, setup_result: SetupResult,
+                               service_config: ServiceConfig,
+                               record_name: str) -> Tuple[str, Any]:
+        display_name = self.get_integration_display_name()
+
+        DockerSetupPrinter.print_header(f"{display_name} App Configuration")
+        config = self.collect_integration_config(params)
+
+        DockerSetupPrinter.print_step(1, 2, f"Creating {display_name} config record '{record_name}'...")
+        custom_fields = self.build_record_custom_fields(config)
+        record_uid = self._create_integration_record(params, record_name, setup_result.folder_uid, custom_fields)
+
+        DockerSetupPrinter.print_step(2, 2, f"Updating docker-compose.yml with {display_name} App service...")
+        self._update_docker_compose(setup_result, service_config, record_uid, config)
+
+        return record_uid, config
+
+    # -- Record management ---------------------------------------------
+
+    def _create_integration_record(self, params, record_name: str,
+                                   folder_uid: str, custom_fields: List) -> str:
+        record_uid = self._find_record_in_folder(params, folder_uid, record_name)
+
+        if record_uid:
+            DockerSetupPrinter.print_success("Using existing record (will update with custom fields)")
+        else:
+            record_uid = self._create_login_record(params, folder_uid, record_name)
+
+        self._update_record_custom_fields(params, record_uid, custom_fields)
+
+        display_name = self.get_integration_display_name()
+        DockerSetupPrinter.print_success(f"{display_name} config record ready (UID: {record_uid})")
+        return record_uid
+
+    def _find_record_in_folder(self, params, folder_uid: str, record_name: str):
+        for rec_uid in (params.subfolder_record_cache or {}).get(folder_uid, []):
+            rec = api.get_record(params, rec_uid)
+            if rec.title == record_name and self._is_owned_record(params, rec_uid):
+                return rec_uid
+        return None
+
+    def _create_login_record(self, params, folder_uid: str, record_name: str) -> str:
+        try:
+            record = vault.KeeperRecord.create(params, 'login')
+            record.record_uid = utils.generate_uid()
+            record.record_key = utils.generate_aes_key()
+            record.title = record_name
+            record.type_name = 'login'
+            record_management.add_record_to_folder(params, record, folder_uid)
+            api.sync_down(params)
+            return record.record_uid
+        except Exception as e:
+            raise CommandError(self.get_command_name(), f'Failed to create record: {str(e)}')
+
+    def _update_record_custom_fields(self, params, record_uid: str, custom_fields: List) -> None:
+        try:
+            record = vault.KeeperRecord.load(params, record_uid)
+            record.custom = custom_fields
+            record_management.update_record(params, record)
+            params.sync_data = True
+            api.sync_down(params)
+        except Exception as e:
+            raise CommandError(self.get_command_name(), f'Failed to update record fields: {str(e)}')
+
+    def _patch_record_approvals(self, params, record_uid: str, approvals: ApprovalsConfig) -> None:
+        try:
+            record = vault.KeeperRecord.load(params, record_uid)
+            if not record:
+                raise CommandError(self.get_command_name(), f'Record not found: {record_uid}')
+            if not isinstance(record, vault.TypedRecord):
+                raise CommandError(
+                    self.get_command_name(),
+                    f'Record {record_uid} is not a typed record and cannot store approvals config',
+                )
+            profile = self.get_approvals_profile()
+            record.custom = merge_approvals_custom_fields(record.custom, approvals, profile)
+            record_management.update_record(params, record)
+            params.sync_data = True
+            api.sync_down(params)
+        except CommandError:
+            raise
+        except Exception as e:
+            raise CommandError(self.get_command_name(), f'Failed to update record fields: {str(e)}')
+
+    def _find_folder_uid_by_name(self, params, folder_name: str) -> Optional[str]:
+        """Return an owned shared folder UID with this name, or None."""
+        for folder_uid, folder_data in (params.shared_folder_cache or {}).items():
+            if folder_data.get('name') == folder_name and self._is_owned_shared_folder(params, folder_uid):
+                return folder_uid
+        return None
+
+    def _resolve_default_integration_record(self, params, record_name: Optional[str] = None) -> str:
+        """Find the default integration config record by folder/name when -r is omitted."""
+        params.sync_data = True
+        api.sync_down(params)
+
+        record_name = record_name or self.get_default_record_name()
+        folder_name = self.get_default_folder_name()
+        folder_uid = self._find_folder_uid_by_name(params, folder_name)
+        if not folder_uid:
+            raise CommandError(
+                self.get_command_name(),
+                f'Default folder "{folder_name}" not found. Pass --integration-record <UID>.',
+            )
+
+        record_uid = self._find_record_in_folder(params, folder_uid, record_name)
+        if not record_uid:
+            raise CommandError(
+                self.get_command_name(),
+                f'Record "{record_name}" not found in folder "{folder_name}". '
+                f'Pass --integration-record <UID>.',
+            )
+        return record_uid
+
+    def _execute_sync_down(self, params, record_uid: str, sync_vault: bool = True) -> None:
+        display_name = self.get_integration_display_name()
+        print(f"\n{bcolors.BOLD}{display_name} App Config Sync{bcolors.ENDC}")
+        print(f"  Reconciling approver teams, shared folders, and records with the vault")
+        print(f"  Config record: {bcolors.OKBLUE}{record_uid}{bcolors.ENDC}")
+
+        run_approvals_sync_down(
+            params=params,
+            record_uid=record_uid,
+            marker_field=self.get_integration_config_marker_field(),
+            update_record=lambda uid, approvals: self._patch_record_approvals(params, uid, approvals),
+            command_name=self.get_command_name(),
+            sync_vault=sync_vault,
+            profile=self.get_approvals_profile(),
+        )
+
+    # -- Docker Compose update -----------------------------------------
+
+    def _update_docker_compose(self, setup_result: SetupResult,
+                               service_config: ServiceConfig,
+                               record_uid: str, config=None) -> None:
+        compose_file = os.path.join(os.getcwd(), 'docker-compose.yml')
+        service_name = self.get_docker_service_name()
+        compose_exists = os.path.exists(compose_file)
+        if compose_exists:
+            with open(compose_file, 'r') as f:
+                content = f.read()
+            if f'{service_name}:' in content:
+                DockerSetupPrinter.print_warning(
+                    f"{service_name} service already exists in docker-compose.yml; rewriting. Hand edits will be lost."
+                )
+
+        try:
+            cfg = asdict(service_config)
+            cfg['commands'] = self.sanitize_service_commands(cfg.get('commands') or '')
+            builder = DockerComposeBuilder(
+                setup_result, cfg,
+                commander_service_name=self.get_commander_service_name(),
+                commander_container_name=self.get_commander_container_name(),
+                commander_environment={self.get_record_env_key(): record_uid},
+            )
+            yaml_content = builder.add_integration_service(
+                service_name=service_name,
+                container_name=self.get_docker_container_name(),
+                image=self.get_docker_image(),
+                record_uid=record_uid,
+                record_env_key=self.get_record_env_key(),
+                ports=self.get_integration_service_ports(config)
+            ).build()
+
+            with open(compose_file, 'w') as f:
+                f.write(yaml_content)
+
+            DockerSetupPrinter.print_success(
+                "docker-compose.yml regenerated successfully" if compose_exists else "docker-compose.yml created successfully"
+            )
+        except Exception as e:
+            raise CommandError(self.get_command_name(), f'Failed to update docker-compose.yml: {str(e)}')
+
+    # -- Success output ------------------------------------------------
+
+    def _print_success_message(self, setup_result: SetupResult,
+                               service_config: ServiceConfig,
+                               record_uid: str, config, config_path: str) -> None:
+        display_name = self.get_integration_display_name()
+
+        print(f"\n{bcolors.OKGREEN}{bcolors.BOLD}✓ {display_name} App Integration Setup Complete!{bcolors.ENDC}\n")
+
+        print(f"{bcolors.BOLD}Resources Created:{bcolors.ENDC}")
+        print(f"  {bcolors.BOLD}Phase 1 - Commander Service:{bcolors.ENDC}")
+        DockerSetupPrinter.print_phase1_resources(setup_result, indent="    ")
+        print(f"  {bcolors.BOLD}Phase 2 - {display_name} App:{bcolors.ENDC}")
+        self._print_integration_resources(record_uid, config)
+
+        DockerSetupPrinter.print_common_deployment_steps(str(service_config.port), config_path)
+
+        container = self.get_docker_container_name()
+        print(f"  {bcolors.OKGREEN}docker logs {container}{bcolors.ENDC} - View {display_name} App logs")
+
+        self.print_integration_commands()
+
+    def _print_integration_resources(self, record_uid: str, config) -> None:
+        display_name = self.get_integration_display_name()
+        print(f"    • {display_name} Config Record: {bcolors.OKBLUE}{record_uid}{bcolors.ENDC}")
+        self.print_integration_specific_resources(config)
+        if hasattr(config, 'pedm_enabled'):
+            print(
+                f"    • EPM Integration: "
+                f"{bcolors.OKBLUE}{'true' if config.pedm_enabled else 'false'}{bcolors.ENDC}"
+            )
+        if hasattr(config, 'device_approval_enabled'):
+            print(
+                f"    • Device Approval: "
+                f"{bcolors.OKBLUE}{'true' if config.device_approval_enabled else 'false'}{bcolors.ENDC}"
+            )
+
+    # -- Optional feature collectors -----------------------------------
+
+    def _collect_pedm_config(self) -> Tuple[bool, int]:
+        print(f"\n{bcolors.BOLD}EPM (Endpoint Privilege Manager) Integration (optional):{bcolors.ENDC}")
+        print(f"  Integrate with Keeper EPM for privilege elevation")
+        enabled = self._prompt_yes_no('Enable EPM?', default=False)
+        interval = 120
+        if enabled:
+            interval_input = input(f"{bcolors.OKBLUE}EPM polling interval in seconds [Press Enter for 120]:{bcolors.ENDC} ").strip()
+            interval = int(interval_input) if interval_input else 120
+        return enabled, interval
+
+    def _collect_device_approval_config(self) -> Tuple[bool, int]:
+        display_name = self.get_integration_display_name()
+        print(f"\n{bcolors.BOLD}SSO Cloud Device Approval Integration (optional):{bcolors.ENDC}")
+        print(f"  Approve SSO Cloud device registrations via {display_name}")
+        enabled = self._prompt_yes_no('Enable Device Approval?', default=False)
+        interval = 120
+        if enabled:
+            interval_input = input(f"{bcolors.OKBLUE}Device approval polling interval in seconds [Press Enter for 120]:{bcolors.ENDC} ").strip()
+            interval = int(interval_input) if interval_input else 120
+        return enabled, interval
+
+    # -- Input / validation --------------------------------------------
+
+    def _prompt_yes_no(self, question: str, default: bool = False) -> bool:
+        suffix = '[Press Enter for Yes] (y/n):' if default else '[Press Enter for No] (y/n):'
+        while True:
+            response = input(
+                f"{bcolors.OKBLUE}{question} {suffix}{bcolors.ENDC} "
+            ).strip().lower()
+            if not response:
+                return default
+            if response == 'y':
+                return True
+            if response == 'n':
+                return False
+            print(f"{bcolors.FAIL}Error: Enter y, n, or press Enter for default{bcolors.ENDC}")
+
+    def _collect_approvals_config(self, params, profile: ApprovalsChannelProfile) -> ApprovalsConfig:
+        return collect_approvals_config(
+            params=params,
+            prompt_yes_no=self._prompt_yes_no,
+            prompt_with_validation=self._prompt_with_validation,
+            profile=profile,
+        )
+
+    def _prompt_with_validation(self, prompt: str, validator, error_msg: str) -> str:
+        while True:
+            value = input(f"{bcolors.OKBLUE}{prompt}{bcolors.ENDC} ").strip()
+            if validator(value):
+                return value
+            print(f"{bcolors.FAIL}Error: {error_msg}{bcolors.ENDC}")
+
+    @staticmethod
+    def is_valid_uuid(value: str) -> bool:
+        return bool(UUID_PATTERN.match(value or ''))

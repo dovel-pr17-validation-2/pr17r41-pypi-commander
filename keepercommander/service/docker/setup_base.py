@@ -1,0 +1,751 @@
+#  _  __
+# | |/ /___ ___ _ __  ___ _ _ ®
+# | ' </ -_) -_) '_ \/ -_) '_|
+# |_|\_\___\___| .__/\___|_|
+#              |_|
+#
+# Keeper Commander
+# Copyright 2026 Keeper Security Inc.
+# Contact: commander@keepersecurity.com
+#
+
+"""
+Core setup logic for Docker-based integrations.
+
+This module provides the reusable base class for setting up
+Commander Service Mode with Docker and KSM.
+"""
+
+import io
+import json
+import logging
+import os
+import sys
+import tempfile
+from typing import Dict, Any
+
+from ...commands.ksm import KSMCommand
+from ... import api, vault, utils, crypto, attachment, record_management, loginv3
+from ...display import bcolors
+from ...error import CommandError
+
+from .models import SetupResult, SetupStep, DockerSetupConstants
+from .printer import DockerSetupPrinter
+from ..config.config_validation import ConfigValidator, ValidationError
+from ..config.record_handler import RecordHandler
+
+
+class DockerSetupBase:
+    """Base class for Docker setup with reusable core logic"""
+
+    @staticmethod
+    def _is_owned_record(params, record_uid: str) -> bool:
+        """True when record_owner_cache marks the record as owned by this account."""
+        if not record_uid:
+            return False
+        owner_cache = getattr(params, 'record_owner_cache', None) or {}
+        owner = owner_cache.get(record_uid)
+        return bool(owner and owner.owner)
+
+    @staticmethod
+    def _is_owned_shared_folder(params, folder_uid: str) -> bool:
+        """True when the shared folder is owned by the current account."""
+        if not folder_uid:
+            return False
+        shared_folder = (getattr(params, 'shared_folder_cache', None) or {}).get(folder_uid)
+        if not shared_folder:
+            return False
+
+        owner_uid = shared_folder.get('owner_account_uid')
+        account_uid_bytes = getattr(params, 'account_uid_bytes', None)
+        if owner_uid and account_uid_bytes:
+            return owner_uid == utils.base64_url_encode(account_uid_bytes)
+
+        owner_username = shared_folder.get('owner_username')
+        if owner_username and getattr(params, 'user', None):
+            return owner_username.lower() == params.user.lower()
+        return False
+
+    @staticmethod
+    def _find_owned_ksm_app_by_title(params, app_name: str):
+        """Return an owned KSM app with this title, or None (ignores non-owned squats)."""
+        if not app_name:
+            return None
+        for rec_cache_val in (getattr(params, 'record_cache', None) or {}).values():
+            rec = KSMCommand._app_record_from_cache_entry(rec_cache_val)
+            if not rec:
+                continue
+            try:
+                title = json.loads(rec['data_unencrypted'].decode('utf-8')).get('title')
+            except Exception:
+                continue
+            if title == app_name and DockerSetupBase._is_owned_record(params, rec.get('record_uid')):
+                return rec
+        return None
+
+    @staticmethod
+    def resolve_commander_config_path(config_path: str = None, params=None) -> str:
+        """Resolve config.json using the same rules as login/shell startup."""
+        if config_path:
+            resolved = os.path.expanduser(config_path)
+        elif params and getattr(params, 'config_filename', None):
+            resolved = os.path.expanduser(params.config_filename)
+        else:
+            resolved = str(utils.get_default_path() / 'config.json')
+        return os.path.abspath(resolved)
+
+    @staticmethod
+    def _require_commander_config_file(command_name: str, config_path: str = None, params=None) -> str:
+        resolved = DockerSetupBase.resolve_commander_config_path(config_path, params)
+        if not os.path.isfile(resolved):
+            raise CommandError(command_name, f'Config file not found: {resolved}')
+        return resolved
+
+    @staticmethod
+    def _require_file_based_config(params, command_name: str) -> None:
+        """Raise CommandError if credentials are in the OS keychain rather than config.json."""
+        from ...config_storage.loader import CONFIG_STORAGE_URL, _is_os_keychain_url
+        config_storage = params.config.get(CONFIG_STORAGE_URL, '') if isinstance(params.config, dict) else ''
+        if _is_os_keychain_url(config_storage):
+            raise CommandError(
+                command_name,
+                f'{bcolors.FAIL}{bcolors.BOLD}Error:{bcolors.ENDC} '
+                f'{bcolors.FAIL}This command requires credentials to be stored in config.json, '
+                f'but they are currently stored in the OS keychain.{bcolors.ENDC}\n\n'
+                f'{bcolors.OKBLUE}Please re-login with the --config-file flag first:{bcolors.ENDC}\n\n'
+                f'    {bcolors.OKGREEN}login --config-file{bcolors.ENDC}    '
+                f'{bcolors.OKGREEN}(or: keeper shell --config-file){bcolors.ENDC}\n\n'
+                f'Then re-run this command.'
+            )
+
+    def run_setup_steps(self, params, folder_name: str, app_name: str, record_name: str,
+                       config_path: str, timeout: str, skip_device_setup: bool = False) -> SetupResult:
+        """
+        Core setup steps that can be reused by integration commands.
+        Returns a SetupResult object containing all the created resources.
+        """
+        # Total number of steps
+        total_steps = len(SetupStep)
+        
+        # Step 1: Device setup
+        if not skip_device_setup:
+            DockerSetupPrinter.print_step(SetupStep.DEVICE_SETUP.value, total_steps, "Checking device settings...")
+            self._setup_device(params, timeout)
+        else:
+            DockerSetupPrinter.print_step(SetupStep.DEVICE_SETUP.value, total_steps, "Skipping device setup (--skip-device-setup)")
+
+        # Step 2: Create shared folder
+        DockerSetupPrinter.print_step(SetupStep.CREATE_FOLDER.value, total_steps, f"Creating shared folder '{folder_name}'...")
+        folder_uid = self._create_shared_folder(params, folder_name)
+
+        # Step 3: Create config record
+        DockerSetupPrinter.print_step(SetupStep.CREATE_RECORD.value, total_steps, f"Creating record '{record_name}'...")
+        record_uid = self._create_config_record(params, record_name, folder_uid)
+
+        # Step 4: Store config file (attachment or custom field)
+        DockerSetupPrinter.print_step(SetupStep.UPLOAD_CONFIG.value, total_steps, "Storing config.json...")
+        self._upload_config_file(params, record_uid, config_path)
+
+        # Step 5: Create KSM app
+        DockerSetupPrinter.print_step(SetupStep.CREATE_KSM_APP.value, total_steps, f"Creating Secrets Manager app '{app_name}'...")
+        app_uid = self._create_ksm_app(params, app_name)
+
+        # Step 6: Share folder with app
+        DockerSetupPrinter.print_step(SetupStep.SHARE_FOLDER.value, total_steps, "Sharing folder with app...")
+        self._share_folder_with_app(params, app_uid, folder_uid)
+
+        # Step 7: Create client device
+        DockerSetupPrinter.print_step(SetupStep.CREATE_CLIENT.value, total_steps, "Creating client device and generating config...")
+        b64_config = self._create_client_device(params, app_uid, app_name)
+
+        return SetupResult(
+            folder_uid=folder_uid,
+            folder_name=folder_name,
+            app_uid=app_uid,
+            app_name=app_name,
+            record_uid=record_uid,
+            b64_config=b64_config
+        )
+
+    # ========================
+    # Core Setup Methods
+    # ========================
+
+    def _setup_device(self, params, timeout: str) -> None:
+        """Check and setup device registration, persistent login, and timeout"""
+        from ...commands.utils import ThisDeviceCommand
+        
+        try:
+            device_info = ThisDeviceCommand.get_device_info(params)
+            
+            # Device registration
+            if not device_info.get('data_key_present', False):
+                DockerSetupPrinter.print_warning("Device not registered")
+                loginv3.LoginV3API.register_encrypted_data_key_for_device(params)
+                DockerSetupPrinter.print_success("Device registered successfully")
+            else:
+                DockerSetupPrinter.print_success("Device already registered")
+
+            # Persistent login
+            if not device_info.get('persistent_login', False):
+                DockerSetupPrinter.print_warning("Persistent login disabled")
+                loginv3.LoginV3API.set_user_setting(params, 'persistent_login', '1')
+                DockerSetupPrinter.print_success("Persistent login enabled")
+            else:
+                DockerSetupPrinter.print_success("Persistent login already enabled")
+
+            # Timeout
+            DockerSetupPrinter.print_success(f"Setting logout timeout to {timeout}...")
+            # Suppress command output
+            old_stdout = sys.stdout
+            sys.stdout = io.StringIO()
+            try:
+                ThisDeviceCommand().execute(params, ops=['timeout', timeout])
+            finally:
+                sys.stdout = old_stdout
+
+        except Exception as e:
+            raise CommandError('docker-setup', f'Device setup failed: {str(e)}')
+
+    @staticmethod
+    def _add_owned_shared_folder(params, folder_name: str) -> str:
+        """Create a root-level shared folder via folder_add (allows duplicate display names).
+
+        Bypasses FolderMakeCommand/mkdir, which refuses to create when any visible
+        folder already has the same name — including a non-owned squat.
+        """
+        name = (folder_name or '').strip()
+        if not name:
+            raise CommandError('docker-setup', 'Shared folder name is required')
+        if not getattr(params, 'data_key', None):
+            raise CommandError('docker-setup', 'Not logged in (missing data key)')
+
+        folder_uid = api.generate_record_uid()
+        folder_key = utils.generate_aes_key()
+        request = {
+            'command': 'folder_add',
+            'folder_type': 'shared_folder',
+            'folder_uid': folder_uid,
+            'key': utils.base64_url_encode(crypto.encrypt_aes_v1(folder_key, params.data_key)),
+            'name': utils.base64_url_encode(crypto.encrypt_aes_v1(name.encode('utf-8'), folder_key)),
+            'data': utils.base64_url_encode(
+                crypto.encrypt_aes_v1(json.dumps({'name': name}).encode('utf-8'), folder_key)
+            ),
+            'manage_users': True,
+            'manage_records': True,
+            'can_share': True,
+            'can_edit': True,
+        }
+        api.communicate(params, request)
+        params.sync_data = True
+        return folder_uid
+
+    def _create_shared_folder(self, params, folder_name: str) -> str:
+        """Create a shared folder, or reuse one owned by this account with the same name."""
+        saw_non_owned = False
+        for folder_uid, folder in (params.folder_cache or {}).items():
+            if folder.name != folder_name or folder_uid not in (params.shared_folder_cache or {}):
+                continue
+            if self._is_owned_shared_folder(params, folder_uid):
+                DockerSetupPrinter.print_success(f"Using existing shared folder (UID: {folder_uid})")
+                return folder_uid
+            saw_non_owned = True
+
+        if saw_non_owned:
+            DockerSetupPrinter.print_warning(
+                f"Ignoring shared folder(s) named '{folder_name}' owned by another account; "
+                f"creating a new owned folder"
+            )
+
+        try:
+            folder_uid = self._add_owned_shared_folder(params, folder_name)
+            api.sync_down(params)
+            DockerSetupPrinter.print_success(f"Shared folder created successfully (UID: {folder_uid})")
+            return folder_uid
+        except CommandError:
+            raise
+        except Exception as e:
+            raise CommandError('docker-setup', f'Failed to create shared folder: {str(e)}')
+
+    def _create_config_record(self, params, record_name: str, folder_uid: str) -> str:
+        """Create a config record, or reuse an owned one with the same title in the folder."""
+        saw_non_owned = False
+        for rec_uid in (params.subfolder_record_cache or {}).get(folder_uid, []):
+            rec = api.get_record(params, rec_uid)
+            if rec.title != record_name:
+                continue
+            if self._is_owned_record(params, rec_uid):
+                DockerSetupPrinter.print_success("Using existing record")
+                return rec_uid
+            saw_non_owned = True
+
+        if saw_non_owned:
+            DockerSetupPrinter.print_warning(
+                f"Ignoring record(s) titled '{record_name}' owned by another account; "
+                f"creating a new owned record"
+            )
+
+        try:
+            record = vault.KeeperRecord.create(params, 'login')
+            record.record_uid = utils.generate_uid()
+            record.record_key = utils.generate_aes_key()
+            record.title = record_name
+            record.type_name = 'login'
+
+            record_management.add_record_to_folder(params, record, folder_uid)
+            api.sync_down(params)
+
+            DockerSetupPrinter.print_success(f"Record created successfully (UID: {record.record_uid})")
+            return record.record_uid
+        except Exception as e:
+            raise CommandError('docker-setup', f'Failed to create record: {str(e)}')
+
+    def _upload_config_file(self, params, record_uid: str, config_path: str) -> None:
+        """Upload config.json as attachment, or store as custom field if no file storage plan.
+        
+        """
+        temp_config_path = None
+        try:
+            cleaned_config_path = self._clean_config_json(config_path)
+            if cleaned_config_path != config_path:
+                temp_config_path = cleaned_config_path
+
+            if RecordHandler.has_file_storage(params):
+                self._upload_config_as_attachment(params, record_uid, cleaned_config_path)
+            else:
+                self._store_config_as_custom_field(params, record_uid, cleaned_config_path)
+        except CommandError:
+            raise
+        except Exception as e:
+            raise CommandError('docker-setup', f'Failed to store config file: {str(e)}')
+        finally:
+            if temp_config_path and os.path.exists(temp_config_path):
+                try:
+                    os.unlink(temp_config_path)
+                except OSError:
+                    pass
+
+    def _upload_config_as_attachment(self, params, record_uid: str, config_path: str) -> None:
+        """Upload config.json as a file attachment (requires file storage plan)."""
+        record = vault.KeeperRecord.load(params, record_uid)
+        if not isinstance(record, vault.TypedRecord):
+            raise CommandError('docker-setup', 'Invalid record type for attachments')
+        self._delete_existing_config_attachments(record, params)
+
+        upload_task = attachment.FileUploadTask(config_path)
+        upload_task.name = 'config.json'
+        upload_task.title = 'config.json'
+
+        attachment.upload_attachments(params, record, [upload_task])
+        record_management.update_record(params, record)
+        params.sync_data = True
+        api.sync_down(params)
+
+        DockerSetupPrinter.print_success("Config file uploaded as attachment")
+
+    def _store_config_as_custom_field(self, params, record_uid: str, config_path: str) -> None:
+        """Store config.json content as a custom field (fallback when no file storage plan)."""
+        with open(config_path, 'r') as f:
+            config_content = f.read()
+
+        record = vault.KeeperRecord.load(params, record_uid)
+        if not isinstance(record, vault.TypedRecord):
+            raise CommandError('docker-setup', 'Invalid record type')
+
+        if record.custom is None:
+            record.custom = []
+        record.custom = [f for f in record.custom if f.label != 'config_json']
+        record.custom.append(vault.TypedField.new_field('secret', config_content, 'config_json'))
+
+        record_management.update_record(params, record)
+        params.sync_data = True
+        api.sync_down(params)
+
+        DockerSetupPrinter.print_success("Config stored as custom field (no file storage plan)")
+
+    def _delete_existing_config_attachments(self, record, params) -> None:
+        """Delete any existing config.json attachments to prevent duplicates"""
+        # Modern records use TypedRecord with fileRef system
+        from ...record_facades import FileRefRecordFacade
+        facade = FileRefRecordFacade()
+        facade.record = record
+        
+        file_uids_to_remove = []
+        for file_uid in facade.file_ref:
+            if file_uid in params.record_cache:
+                file_record = vault.KeeperRecord.load(params, file_uid)
+                if isinstance(file_record, vault.FileRecord):
+                    if file_record.name.lower() == 'config.json' or file_record.title.lower() == 'config.json':
+                        file_uids_to_remove.append(file_uid)
+        
+        if file_uids_to_remove:
+            for file_uid in file_uids_to_remove:
+                facade.file_ref.remove(file_uid)
+            DockerSetupPrinter.print_success(f"Removed {len(file_uids_to_remove)} existing config.json attachment(s)")
+
+    
+    def _clean_config_json(self, config_path: str) -> str:
+        """Clean config.json by keeping only essential authentication keys"""
+        try:
+            with open(config_path, 'r') as f:
+                config_data = json.load(f)
+            
+            # Essential keys for authentication
+            essential_keys = {
+                'server', 'user', 'device_token', 'private_key',
+                'device_id', 'clone_code', 'session_token', 'data_key'
+            }
+            
+            cleaned_config = {k: v for k, v in config_data.items() if k in essential_keys}
+            removed_count = len(config_data) - len(cleaned_config)
+            
+            if removed_count > 0:
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp_file:
+                    json.dump(cleaned_config, tmp_file, indent=2)
+                    temp_path = tmp_file.name
+                
+                DockerSetupPrinter.print_success(
+                    f"Config cleaned (kept {len(cleaned_config)} essential keys, removed {removed_count} non-essential)"
+                )
+                return temp_path
+            else:
+                DockerSetupPrinter.print_success("Config is already minimal")
+                return config_path
+                
+        except Exception as e:
+            DockerSetupPrinter.print_warning(f"Could not clean config: {str(e)}")
+            return config_path
+
+    def _create_ksm_app(self, params, app_name: str) -> str:
+        """Create a KSM app, or reuse an owned app with the same title."""
+        existing_app = self._find_owned_ksm_app_by_title(params, app_name)
+        if existing_app:
+            DockerSetupPrinter.print_success("Using existing app")
+            return existing_app.get('record_uid')
+
+        existing_any = KSMCommand.get_app_record(params, app_name)
+        force_to_add = False
+        if existing_any:
+            existing_uid = existing_any.get('record_uid')
+            if self._is_owned_record(params, existing_uid):
+                DockerSetupPrinter.print_success("Using existing app")
+                return existing_uid
+            force_to_add = True
+            DockerSetupPrinter.print_warning(
+                f"Ignoring Secrets Manager app '{app_name}' owned by another account; "
+                f"creating a new owned app"
+            )
+
+        try:
+            old_stdout = sys.stdout
+            sys.stdout = io.StringIO()
+            try:
+                KSMCommand.add_new_v5_app(
+                    params, app_name, force_to_add=force_to_add, format_type='table'
+                )
+            finally:
+                sys.stdout = old_stdout
+
+            api.sync_down(params)
+
+            app_rec = self._find_owned_ksm_app_by_title(params, app_name)
+            if not app_rec:
+                raise CommandError('docker-setup', 'Failed to retrieve created app')
+
+            app_uid = app_rec.get('record_uid')
+            DockerSetupPrinter.print_success(f"App created successfully (UID: {app_uid})")
+            return app_uid
+        except CommandError:
+            raise
+        except Exception as e:
+            raise CommandError('docker-setup', f'Failed to create KSM app: {str(e)}')
+
+    def _share_folder_with_app(self, params, app_uid: str, folder_uid: str) -> None:
+        """Share the folder with the KSM app"""
+        try:
+            app_rec = KSMCommand.get_app_record(params, app_uid)
+            if not app_rec:
+                raise CommandError('docker-setup', 'App not found')
+
+            # Suppress all output (stdout and logging)
+            old_stdout = sys.stdout
+            old_log_level = logging.root.level
+            
+            sys.stdout = io.StringIO()
+            logging.root.setLevel(logging.CRITICAL + 1)  # Disable all logging
+            try:
+                KSMCommand.add_app_share(
+                    params,
+                    secret_uids=[folder_uid],
+                    app_name_or_uid=app_uid,
+                    is_editable=True
+                )
+            finally:
+                sys.stdout = old_stdout
+                logging.root.setLevel(old_log_level)     
+            DockerSetupPrinter.print_success("Folder shared with app")
+        except Exception as e:
+            raise CommandError('docker-setup', f'Failed to share folder with app: {str(e)}')
+
+    def _create_client_device(self, params, app_uid: str, app_name: str) -> str:
+        """Create client device and return b64 config"""
+        try:
+            client_name = DockerSetupConstants.DEFAULT_CLIENT_NAME
+            
+            tokens_and_devices = KSMCommand.add_client(
+                params=params,
+                app_name_or_uid=app_uid,
+                count=1,
+                unlock_ip=True,
+                first_access_expire_on=60,
+                access_expire_in_min=None,
+                client_name=client_name,
+                config_init='b64',
+                silent=True
+            )
+            
+            if not tokens_and_devices or len(tokens_and_devices) == 0:
+                raise CommandError('docker-setup', 'Failed to generate client device')
+
+            b64_config = tokens_and_devices[0]['config']
+            DockerSetupPrinter.print_success("Client device created successfully")
+            
+            return b64_config
+        except Exception as e:
+            raise CommandError('docker-setup', f'Failed to create client device: {str(e)}')
+
+    # ========================
+    # Shared Configuration Methods
+    # ========================
+
+    def _get_ngrok_config(self) -> Dict[str, Any]:
+        """Get ngrok configuration"""
+        print(f"\n{bcolors.BOLD}Ngrok Tunneling (optional):{bcolors.ENDC}")
+        print(f"  Generate a public URL for your service using ngrok")
+        use_ngrok = input(f"{bcolors.OKBLUE}Enable ngrok? [Press Enter for No] (y/n):{bcolors.ENDC} ").strip().lower() == 'y'
+        
+        config = {'ngrok_enabled': use_ngrok, 'ngrok_auth_token': '', 'ngrok_custom_domain': '', 'ngrok_public_url': ''}
+        
+        if use_ngrok:
+            while True:
+                token = input(f"{bcolors.OKBLUE}Ngrok auth token:{bcolors.ENDC} ").strip()
+                try:
+                    config['ngrok_auth_token'] = ConfigValidator.validate_ngrok_token(token)
+                    break
+                except ValidationError as e:
+                    print(f"{bcolors.FAIL}Error: {str(e)}{bcolors.ENDC}")
+            
+            # Validate custom domain if provided (ngrok allows subdomain prefixes)
+            domain = input(f"{bcolors.OKBLUE}Ngrok custom domain [Press Enter to skip]:{bcolors.ENDC} ").strip()
+            if domain:
+                while True:
+                    try:
+                        config['ngrok_custom_domain'] = ConfigValidator.validate_domain(domain, require_tld=False)
+                        # Construct ngrok public URL
+                        if '.' not in config['ngrok_custom_domain']:
+                            config['ngrok_public_url'] = f"https://{config['ngrok_custom_domain']}.ngrok.io"
+                        else:
+                            config['ngrok_public_url'] = f"https://{config['ngrok_custom_domain']}"
+                        break
+                    except ValidationError as e:
+                        print(f"{bcolors.FAIL}Error: {str(e)}{bcolors.ENDC}")
+                        domain = input(f"{bcolors.OKBLUE}Ngrok custom domain [Press Enter to skip]:{bcolors.ENDC} ").strip()
+                        if not domain:
+                            break
+        
+        return config
+
+    def _get_cloudflare_config(self) -> Dict[str, Any]:
+        """Get Cloudflare configuration"""
+        print(f"\n{bcolors.BOLD}Cloudflare Tunneling (optional):{bcolors.ENDC}")
+        print(f"  Generate a public URL for your service using Cloudflare")
+        use_cloudflare = input(f"{bcolors.OKBLUE}Enable Cloudflare? [Press Enter for No] (y/n):{bcolors.ENDC} ").strip().lower() == 'y'
+        
+        config = {'cloudflare_enabled': use_cloudflare, 'cloudflare_tunnel_token': '', 
+                  'cloudflare_custom_domain': '', 'cloudflare_public_url': ''}
+        
+        if use_cloudflare:
+            while True:
+                token = input(f"{bcolors.OKBLUE}Cloudflare tunnel token:{bcolors.ENDC} ").strip()
+                try:
+                    config['cloudflare_tunnel_token'] = ConfigValidator.validate_cloudflare_token(token)
+                    break
+                except ValidationError as e:
+                    print(f"{bcolors.FAIL}Error: {str(e)}{bcolors.ENDC}")
+            
+            while True:
+                domain = input(f"{bcolors.OKBLUE}Cloudflare custom domain:{bcolors.ENDC} ").strip()
+                try:
+                    config['cloudflare_custom_domain'] = ConfigValidator.validate_domain(domain)
+                    # Construct cloudflare public URL
+                    config['cloudflare_public_url'] = f"https://{config['cloudflare_custom_domain']}"
+                    break
+                except ValidationError as e:
+                    print(f"{bcolors.FAIL}Error: {str(e)}{bcolors.ENDC}")
+        
+        return config
+
+    def _get_tailscale_config(self) -> Dict[str, Any]:
+        """Get Tailscale Funnel configuration"""
+        print(f"\n{bcolors.BOLD}Tailscale Funnel (optional):{bcolors.ENDC}")
+        print(f"  Generate a public URL for your service using Tailscale Funnel")
+        use_tailscale = input(f"{bcolors.OKBLUE}Enable Tailscale? [Press Enter for No] (y/n):{bcolors.ENDC} ").strip().lower() == 'y'
+
+        config = {'tailscale_enabled': use_tailscale, 'tailscale_auth_key': '',
+                  'tailscale_advertise_tags': '', 'tailscale_public_url': ''}
+
+        if use_tailscale:
+            while True:
+                key = input(f"{bcolors.OKBLUE}Tailscale auth key:{bcolors.ENDC} ").strip()
+                try:
+                    config['tailscale_auth_key'] = ConfigValidator.validate_tailscale_auth_key(key)
+                    break
+                except ValidationError as e:
+                    print(f"{bcolors.FAIL}Error: {str(e)}{bcolors.ENDC}")
+
+            config['tailscale_advertise_tags'] = input(
+                f"{bcolors.OKBLUE}Tailscale ACL tags to advertise, comma-separated "
+                f"[Press Enter to skip; required for OAuth-derived keys]:{bcolors.ENDC} "
+            ).strip()
+
+        return config
+
+    @staticmethod
+    def _disabled_tailscale_config() -> Dict[str, Any]:
+        return {'tailscale_enabled': False, 'tailscale_auth_key': '',
+                'tailscale_advertise_tags': '', 'tailscale_public_url': ''}
+
+    def _get_advanced_security_config(self) -> Dict[str, Any]:
+        """Get advanced security configuration (IP filter, rate limit, encryption, token expiry)."""
+        print(f"\n{bcolors.BOLD}Advanced Security (optional):{bcolors.ENDC}")
+        print(f"  Configure IP filtering, rate limiting, and response encryption")
+        enable_advanced = input(
+            f"{bcolors.OKBLUE}Enable advanced security? [Press Enter for No] (y/n):{bcolors.ENDC} "
+        ).strip().lower() == 'y'
+
+        config = {
+            'allowed_ip': '0.0.0.0/0,::/0',
+            'denied_ip': '',
+            'rate_limit': '',
+            'encryption_enabled': False,
+            'encryption_key': '',
+            'token_expiration': ''
+        }
+
+        if enable_advanced:
+            config.update(self._get_ip_allowed_config())
+            config.update(self._get_ip_denied_config())
+            config.update(self._get_rate_limit_config())
+            config.update(self._get_encryption_config())
+            config.update(self._get_token_expiration_config())
+
+        return config
+
+    def _get_ip_allowed_config(self) -> Dict[str, str]:
+        """Get allowed IP configuration"""
+        print(f"\n{bcolors.BOLD}IP Allowed List:{bcolors.ENDC}")
+        print(f"  Comma-separated IPs or CIDR ranges (e.g., 192.168.1.0/24,10.0.0.1)")
+
+        ip_list = input(f"{bcolors.OKBLUE}Allowed IPs [Press Enter for all]:{bcolors.ENDC} ").strip()
+
+        if ip_list:
+            while True:
+                try:
+                    return {'allowed_ip': ConfigValidator.validate_ip_list(ip_list)}
+                except ValidationError as e:
+                    print(f"{bcolors.FAIL}Error: {str(e)}{bcolors.ENDC}")
+                    ip_list = input(
+                        f"{bcolors.OKBLUE}Allowed IPs [Press Enter for all]:{bcolors.ENDC} "
+                    ).strip()
+                    if not ip_list:
+                        break
+
+        return {'allowed_ip': '0.0.0.0/0,::/0'}
+
+    def _get_ip_denied_config(self) -> Dict[str, str]:
+        """Get denied IP configuration"""
+        print(f"\n{bcolors.BOLD}IP Denied List:{bcolors.ENDC}")
+        print(f"  Comma-separated IPs or CIDR ranges to block")
+
+        ip_list = input(f"{bcolors.OKBLUE}Denied IPs [Press Enter to skip]:{bcolors.ENDC} ").strip()
+
+        if ip_list:
+            while True:
+                try:
+                    return {'denied_ip': ConfigValidator.validate_ip_list(ip_list)}
+                except ValidationError as e:
+                    print(f"{bcolors.FAIL}Error: {str(e)}{bcolors.ENDC}")
+                    ip_list = input(
+                        f"{bcolors.OKBLUE}Denied IPs [Press Enter to skip]:{bcolors.ENDC} "
+                    ).strip()
+                    if not ip_list:
+                        break
+
+        return {'denied_ip': ''}
+
+    def _get_rate_limit_config(self) -> Dict[str, str]:
+        """Get rate limiting configuration"""
+        print(f"\n{bcolors.BOLD}Rate Limiting:{bcolors.ENDC}")
+        print(f"  Format: <number>/<period> (e.g., 10/minute, 100/hour, 1000/day)")
+
+        rate_limit = input(f"{bcolors.OKBLUE}Rate limit [Press Enter to skip]:{bcolors.ENDC} ").strip()
+
+        if rate_limit:
+            while True:
+                try:
+                    return {'rate_limit': ConfigValidator.validate_rate_limit(rate_limit)}
+                except ValidationError as e:
+                    print(f"{bcolors.FAIL}Error: {str(e)}{bcolors.ENDC}")
+                    rate_limit = input(
+                        f"{bcolors.OKBLUE}Rate limit [Press Enter to skip]:{bcolors.ENDC} "
+                    ).strip()
+                    if not rate_limit:
+                        break
+
+        return {'rate_limit': ''}
+
+    def _get_encryption_config(self) -> Dict[str, Any]:
+        """Get encryption configuration"""
+        print(f"\n{bcolors.BOLD}Response Encryption:{bcolors.ENDC}")
+        print(f"  Enable AES-256 encryption for API responses")
+        enable_encryption = input(
+            f"{bcolors.OKBLUE}Enable encryption? [Press Enter for No] (y/n):{bcolors.ENDC} "
+        ).strip().lower() == 'y'
+
+        config = {'encryption_enabled': enable_encryption, 'encryption_key': ''}
+
+        if enable_encryption:
+            print(f"  Encryption key must be exactly 32 alphanumeric characters")
+            while True:
+                key = input(f"{bcolors.OKBLUE}Encryption key (32 chars):{bcolors.ENDC} ").strip()
+                try:
+                    config['encryption_key'] = ConfigValidator.validate_encryption_key(key)
+                    break
+                except ValidationError as e:
+                    print(f"{bcolors.FAIL}Error: {str(e)}{bcolors.ENDC}")
+
+        return config
+
+    def _get_token_expiration_config(self) -> Dict[str, str]:
+        """Get token expiration configuration"""
+        print(f"\n{bcolors.BOLD}API Token Expiration:{bcolors.ENDC}")
+        print(f"  Format: Xm (minutes), Xh (hours), Xd (days) - e.g., 30m, 24h, 7d")
+
+        expiration = input(
+            f"{bcolors.OKBLUE}Token expiration [Press Enter for never]:{bcolors.ENDC} "
+        ).strip()
+
+        if expiration:
+            while True:
+                try:
+                    ConfigValidator.parse_expiration_time(expiration)
+                    return {'token_expiration': expiration}
+                except ValidationError as e:
+                    print(f"{bcolors.FAIL}Error: {str(e)}{bcolors.ENDC}")
+                    expiration = input(
+                        f"{bcolors.OKBLUE}Token expiration [Press Enter for never]:{bcolors.ENDC} "
+                    ).strip()
+                    if not expiration:
+                        break
+
+        return {'token_expiration': ''}

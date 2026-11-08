@@ -1,0 +1,2941 @@
+#  _  __
+# | |/ /___ ___ _ __  ___ _ _ ®
+# | ' </ -_) -_) '_ \/ -_) '_|
+# |_|\_\___\___| .__/\___|_|
+#              |_|
+#
+# Keeper Commander
+# Copyright 2026 Keeper Security Inc.
+# Contact: commander@keepersecurity.com
+#
+# CyberArk → KeeperPAM import orchestrator
+# Fetches accounts from CyberArk PVWA, maps them to PAM record types,
+# and calls pam project import/extend to create vault records.
+#
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import copy
+import json
+import logging
+import os
+import re
+import tempfile
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+from prompt_toolkit import HTML, print_formatted_text
+
+from ..base import Command
+from ..pam.vault_target import is_nested_share_folder, is_pam_nsf_record
+from ... import api, vault, vault_extensions
+from ...display import bcolors
+from ...error import CommandError
+from ...importer.cyberark.cyberark_pam import (
+    _esc,
+    CyberArkPVWAClient,
+    AccountMapper,
+    StrictPolicyError,
+    MasterPolicyMapper,
+    UserTeamMatcher,
+    PermissionMapper,
+    SafeFolderMapper,
+    AdaptiveThrottler,
+    SessionRecordingResolver,
+    apply_safe_filter,
+    exclude_system_safes,
+    resolve_account_dependents,
+    resolve_linked_accounts,
+    PAM_SERVICE_ADD_TYPES,
+    pick_admin_credentials,
+    pick_launch_credentials,
+    detect_dual_account,
+    build_import_json,
+    build_extend_json,
+    build_report,
+    build_safe_folders,
+    format_duration,
+    strip_credentials,
+    validate_import_data,
+    RECORD_TYPE_LOGIN,
+    RECORD_TYPE_PAM_MACHINE,
+    RECORD_TYPE_PAM_DATABASE,
+    RECORD_TYPE_PAM_DIRECTORY,
+    RECORD_TYPE_PAM_REMOTE_BROWSER,
+    SCHEDULE_ON_DEMAND,
+    ROTATION_UNMAPPED,
+)
+from ...importer.cyberark.pam.idempotency import (
+    ExistingRecordIndex,
+    IdempotencyDecision,
+    PartitionSummary,
+    RecordDecision,
+    build_existing_index,
+    partition_records,
+    strip_id_marker,
+    summarize,
+)
+from .nsf_helpers import find_pam_configuration, get_folder_record_uids
+from .record_loader import iter_accessible_record_uids, load_pam_record
+
+
+def is_matching_title(title: str, base: str) -> bool:
+    """True when *title* equals *base* or is ``{base} #N`` (case-insensitive)."""
+    title = title.casefold()
+    if title == base:
+        return True
+    if not title.startswith(base):
+        return False
+    return bool(re.fullmatch(r" #\d+", title[len(base):]))
+
+
+class SecureTempFileStore:
+    """Writes JSON to owner-only temp files and securely wipes them on removal."""
+
+    def __init__(self):
+        self._pending: set[str] = set()
+        atexit.register(self.cleanup_all)
+
+    def cleanup_all(self):
+        for path in list(self._pending):
+            self.remove(path)
+
+    def write_json(self, data: dict) -> str:
+        tmp_dir = tempfile.gettempdir()
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            suffix='.json', prefix='keeper_ca_import_', dir=tmp_dir,
+        )
+        try:
+            with os.fdopen(tmp_fd, 'w', encoding='utf-8') as fh:
+                json.dump(data, fh, indent=2)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        self._pending.add(tmp_path)
+        return tmp_path
+
+    def remove(self, tmp_path: str):
+        try:
+            if os.path.exists(tmp_path):
+                size = os.path.getsize(tmp_path)
+                with open(tmp_path, 'wb') as fh:
+                    fh.write(b'\x00' * size)
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+        self._pending.discard(tmp_path)
+
+
+_temp_store = SecureTempFileStore()
+
+
+def _write_secure_temp_json(data: dict) -> str:
+    """Backward-compatible alias for tests and external callers."""
+    return _temp_store.write_json(data)
+
+
+def _remove_secure_temp(tmp_path: str):
+    """Backward-compatible alias for tests and external callers."""
+    _temp_store.remove(tmp_path)
+
+
+@dataclass
+class ImportRunOptions:
+    """Normalized CLI options for a single import run."""
+
+    server: str
+    project_name: str
+    config_uid: str
+    gateway_name: str
+    folder_mode: str
+    dry_run: bool
+    output_file: str
+    include_creds: bool
+    estimate_only: bool
+    skip_confirm: bool
+    skip_users: bool
+    skip_linked: bool
+    skip_members: bool
+    skip_dependents: bool
+    safe_include: str
+    safe_exclude: str
+    list_safes: bool
+    batch_size: int
+    batch_delay: float
+    platform_map_override: Optional[dict]
+    state_filter: Optional[list[str]]
+    include_system_safes: bool
+    user_map_file: str
+    sync_mode: str = "upsert"
+    strict_policies: bool = False
+    use_nsf: bool = False
+    raw_kwargs: dict = field(default_factory=dict)
+    add_cyberark_users: bool = False
+
+
+@dataclass
+class MappedImportResult:
+    """Output of the account-mapping phase."""
+
+    pam_resources: list[dict]
+    pam_users: list[dict]
+    incomplete: list[dict]
+    skipped: list[dict]
+    platform_counts: dict[str, dict]
+    total_accounts: int
+    accounts_by_safe: dict[str, list[dict]]
+    mapper: AccountMapper
+    folder_mapper: SafeFolderMapper
+    unmapped_items: list[dict]
+    dependents: list[dict] = field(default_factory=list)
+    import_duration: float = 0.0
+
+
+class CyberArkImportOrchestrator:
+    """Coordinates CyberArk PVWA fetch → map → vault import phases (SRP)."""
+    DELAY = 0.5  # seconds between CyberArk API calls to avoid throttling
+
+    def __init__(self, command: 'CyberArkPAMImportCommand', params, client: CyberArkPVWAClient,
+                 options: ImportRunOptions):
+        self._cmd = command
+        self.params = params
+        self.client = client
+        self.options = options
+        self._temp = _temp_store
+
+    def run(self) -> None:
+        unmapped_items: list[dict] = []
+        master_policy_config = self._load_master_policy(unmapped_items)
+        safes, system_excluded = self._prepare_safes()
+        if not safes:
+            return
+        if self.options.list_safes:
+            self._cmd._list_safes_detailed(safes, system_excluded)
+            return
+        safes = self._maybe_interactive_safe_pick(safes)
+        if not safes:
+            return
+        safe_names = [s.get("safeUrlId", s["safeName"]) for s in safes]
+        safe_member_map, member_unmapped = self._fetch_safe_members(safe_names)
+        unmapped_items.extend(member_unmapped)
+        user_team_matcher = self._build_user_team_matcher()
+        accounts_by_safe = self._fetch_accounts(safe_names)
+        total_accounts = sum(len(v) for v in accounts_by_safe.values())
+        if total_accounts == 0:
+            print_formatted_text(HTML("<ansiyellow>No accounts found in selected safes</ansiyellow>"))
+            return
+        if self.options.estimate_only:
+            self._print_estimate(len(accounts_by_safe), total_accounts)
+            return
+        self._maybe_auto_extend()
+        mapped = self._map_accounts(
+            accounts_by_safe, safe_names, master_policy_config, unmapped_items,
+        )
+        unmapped_items.extend(mapped.mapper.platform_workflow_unmapped)
+        self._print_mapping_summary(mapped, unmapped_items)
+        validation_warnings = validate_import_data(mapped.pam_resources, mapped.pam_users)
+        if validation_warnings:
+            self._print_validation_warnings(validation_warnings)
+        idempotency_ctx = self._prepare_idempotency(mapped)
+        import_data = self._build_import_payload(
+            mapped, safe_member_map, user_team_matcher, master_policy_config,
+        )
+        if self.options.output_file:
+            self._write_output_file(import_data)
+            return
+        if self.options.dry_run:
+            self._print_dry_run(import_data, mapped)
+            return
+        if not self._confirm_import(mapped, idempotency_ctx):
+            return
+        # Apply the partition to the import payload just before we
+        # call pam project import/extend, so create-only records go
+        # through and update / unchanged records are handled out of
+        # band. Done here (not earlier) so the report accurately
+        # reflects what the mapper produced from CyberArk, not what
+        # survived the idempotency filter. ``mapped`` is passed so
+        # the filter can mutate ``pam_resources`` / ``pam_users`` in
+        # place — ``_execute_vault_import`` reads those lists
+        # directly for the multi-batch path, not the ``import_data``
+        # dict, so any filtered-out record must be dropped from both
+        # views simultaneously.
+        if idempotency_ctx:
+            self._apply_idempotency_filter(import_data, mapped, idempotency_ctx)
+        # Skip the vault write entirely when every mapped record was
+        # already up to date — avoids a no-op ``pam project extend``
+        # round-trip and lets the report acknowledge "nothing to do".
+        # We still run the update path in case any records were
+        # tagged as UPDATE (their data changed even though no new
+        # records need to be created).
+        enterprise_users = None
+        if self.options.add_cyberark_users:
+            enterprise_users = self._provision_cyberark_users()
+        skip_vault_import = (
+            idempotency_ctx is not None
+            and not mapped.pam_resources
+            and not mapped.pam_users
+        )
+        if skip_vault_import:
+            project_result = {
+                "project_name": self.options.project_name,
+                "config_uid": self.options.config_uid,
+                "folders": {},
+            }
+            self._populate_folder_info(project_result, self.options.project_name)
+        else:
+            project_result = self._execute_vault_import(import_data, mapped)
+        if idempotency_ctx and project_result is not None:
+            update_summary = self._apply_record_updates(idempotency_ctx)
+            idempotency_ctx["update_summary"] = update_summary
+        self._finalize_report(
+            mapped, mapped.unmapped_items, project_result, total_accounts,
+            user_team_matcher, idempotency_ctx, enterprise_users=enterprise_users
+        )
+
+    def _provision_cyberark_users(self) -> dict:
+        # Optional step: a CyberArk user-fetch failure must not abort the PAM import.
+        print_formatted_text(HTML("\nFetching CyberArk Users..."))
+        try:
+            cyberark_users = self._prepare_users()
+        except Exception as e:
+            logging.warning('Failed to fetch CyberArk users: %s', e)
+            return {"users": [], "error": "Failed to fetch CyberArk users"}
+        return self._cmd._create_enterprise_users(self.params, cyberark_users)
+
+    @staticmethod
+    def _get_case_insensitive(data: dict, target_key: str) -> Optional[Any]:
+        if not isinstance(data, dict):
+            return None
+        if target_key in data:
+            return data[target_key]
+        target_lower = target_key.lower()
+        return next((v for k, v in data.items() if str(k).lower() == target_lower), None)
+
+
+    def _extract_user_email(self, user):
+        """Return the best available email for a CyberArk user dict, or None."""
+        internet = self._get_case_insensitive(user, "internet")
+        personal = self._get_case_insensitive(user, "personaldetails")
+        sources = (
+            (internet, "businessEmail"),
+            (internet, "homeEmail"),
+            (internet, "otherEmail"),
+            (user, "email"),
+            (personal, "email"),
+        )
+        for target_dict, target_key in sources:
+            email = self._get_case_insensitive(target_dict, target_key)
+            # Edge Case :  if email = "    " --> condition checks that it is not None or empty string
+            if isinstance(email, str):
+                sanitized_email = email.strip()
+                if sanitized_email:
+                    return sanitized_email
+        return None
+
+    def _get_user_details(self, id):
+        try:
+            user_detail = self.client.fetch_user_details(id)
+            return user_detail
+        except Exception as e:
+            logging.warning('Failed to fetch user with id "%s": %s', id, e)
+            return None
+
+    def _prepare_users(self): # type: () -> list[dict]
+        all_users = self.client.fetch_users()
+        result = []
+        for u in all_users:
+            if isinstance(u, dict):
+                email = self._extract_user_email(u)
+                user_id = u.get("id")
+                if not email and user_id not in (None,""):
+                    time.sleep(self.DELAY)
+                    user_details = self._get_user_details(user_id)
+                    email = self._extract_user_email(user_details)
+                # in user_details also if we did not find the email, we will not add the user to the result
+                if email:
+                    result.append(
+                        {
+                            "id": user_id,
+                            "username": u.get("username") or "",
+                            "email": email
+                        }
+                    )
+        print_formatted_text(HTML(f"Found <b>{len(result)}</b> CyberArk users "))
+        return result
+
+    def _load_master_policy(self, unmapped_items: list[dict]) -> dict:
+        master_policy_config = dict(MasterPolicyMapper.DEFAULTS)
+        print_formatted_text(HTML("Fetching Master Policy..."))
+        policy_data = self.client.fetch_master_policy()
+        if policy_data:
+            self._log_master_policy_raw(policy_data)
+            master_policy_config, mp_unmapped = MasterPolicyMapper.map_policy(policy_data)
+            unmapped_items.extend(mp_unmapped)
+        else:
+            logging.warning(
+                '%sMaster Policy not accessible — using defaults. '
+                'Review PAM config settings manually.%s',
+                bcolors.WARNING, bcolors.ENDC,
+            )
+        # Logs the raw exceptions JSON at INFO internally; returns None when
+        # the tenant doesn't expose a real per-platform list (common — see
+        # fetch_master_rotation_policy_exceptions docstring), in which case
+        # AccountMapper falls back to the per-platform rotation-policy check.
+        exceptions_raw = self.client.fetch_master_rotation_policy_exceptions()
+        master_policy_config["rotation_exception_schedules"] = (
+            MasterPolicyMapper.parse_rotation_exceptions(exceptions_raw)
+            if exceptions_raw else {}
+        )
+        try:
+            master_sm = self.client.fetch_master_session_monitoring()
+        except Exception as e:  # noqa: BLE001 — never block import on optional fetch
+            logging.debug('Master session-monitoring fetch failed: %s', type(e).__name__)
+            master_sm = None
+        master_policy_config = SessionRecordingResolver.apply_to_master_config(
+            master_policy_config, master_sm,
+        )
+        if master_sm and master_policy_config.get("graphical_session_recording") == "on":
+            logging.debug(
+                'Master session-monitoring resolved to ON — '
+                'PAM Configuration session recording will be enabled.',
+            )
+        if policy_data:
+            self._print_master_policy_summary(master_policy_config)
+        return master_policy_config
+
+    @staticmethod
+    def _log_master_policy_raw(policy_data: dict):
+        try:
+            logging.debug(
+                'CyberArk Master Policy (raw response):\n%s',
+                json.dumps(policy_data, indent=2, sort_keys=True),
+            )
+        except (TypeError, ValueError) as e:
+            logging.error("Could not serialize Master Policy for display: %s", type(e).__name__)
+
+    @staticmethod
+    def _print_master_policy_summary(master_policy_config: dict):
+        sched = master_policy_config.get("default_rotation_schedule") or {}
+        sched_type = str(sched.get("type", SCHEDULE_ON_DEMAND)).lower().replace("_", "-")
+        if sched_type == "cron":
+            rotation_summary = (
+                f"every {master_policy_config.get('password_change_days', 0)} days "
+                f"({sched.get('cron', '')})"
+            )
+        else:
+            rotation_summary = SCHEDULE_ON_DEMAND
+        exc_schedules = master_policy_config.get("rotation_exception_schedules") or {}
+        exc_note = ""
+        if exc_schedules:
+            exc_note = (
+                f", rotation_exceptions=<b>{len(exc_schedules)} platform(s)</b>"
+            )
+        print_formatted_text(HTML(
+            f"Master Policy: session_recording="
+            f"<b>{master_policy_config.get('graphical_session_recording', 'off')}</b>, "
+            f"connections=<b>{master_policy_config.get('connections', 'on')}</b>, "
+            f"rotation=<b>{_esc(rotation_summary)}</b>{exc_note}"))
+
+    def _prepare_safes(self) -> tuple[list[dict], int]:
+        all_safes = self.client.fetch_safes()
+        if not all_safes:
+            return [], 0
+        safes = exclude_system_safes(
+            all_safes, include_system=self.options.include_system_safes,
+        )
+        system_excluded = len(all_safes) - len(safes)
+        safes = apply_safe_filter(
+            safes,
+            self.options.safe_include or None,
+            self.options.safe_exclude or None,
+        )
+        if not safes:
+            print_formatted_text(HTML("<ansiyellow>No safes match the filter criteria</ansiyellow>"))
+        return safes, system_excluded
+
+    def _maybe_interactive_safe_pick(self, safes: list[dict]) -> list[dict]:
+        opts = self.options
+        if (opts.safe_include or opts.safe_exclude or opts.skip_confirm
+                or opts.dry_run or opts.output_file
+                or getattr(self.params, 'batch_mode', False)):
+            return safes
+        selected = self._cmd._interactive_safe_picker(safes)
+        if selected is None:
+            return safes
+        if not selected:
+            return []
+        selected_set = set(selected)
+        picked = [s for s in safes if s.get("safeName", "") in selected_set]
+        if not picked:
+            print_formatted_text(HTML("<ansiyellow>No safes selected</ansiyellow>"))
+        return picked
+
+    def _fetch_safe_members(self, safe_names: list[str]) -> tuple[dict, list[dict]]:
+        opts = self.options
+        if opts.skip_members or opts.dry_run:
+            return {}, []
+        print_formatted_text(HTML(
+            f"\nFetching safe members from <b>{len(safe_names)}</b> safes..."))
+        safe_member_map: dict[str, list[dict]] = {}
+        member_unmapped: list[dict] = []
+        for safe_url_id in safe_names:
+            mapped = []
+            for m in self.client.fetch_safe_members(safe_url_id):
+                mapped_member = PermissionMapper.map_member(m)
+                mapped.append(mapped_member)
+                for up in mapped_member.get("unmapped_permissions", []):
+                    member_unmapped.append({
+                        "category": "Safe member permission",
+                        "item": f"{mapped_member['name']} in {safe_url_id}",
+                        "action": f"CyberArk permission '{up}' has no Keeper equivalent",
+                    })
+            if mapped:
+                safe_member_map[safe_url_id] = mapped
+        total_members = sum(len(v) for v in safe_member_map.values())
+        print_formatted_text(HTML(
+            f"Found <b>{total_members}</b> members across "
+            f"<b>{len(safe_member_map)}</b> safes"))
+        return safe_member_map, member_unmapped
+
+    def _build_user_team_matcher(self) -> Optional[UserTeamMatcher]:
+        opts = self.options
+        if opts.skip_users or opts.skip_members or opts.dry_run:
+            return None
+        print_formatted_text(HTML("\nFetching CyberArk vault users and groups..."))
+        ca_users = self.client.fetch_users()
+        ca_groups = self.client.fetch_user_groups()
+        user_map_override = self._load_user_map_override()
+        keeper_users, keeper_teams = self._load_keeper_identities()
+        matcher = UserTeamMatcher(
+            keeper_users=keeper_users,
+            keeper_teams=keeper_teams,
+            user_map_override=user_map_override,
+        )
+        print_formatted_text(HTML(
+            f"Found <b>{len(ca_users)}</b> vault users, <b>{len(ca_groups)}</b> groups"))
+        return matcher
+
+    def _load_user_map_override(self) -> Optional[dict]:
+        path = self.options.user_map_file
+        if not path:
+            return None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict):
+                raise CommandError(
+                    "pam project cyberark-import",
+                    f"--user-map file must contain a JSON object, got {type(data).__name__}",
+                )
+            return data
+        except (FileNotFoundError, ValueError) as e:
+            raise CommandError("pam project cyberark-import",
+                               f"Failed to load --user-map file: {e}") from e
+
+    def _load_keeper_identities(self) -> tuple[list[dict], list[dict]]:
+        keeper_users: list[dict] = []
+        keeper_teams: list[dict] = []
+        if hasattr(self.params, 'enterprise') and self.params.enterprise:
+            for u in self.params.enterprise.get('users', []):
+                keeper_users.append({
+                    'email': u.get('username', ''),
+                    'username': u.get('username', ''),
+                })
+        else:
+            logging.warning(
+                '%sEnterprise data not available — all safe members will appear as '
+                'unmatched. Ensure you are logged in as an enterprise admin.%s',
+                bcolors.WARNING, bcolors.ENDC,
+            )
+        if hasattr(self.params, 'available_team_cache') and self.params.available_team_cache:
+            for t in self.params.available_team_cache:
+                keeper_teams.append({'name': t.get('team_name', '')})
+        return keeper_users, keeper_teams
+
+    def _fetch_accounts(self, safe_names: list[str]) -> dict[str, list[dict]]:
+        print_formatted_text(HTML(
+            f"\nFetching accounts from <b>{len(safe_names)}</b> safes..."))
+        return self.client.fetch_accounts(safe_names, state_filter=self.options.state_filter)
+
+    @staticmethod
+    def _print_estimate(safe_count: int, total_accounts: int):
+        est_seconds = total_accounts * 3
+        print(f"\nSafes:    {safe_count}")
+        print(f"Accounts: {total_accounts}")
+        print(f"Estimated import time: ~{format_duration(est_seconds)}")
+
+
+    def _map_accounts(self, accounts_by_safe: dict[str, list[dict]], safe_names: list[str],
+                      master_policy_config: dict,
+                      unmapped_items: list[dict]) -> MappedImportResult:
+        opts = self.options
+        try:
+            ca_platforms = self.client.fetch_platforms()
+            if ca_platforms:
+                logging.debug(
+                    "Loaded %d CyberArk platform definitions for mapping", len(ca_platforms),
+                )
+        except Exception as e:
+            logging.error("fetch_platforms failed (%s) — proceeding without platform metadata",
+                          type(e).__name__)
+            ca_platforms = []
+        mapper = AccountMapper(
+            opts.platform_map_override,
+            platforms=ca_platforms,
+            client=self.client,
+            default_rotation_schedule=master_policy_config.get("default_rotation_schedule"),
+            master_rotation_exceptions=master_policy_config.get(
+                "rotation_exception_schedules"),
+            master_change_days=master_policy_config.get("password_change_days", 0),
+            strict_policies=opts.strict_policies,
+        )
+        folder_mapper = SafeFolderMapper(mode=opts.folder_mode)
+        pam_resources: list[dict] = []
+        pam_users: list[dict] = []
+        incomplete: list[dict] = []
+        skipped: list[dict] = []
+        platform_counts: dict[str, dict] = {}
+        skip_all_passwords: dict[str, bool] = {}
+        dependents: list[dict] = []
+        for safe_name, accounts in accounts_by_safe.items():
+            for account in accounts:
+                self._map_single_account(
+                    account, safe_name, mapper, folder_mapper, master_policy_config,
+                    pam_resources, pam_users, incomplete, skipped, platform_counts,
+                    skip_all_passwords, unmapped_items, dependents,
+                )
+        return MappedImportResult(
+            pam_resources=pam_resources,
+            pam_users=pam_users,
+            incomplete=incomplete,
+            skipped=skipped,
+            platform_counts=platform_counts,
+            total_accounts=sum(len(v) for v in accounts_by_safe.values()),
+            accounts_by_safe=accounts_by_safe,
+            mapper=mapper,
+            folder_mapper=folder_mapper,
+            unmapped_items=unmapped_items,
+            dependents=dependents,
+        )
+
+    def _map_single_account(
+        self, account: dict, safe_name: str, mapper: AccountMapper,
+        folder_mapper: SafeFolderMapper, master_policy_config: dict,
+        pam_resources: list[dict], pam_users: list[dict], incomplete: list[dict],
+        skipped: list[dict], platform_counts: dict[str, dict],
+        skip_all_passwords: dict, unmapped_items: list[dict],
+        dependents: list[dict],
+    ):
+        opts = self.options
+        if not isinstance(account, dict):
+            logging.error("Skipping account mapping: expected dict, got %s", type(account).__name__)
+            return
+        # CyberArk API field is camelCase and case-sensitive.
+        platform_id = account.get("platformId") or "Unknown"
+        if platform_id not in platform_counts:
+            mapping = mapper.platform_map.get(platform_id)
+            if not isinstance(mapping, dict):
+                mapping = {}
+            platform_counts[platform_id] = {
+                "rotation": mapping.get("rotation", ROTATION_UNMAPPED),
+                "count": 0,
+            }
+        platform_counts[platform_id]["count"] += 1
+        is_incomplete, reason = mapper.is_incomplete(account)
+        # Hold the retrieved credential as ``token`` (not ``password``) so
+        # accidental log formatting is less likely to leak the secret name.
+        # Clear it immediately after map_account copies it into the record.
+        token = None
+        record = None
+        password_failed = False
+        try:
+            if not opts.dry_run or opts.include_creds:
+                token = self.client.retrieve_password(
+                    account.get("id", ""),
+                    account_name=account.get("name", ""),
+                    safe_name=safe_name,
+                    skip_all=skip_all_passwords,
+                )
+                if token is None:
+                    password_failed = True
+                    skipped.append({
+                        "account": account.get("name", ""),
+                        "safe": safe_name,
+                        "reason": "password retrieval failed",
+                    })
+                    # Still map host/username so the account is not dropped from
+                    # the PAM project (legacy import also keeps going after Skip).
+                    token = ""
+            try:
+                record = mapper.map_account(account, token, safe_name)
+            except StrictPolicyError as e:
+                raise CommandError("pam project cyberark-import", str(e)) from e
+        finally:
+            # Drop the local plaintext reference as soon as mapping finishes
+            # (or fails). The record dict still holds the credential for vault
+            # import when needed — that is intentional and short-lived.
+            token = None
+        if not isinstance(record, dict):
+            skipped.append({
+                "account": account.get("name", ""),
+                "safe": safe_name,
+                "reason": f"unmappable platformId: {platform_id}",
+            })
+            return
+        self._apply_folder_paths(record, safe_name, folder_mapper)
+        if password_failed:
+            reason = "password retrieval failed"
+            is_incomplete = True
+        if is_incomplete:
+            incomplete.append(record)
+        dual_fields = detect_dual_account(account)
+        if dual_fields:
+            record.setdefault("custom", [])
+            for key, val in dual_fields.items():
+                record["custom"].append({"type": "text", "label": key, "value": [val]})
+            unmapped_items.append({
+                "category": "Dual account pair",
+                "item": account.get("name", ""),
+                "action": "Exclusive rotation behavior requires manual "
+                          "configuration in KeeperPAM rotation settings",
+            })
+        if (not opts.skip_linked and not opts.dry_run and not opts.skip_users
+                and record.get("type") != RECORD_TYPE_LOGIN):
+            self._attach_linked_accounts(record, account, safe_name, folder_mapper)
+        self._collect_dependents(account, record, dependents, unmapped_items)
+        if record.get("type") == RECORD_TYPE_LOGIN:
+            pam_users.append(record)
+        else:
+            if record.get("type") == RECORD_TYPE_PAM_REMOTE_BROWSER:
+                for user in record.pop("users", []) or []:
+                    if isinstance(user, dict):
+                        pam_users.append(user)
+            if opts.skip_users:
+                record.pop("users", None)
+            pam_resources.append(record)
+
+    def _collect_dependents(self, account: dict, record: dict,
+                            dependents: list[dict], unmapped_items: list[dict]):
+        """Resolve CyberArk dependents (services/tasks/IIS pools) for ``account``
+        and append them to ``dependents`` for post-import service mapping.
+
+        The "user" the service runs as is the nested pamUser record on this
+        resource (we use its title as the lookup key). Non-pamMachine records
+        (login, pamDatabase) cannot host a Windows service, so they're skipped.
+        Categories with no Keeper equivalent (e.g. COM+) are recorded in
+        ``unmapped_items`` so admins can act on them manually.
+        """
+        opts = self.options
+        if opts.skip_dependents or opts.dry_run:
+            return
+        if not isinstance(account, dict) or not isinstance(record, dict):
+            logging.error(
+                "Skipping dependents: account/record must be dicts (got %s / %s)",
+                type(account).__name__, type(record).__name__,
+            )
+            return
+        # Keeper record types are case-sensitive (pamMachine ≠ Pammachine).
+        if record.get("type") != RECORD_TYPE_PAM_MACHINE:
+            return
+        users = record.get("users") or []
+        if not isinstance(users, list) or not users:
+            return
+        first_user = users[0] if isinstance(users[0], dict) else {}
+        master_user_title = first_user.get("title", "") or ""
+        if not master_user_title:
+            return
+        try:
+            account_dependents = resolve_account_dependents(
+                self.client, account, master_user_title,
+            )
+        except Exception as e:  # noqa: BLE001 — never block import on optional fetch
+            logging.error('Dependents resolution failed for %s: %s',
+                          account.get("name", "?"), type(e).__name__)
+            return
+        if not account_dependents:
+            return
+        if not isinstance(account_dependents, list):
+            logging.error(
+                "Dependents resolution returned non-list for %s: %s",
+                account.get("name", "?"), type(account_dependents).__name__,
+            )
+            return
+        machine_title = record.get("title", "")
+        for dep in account_dependents:
+            if not isinstance(dep, dict):
+                continue
+            dep["machine_title"] = machine_title
+            refs = dep.setdefault("machine_refs", [])
+            if isinstance(refs, list) and machine_title:
+                refs.append(machine_title)
+            if dep.get("service_type") is None:
+                unmapped_items.append({
+                    "category": "CyberArk dependent",
+                    "item": (f"{dep.get('service_name') or '?'} "
+                             f"({dep.get('raw_type') or 'unknown'}) "
+                             f"on {dep.get('machine_address', '?')}"),
+                    "action": "No KeeperPAM equivalent for this dependent type "
+                              "— configure manually if required",
+                })
+            dependents.append(dep)
+        # Surface progress + a per-dependent breakdown so the operator can see
+        # exactly what the importer parsed before the post-import phase runs.
+        print_formatted_text(HTML(
+            f"Found <b>{len(account_dependents)}</b> CyberArk dependent(s) "
+            f"on account <b>{_esc(account.get('name', '?'))}</b>"))
+        for dep in account_dependents:
+            mapped_to = dep.get("service_type") or "(unsupported)"
+            print_formatted_text(HTML(
+                f"  • <b>{_esc(dep.get('service_name', '') or '?')}</b> "
+                f"({_esc(dep.get('raw_type', '') or 'unknown')}) "
+                f"on <b>{_esc(dep.get('machine_address', '') or '?')}</b> "
+                f"→ pam action service add --type <b>{_esc(mapped_to)}</b>"))
+
+    def _apply_folder_paths(self, record: dict, safe_name: str,
+                            folder_mapper: SafeFolderMapper):
+        opts = self.options
+        if opts.folder_mode == "flat":
+            return
+        safe_folder = folder_mapper.map_safe(safe_name, opts.project_name)
+        if not safe_folder:
+            return
+        if opts.folder_mode == "safe":
+            # ``safe`` mode: each safe is its own root shared folder
+            # under the project wrapper, with two organizational
+            # subfolders inside — ``{safe} - Resources`` for the asset
+            # records (pamMachine / pamDatabase / pamDirectory /
+            # pamRemoteBrowser) and ``{safe} - Users`` for the
+            # credential records (pamUser nested under a resource, plus
+            # standalone ``login`` records). Prefixing the subfolder
+            # names with the safe name makes them unambiguous in the
+            # Keeper UI even when expanded out of their parent folder
+            # context. The safe's permission set is granted at the
+            # shared-folder level, so both subfolders inherit it
+            # automatically — we only need to route records to the
+            # right subfolder.
+            res_sub = f"{safe_folder}/{safe_folder} - Resources"
+            usr_sub = f"{safe_folder}/{safe_folder} - Users"
+            if record.get("type") == RECORD_TYPE_LOGIN:
+                record["folder_path"] = usr_sub
+            else:
+                record["folder_path"] = res_sub
+            for u in record.get("users", []):
+                u["folder_path"] = usr_sub
+            return
+        res_root = f"{opts.project_name} - Resources"
+        usr_root = f"{opts.project_name} - Users"
+        if record.get("type") == RECORD_TYPE_LOGIN:
+            record["folder_path"] = f"{usr_root}/{safe_folder}"
+        else:
+            record["folder_path"] = f"{res_root}/{safe_folder}"
+        for u in record.get("users", []):
+            u["folder_path"] = f"{usr_root}/{safe_folder}"
+
+    def _attach_linked_accounts(self, record: dict, account: dict, safe_name: str,
+                                folder_mapper: SafeFolderMapper):
+        linked_users = resolve_linked_accounts(self.client, account)
+        if not linked_users:
+            return
+        record.setdefault("users", []).extend(linked_users)
+        admin_title, admin_role = pick_admin_credentials(linked_users)
+        if admin_title:
+            conn = record.setdefault("pam_settings", {}).setdefault("connection", {})
+            conn["administrative_credentials"] = admin_title
+            logging.info("Mapped %s account '%s' as administrative_credentials on '%s'",
+                         admin_role, admin_title, record.get("title", ""))
+        logon_title = pick_launch_credentials(linked_users)
+        if logon_title:
+            conn = record.setdefault("pam_settings", {}).setdefault("connection", {})
+            conn["launch_credentials"] = logon_title
+            logging.info("Overrode launch_credentials with logon account '%s' on '%s'",
+                         logon_title, record.get("title", ""))
+        if self.options.folder_mode != "flat":
+            safe_folder = folder_mapper.map_safe(safe_name, self.options.project_name)
+            if safe_folder:
+                if self.options.folder_mode == "safe":
+                    usr_sub = f"{safe_folder}/{safe_folder} - Users"
+                    for lu in linked_users:
+                        lu["folder_path"] = usr_sub
+                else:
+                    usr_root = f"{self.options.project_name} - Users"
+                    for lu in linked_users:
+                        lu["folder_path"] = f"{usr_root}/{safe_folder}"
+
+    def _print_mapping_summary(self, mapped: MappedImportResult, unmapped_items: list[dict]):
+        resource_count = len(mapped.pam_resources)
+        user_count = sum(len(r.get("users", [])) for r in mapped.pam_resources)
+        login_count = len(mapped.pam_users)
+        print()
+        print(f"{bcolors.OKBLUE}Mapped {mapped.total_accounts} CyberArk accounts:{bcolors.ENDC}")
+        print(f"  Resources (pamMachine/pamDatabase): {resource_count}")
+        print(f"  Users (pamUser, nested):            {user_count}")
+        print(f"  Logins (BusinessWebsite):           {login_count}")
+        if unmapped_items:
+            print(f"  {bcolors.WARNING}Unmapped (manual action needed):  {len(unmapped_items)}{bcolors.ENDC}")
+        if mapped.incomplete:
+            print(f"  {bcolors.WARNING}Incomplete:                         {len(mapped.incomplete)}{bcolors.ENDC}")
+        if mapped.skipped:
+            print(f"  {bcolors.WARNING}Skipped:                            {len(mapped.skipped)}{bcolors.ENDC}")
+        mapper = mapped.mapper
+        if mapper.unmapped_platforms:
+            print(f"  {bcolors.WARNING}Unmapped platforms (defaulted):     "
+                  f"{sum(mapper.unmapped_platforms.values())}{bcolors.ENDC}")
+            for pid, cnt in mapper.unmapped_platforms.items():
+                print(f"    {pid}: {cnt} accounts")
+        if mapper.platform_schedule_overrides:
+            total_overrides = sum(mapper.platform_schedule_overrides.values())
+            print(f"  {bcolors.OKBLUE}Platform rotation-policy overrides: {total_overrides}{bcolors.ENDC}")
+            for pid, cnt in sorted(mapper.platform_schedule_overrides.items()):
+                cached = mapper._platform_schedule_cache.get(pid) or {}
+                cron = cached.get("cron", cached.get("type", "?"))
+                print(f"    {pid}: {cnt} accounts -> {cron}")
+        if mapper.platform_recording_overrides:
+            total_rec = sum(mapper.platform_recording_overrides.values())
+            print(f"  {bcolors.OKBLUE}Platform session-recording overrides: {total_rec}{bcolors.ENDC}")
+            for pid, cnt in sorted(mapper.platform_recording_overrides.items()):
+                rec = mapper._platform_session_cache.get(pid) or ("?", "?")
+                print(f"    {pid}: {cnt} resources -> graphical={rec[0]}")
+        if mapper.platform_complexity_overrides:
+            total_pc = sum(mapper.platform_complexity_overrides.values())
+            print(f"  {bcolors.OKBLUE}Platform password-complexity overrides: {total_pc}{bcolors.ENDC}")
+            for pid, cnt in sorted(mapper.platform_complexity_overrides.items()):
+                cx = mapper._platform_complexity_cache.get(pid) or "?"
+                print(f"    {pid}: {cnt} accounts -> {cx}  (length,upper,lower,digits,symbols)")
+        if mapper._platform_metadata_cache:
+            total_md = sum(1 for v in mapper._platform_metadata_cache.values() if v)
+            if total_md:
+                print(f"  {bcolors.OKBLUE}Platform metadata custom fields: "
+                      f"{total_md} platform(s) emitted CyberArk metadata{bcolors.ENDC}")
+                for pid, fields in sorted(mapper._platform_metadata_cache.items()):
+                    if fields:
+                        print(f"    {pid}: {len(fields)} field(s)")
+        print()
+
+    @staticmethod
+    def _print_validation_warnings(validation_warnings: list[str]):
+        print_formatted_text(HTML(
+            f"\n<ansiyellow>⚠ {len(validation_warnings)} validation warning(s):</ansiyellow>"))
+        for w in validation_warnings:
+            print_formatted_text(HTML(f"  <ansiyellow>• {_esc(w)}</ansiyellow>"))
+        print()
+
+    def _build_import_payload(self, mapped: MappedImportResult, safe_member_map: dict,
+                              user_team_matcher: Optional[UserTeamMatcher],
+                              master_policy_config: dict) -> dict:
+        opts = self.options
+        if opts.config_uid:
+            return build_extend_json(mapped.pam_resources, mapped.pam_users)
+        return build_import_json(
+            project_name=opts.project_name,
+            gateway_name=opts.gateway_name or None,
+            resources=mapped.pam_resources,
+            users=mapped.pam_users,
+            safe_member_map=safe_member_map or None,
+            user_team_matcher=user_team_matcher,
+            master_policy_config=master_policy_config,
+            folder_mapper=mapped.folder_mapper,
+        )
+
+    def _write_output_file(self, import_data: dict):
+        output_data = copy.deepcopy(import_data)
+        if not self.options.include_creds:
+            strip_credentials(output_data)
+        fd = os.open(
+            self.options.output_file,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(output_data, fh, indent=2)
+        print(f"Import JSON saved to: {self.options.output_file}")
+
+    def _print_dry_run(self, import_data: dict, mapped: MappedImportResult):
+        resource_count = len(mapped.pam_resources)
+        user_count = sum(len(r.get("users", [])) for r in mapped.pam_resources)
+        login_count = len(mapped.pam_users)
+        print("[DRY RUN] No changes will be made to the vault.\n")
+        output_data = copy.deepcopy(import_data)
+        if not self.options.include_creds:
+            strip_credentials(output_data)
+        print(json.dumps(output_data, indent=2))
+        print()
+        print(f"[DRY RUN COMPLETE] {resource_count} resources, {user_count} users, "
+              f"{login_count} logins would be imported.")
+
+    def _confirm_import(self, mapped: MappedImportResult,
+                        idempotency_ctx: Optional[dict] = None) -> bool:
+        opts = self.options
+        if opts.skip_confirm:
+            return True
+        resource_count = len(mapped.pam_resources)
+        user_count = sum(len(r.get("users", [])) for r in mapped.pam_resources)
+        login_count = len(mapped.pam_users)
+        print(f"Ready to import {resource_count} resources, {user_count} users, "
+              f"{login_count} logins into project '{opts.project_name}'.")
+        if opts.config_uid:
+            print(f"Extending existing PAM configuration: {opts.config_uid}")
+        else:
+            print("A new PAM project will be created.")
+        # Surface the create / update / unchanged breakdown so the
+        # operator knows exactly what will happen before we touch the
+        # vault.  Without this a re-run against an existing project
+        # looks like it's about to create hundreds of duplicates when
+        # in fact most of the mapped records are unchanged and will be
+        # silently skipped.
+        if idempotency_ctx:
+            summary = idempotency_ctx.get("partition_summary")
+            if summary is not None:
+                print(
+                    f"Sync plan (--sync-mode={opts.sync_mode}): "
+                    f"{bcolors.OKGREEN}{summary.created} to create{bcolors.ENDC}, "
+                    f"{bcolors.OKBLUE}{summary.updated} to update{bcolors.ENDC}, "
+                    f"{bcolors.WARNING}{summary.unchanged} unchanged{bcolors.ENDC}"
+                )
+                for dec in idempotency_ctx.get("decisions", []):
+                    if dec.decision is not IdempotencyDecision.UPDATE:
+                        continue
+                    title = (dec.incoming.get("title") or dec.account_id or "?")
+                    fields = ", ".join(dec.change_fields) or "(none)"
+                    print(f"    • update {title}: {fields}")
+        confirm = input("Proceed? [y/N] ").strip().lower()
+        if confirm not in ("y", "yes"):
+            print("Import cancelled.")
+            return False
+        return True
+
+    def _execute_vault_import(self, import_data: dict,
+                              mapped: MappedImportResult) -> Optional[dict]:
+        opts = self.options
+        import_start = time.time()
+        try:
+            result = self._cmd._execute_import(
+                self.params, import_data, opts.project_name, opts.config_uid,
+                opts.batch_size, opts.batch_delay,
+                mapped.pam_resources, mapped.pam_users,
+                use_nsf=opts.use_nsf,
+            )
+        except Exception as e:
+            logging.error("Import failed: %s", type(e).__name__)
+            logging.debug("Import error details: %s", e)
+            logging.debug("Import traceback:", exc_info=True)
+            print_formatted_text(HTML(f"\nImport <ansired>failed</ansired>: {type(e).__name__}"))
+            return None
+        mapped.import_duration = time.time() - import_start
+        # Augment ``project_result`` with the actual shared folders that
+        # got created under the project wrapper so build_report can list
+        # them. PAMProjectImportCommand doesn't return this info, so we
+        # rediscover it from the synced folder cache.
+        if isinstance(result, dict):
+            result.setdefault("folders", {})
+            self._populate_folder_info(result, opts.project_name)
+        return result
+
+    def _populate_folder_info(self, project_result: dict, project_name: str) -> None:
+        """Fill ``project_result['folders']`` with the freshly-created
+        shared folders so the post-import report shows the safe-per-
+        folder layout. Best-effort — failures here don't affect the
+        import itself.
+        """
+        from ... import api as _api  # noqa: WPS433 — local import to mirror style
+        try:
+            _api.sync_down(self.params)
+        except Exception:  # noqa: BLE001
+            pass
+
+        wrapper_uids = CyberArkPAMCleanupCommand._find_project_wrapper_folder_uids(
+            self.params, project_name,
+        )
+        if not wrapper_uids:
+            return
+
+        folders_info = project_result.get("folders") or {}
+        safe_folders: list[dict] = []
+        config_folder_uid = ""
+        config_folder_name = ""
+        legacy_resources_uid = ""
+        legacy_resources_name = ""
+        legacy_users_uid = ""
+        legacy_users_name = ""
+        config_suffix = f"{project_name} - Config"
+        resources_suffix = f"{project_name} - Resources"
+        users_suffix = f"{project_name} - Users"
+
+        seen_uids: set = set()
+        for wrapper_uid in wrapper_uids:
+            for child_uid, name in CyberArkPAMCleanupCommand._iter_project_child_folders(
+                    self.params, wrapper_uid):
+                if child_uid in seen_uids:
+                    continue
+                seen_uids.add(child_uid)
+                if name == config_suffix:
+                    config_folder_uid = child_uid
+                    config_folder_name = name
+                elif name == resources_suffix:
+                    legacy_resources_uid = child_uid
+                    legacy_resources_name = name
+                elif name == users_suffix:
+                    legacy_users_uid = child_uid
+                    legacy_users_name = name
+                else:
+                    safe_folders.append({"name": name, "uid": child_uid})
+
+        if config_folder_uid:
+            folders_info["config_folder"] = config_folder_name
+            folders_info["config_folder_uid"] = config_folder_uid
+            folders_info.setdefault("resources_folder", config_folder_name)
+            folders_info.setdefault("resources_folder_uid", config_folder_uid)
+            folders_info.setdefault("users_folder", config_folder_name)
+            folders_info.setdefault("users_folder_uid", config_folder_uid)
+        if legacy_resources_uid:
+            folders_info["resources_folder"] = legacy_resources_name
+            folders_info["resources_folder_uid"] = legacy_resources_uid
+        if legacy_users_uid:
+            folders_info["users_folder"] = legacy_users_name
+            folders_info["users_folder_uid"] = legacy_users_uid
+        if safe_folders:
+            folders_info["safe_folders"] = safe_folders
+
+        project_result["folders"] = folders_info
+
+    def _finalize_report(self, mapped: MappedImportResult, unmapped_items: list[dict],
+                         project_result: Optional[dict], total_accounts: int,
+                         user_team_matcher: Optional[UserTeamMatcher],
+                         idempotency_ctx: Optional[dict] = None, enterprise_users: Optional[list] = None):
+        if project_result is None:
+            return
+        dependent_summary = self._apply_service_dependent_mappings(
+            mapped, project_result, unmapped_items,
+        )
+        resource_counts = self._build_resource_counts(mapped)
+        import_duration = mapped.import_duration
+        if dependent_summary:
+            self._print_dependent_summary(dependent_summary)
+        if idempotency_ctx:
+            self._print_idempotency_summary(idempotency_ctx)
+        report_text = build_report(
+            project_name=self.options.project_name,
+            safes_processed=len(mapped.accounts_by_safe),
+            total_accounts=total_accounts,
+            resource_counts=resource_counts,
+            platform_counts=mapped.platform_counts,
+            skipped=mapped.skipped,
+            incomplete_count=len(mapped.incomplete),
+            duration=import_duration,
+            project_result=project_result,
+            unmapped_platforms=mapped.mapper.unmapped_platforms,
+            unmapped_items=unmapped_items,
+            enterprise_users=enterprise_users,
+            server=self.options.server,
+        )
+        notes_text = report_text
+        gw_token = (project_result or {}).get("gateway", {}).get("gateway_token", "")
+        if gw_token:
+            notes_text = notes_text.replace(
+                gw_token, '(see "Gateway Access Token" field on this record)')
+        try:
+            print()
+            print(report_text)
+        except (BrokenPipeError, OSError):
+            pass
+        report_config_uid = (project_result or {}).get("config_uid", "") or self.options.config_uid
+        if report_config_uid:
+            self._attach_report_files(notes_text, report_config_uid, user_team_matcher)
+
+    # ------------------------------------------------------------------
+    # Idempotency (upsert) support
+    # ------------------------------------------------------------------
+
+    def _maybe_auto_extend(self) -> None:
+        """Promote a repeat import to extend mode when the target exists.
+
+        Runs before mapping so ``_build_import_payload`` picks the
+        ``build_extend_json`` branch and the vault write goes through
+        ``PAMProjectExtendCommand`` (which grafts records onto an
+        existing project) instead of ``PAMProjectImportCommand``
+        (which creates a fresh ``project #2`` folder).
+
+        Skipped when:
+        - ``--sync-mode create`` — the user explicitly asked for the
+          legacy always-create behavior.
+        - ``--config`` was provided — the caller already told us
+          which project to extend.
+        - No PAM project with this name exists — we're a fresh import.
+        - ``--dry-run`` / ``--output`` / ``--list-safes`` /
+          ``--estimate`` — those never touch the vault; no need to
+          resolve a config UID.
+        """
+        opts = self.options
+        if (opts.sync_mode or "").lower() == "create":
+            return
+        if opts.config_uid:
+            return
+        if opts.use_nsf:
+            return
+        if opts.dry_run or opts.output_file or opts.list_safes or opts.estimate_only:
+            return
+        # sync_down here so folder_cache / record_cache reflect any
+        # project the operator (or a peer) just created via the UI.
+        from ... import api as _api
+        try:
+            _api.sync_down(self.params)
+        except Exception:  # noqa: BLE001 — best-effort refresh
+            return
+        wrapper_uids = self._find_project_wrapper_uids(opts.project_name)
+        if not wrapper_uids:
+            return
+        resolved = self._cmd._find_config_uid(self.params, opts.project_name)
+        if not resolved:
+            logging.debug(
+                "Project '%s' folder tree exists but no PAM configuration "
+                "record was found — proceeding as a fresh import.",
+                opts.project_name,
+            )
+            return
+        self.options.config_uid = resolved
+        print_formatted_text(HTML(
+            f"<ansiblue>Detected existing PAM project '{_esc(opts.project_name)}'"
+            f" — switching to extend mode (config: {_esc(resolved)}).</ansiblue>"
+        ))
+
+    def _prepare_idempotency(self, mapped: MappedImportResult) -> Optional[dict]:
+        """Scan the target project and partition ``mapped`` records.
+
+        Returns ``None`` when idempotency is disabled (``--sync-mode
+        create``) or when the target project doesn't exist yet (fresh
+        import — nothing to reconcile).  Otherwise returns a dict
+        holding the :class:`ExistingRecordIndex`, the ordered list of
+        :class:`RecordDecision`, and the summary counters that the
+        confirmation prompt and post-import report consume.
+        """
+        opts = self.options
+        if (opts.sync_mode or "").lower() == "create":
+            return None
+        if opts.use_nsf and not opts.config_uid:
+            return None
+        if opts.dry_run or opts.output_file:
+            # Both paths skip the vault write; there's nothing to
+            # de-dupe against and the pre-scan would only slow the
+            # dry-run down.
+            return None
+
+        from ... import api as _api
+        try:
+            _api.sync_down(self.params)
+        except Exception:  # noqa: BLE001 — sync is best-effort
+            pass
+
+        wrapper_uids = self._find_project_wrapper_uids(opts.project_name)
+        if not wrapper_uids:
+            # New project — no records exist yet.  Bail so we don't
+            # pay the full-vault scan cost for nothing.
+            return None
+
+        # Collect all shared / NSF folders directly under the project
+        # wrapper folder(s).  Records live inside these (and inside
+        # their Resources / Users subfolders for the safe-per-folder
+        # layout).
+        shared_folder_uids: list[str] = []
+        seen: set = set()
+        for wrapper_uid in wrapper_uids:
+            for child_uid, _name in CyberArkPAMCleanupCommand._iter_project_child_folders(
+                    self.params, wrapper_uid):
+                if child_uid in seen:
+                    continue
+                seen.add(child_uid)
+                shared_folder_uids.append(child_uid)
+
+        existing = build_existing_index(self.params, shared_folder_uids)
+        if not existing.by_account_id and not existing.by_title:
+            # Project exists but is empty (unusual — probably a
+            # partially-cleaned-up prior run).  Nothing to reconcile.
+            return None
+
+        decisions = partition_records(
+            mapped.pam_resources, mapped.pam_users, existing,
+            diff_fn=self._diff_incoming_vs_existing,
+        )
+        summary = summarize(decisions)
+        return {
+            "existing": existing,
+            "decisions": decisions,
+            "partition_summary": summary,
+            "wrapper_uids": wrapper_uids,
+        }
+
+    def _find_project_wrapper_uids(self, project_name: str) -> list[str]:
+        """Locate the project wrapper user-folder(s) under PAM Environments.
+
+        Delegates to :class:`CyberArkPAMCleanupCommand` so cleanup /
+        idempotency / reporting all share the same discovery rules
+        (they need to agree on which folder tree constitutes "this
+        project").
+        """
+        return CyberArkPAMCleanupCommand._find_project_wrapper_folder_uids(
+            self.params, project_name,
+        )
+
+    @staticmethod
+    def _get_field_value(record, field_type: str, label: str = "") -> str:
+        """Return the first stringified value of a typed field.
+
+        ``field_type`` matches ``TypedField.type`` (e.g. ``"login"``,
+        ``"password"``, ``"pamHostname"``).  ``label`` is used only
+        for the ``text``/``checkbox`` families where the type alone
+        isn't enough to disambiguate (both ``operatingSystem`` and
+        ``instanceName`` are stored as ``text``, for instance).
+        """
+        if record is None:
+            return ""
+        for f in getattr(record, "fields", []) or []:
+            ftype = getattr(f, "type", "") or ""
+            flabel = getattr(f, "label", "") or ""
+            if ftype != field_type:
+                continue
+            if label and flabel != label:
+                continue
+            vals = getattr(f, "value", None) or []
+            if not vals:
+                return ""
+            raw = vals[0]
+            if isinstance(raw, str):
+                return raw
+            if isinstance(raw, dict):
+                # pamHostname is stored as {hostName, port}.  We rejoin
+                # them into "host:port" for a stable diff key; the
+                # incoming record dict emits ``host`` and ``port``
+                # separately so callers hit the specialized branch
+                # below rather than this one.
+                if "hostName" in raw:
+                    return str(raw.get("hostName") or "")
+                return str(raw)
+            return str(raw)
+        return ""
+
+    @staticmethod
+    def _get_hostname_port(record) -> tuple[str, str]:
+        """Extract ``(hostName, port)`` from a pamHostname typed field."""
+        for f in getattr(record, "fields", []) or []:
+            if (getattr(f, "type", "") or "") != "pamHostname":
+                continue
+            vals = getattr(f, "value", None) or []
+            if not vals:
+                return "", ""
+            raw = vals[0]
+            if isinstance(raw, dict):
+                return (str(raw.get("hostName") or ""),
+                        str(raw.get("port") or ""))
+            if isinstance(raw, str):
+                return raw, ""
+        return "", ""
+
+    def _diff_incoming_vs_existing(self, existing_rec, incoming: dict) -> list[str]:
+        """Return the list of field names where the two records differ.
+
+        Only the fields the CyberArk mapper actually writes are
+        compared: title, notes body (marker line stripped so it is
+        never a diff driver), credentials (login / password /
+        SSH key), host + port, operating_system, distinguished_name,
+        connect_database and url.  Rotation settings, pam_settings
+        options and workflow permissions are intentionally **not**
+        diffed because operators legitimately customize them in the
+        Keeper UI after the initial import — clobbering those on a
+        re-run would surprise everyone.
+
+        An empty list means the record is unchanged.  Any non-empty
+        return puts the record on the update path.
+        """
+        changes: list[str] = []
+
+        rtype = incoming.get("type", "") or ""
+
+        # Title
+        incoming_title = (incoming.get("title") or "").strip()
+        existing_title = (getattr(existing_rec, "title", "") or "").strip()
+        if incoming_title and incoming_title != existing_title:
+            changes.append("title")
+
+        # Notes (marker line excluded so it never causes a false diff)
+        incoming_notes = strip_id_marker(incoming.get("notes") or "").strip()
+        existing_notes = strip_id_marker(getattr(existing_rec, "notes", "") or "").strip()
+        if incoming_notes != existing_notes:
+            changes.append("notes")
+
+        # Login-family fields
+        if rtype in ("login", "pamUser"):
+            if (incoming.get("login") or "") != self._get_field_value(existing_rec, "login"):
+                changes.append("login")
+            # Password change is the whole point of a re-sync when CyberArk
+            # rotated the credential.  Only diff when the incoming value is
+            # non-empty — a redacted / omitted password should not clobber
+            # what's already stored.
+            incoming_password = incoming.get("password") or ""
+            if incoming_password and incoming_password != self._get_field_value(existing_rec, "password"):
+                changes.append("password")
+            if incoming.get("private_pem_key"):
+                if incoming["private_pem_key"] != self._get_field_value(existing_rec, "secret", "privatePEMKey"):
+                    changes.append("private_pem_key")
+            if rtype == "pamUser":
+                if (incoming.get("distinguished_name") or "") != self._get_field_value(
+                        existing_rec, "text", "distinguishedName"):
+                    changes.append("distinguished_name")
+                if (incoming.get("connect_database") or "") != self._get_field_value(
+                        existing_rec, "text", "connectDatabase"):
+                    changes.append("connect_database")
+            if rtype == RECORD_TYPE_LOGIN:
+                if (incoming.get("url") or "") != self._get_field_value(existing_rec, "url"):
+                    changes.append("url")
+
+        # Resource-family fields
+        if rtype in (RECORD_TYPE_PAM_MACHINE, RECORD_TYPE_PAM_DATABASE, RECORD_TYPE_PAM_DIRECTORY):
+            e_host, e_port = self._get_hostname_port(existing_rec)
+            i_host = (incoming.get("host") or "").strip()
+            i_port = (incoming.get("port") or "").strip()
+            if i_host and i_host != e_host:
+                changes.append("host")
+            if i_port and i_port != e_port:
+                changes.append("port")
+            if rtype == RECORD_TYPE_PAM_MACHINE:
+                if (incoming.get("operating_system") or "") != self._get_field_value(
+                        existing_rec, "text", "operatingSystem"):
+                    changes.append("operating_system")
+
+        return changes
+
+    def _apply_idempotency_filter(self, import_data: dict,
+                                  mapped: MappedImportResult,
+                                  idempotency_ctx: dict) -> None:
+        """Rewrite the import payload to only include CREATE records.
+
+        Mutates the underlying lists in place (``mapped.pam_resources``,
+        ``mapped.pam_users``, and each resource's ``users`` sublist)
+        so both ``import_data["pam_data"]`` (used by the single-batch
+        path) and the ``resources`` / ``users`` args threaded through
+        ``_execute_vault_import`` → ``_multi_batch_import`` (which
+        rebuilds the payload from those lists) see the same filtered
+        set.  ``pam_data.resources`` and ``mapped.pam_resources``
+        already point at the same list object thanks to how
+        ``build_import_json`` constructs the payload, so a slice
+        assignment on either propagates to the other.
+        """
+        decisions_by_id: dict[int, RecordDecision] = {
+            id(d.incoming): d for d in idempotency_ctx.get("decisions", [])
+        }
+
+        def _keep(record: dict) -> bool:
+            dec = decisions_by_id.get(id(record))
+            if dec is None:
+                # Defensive: a record the partition didn't see (e.g.
+                # added post-partition by another mapper hook) is
+                # left as-is so we don't accidentally drop new data.
+                return True
+            return dec.decision is IdempotencyDecision.CREATE
+
+        # Filter nested pamUsers first so a resource that survives
+        # the outer filter carries only its CREATE-worthy children.
+        for res in mapped.pam_resources or []:
+            nested = res.get("users")
+            if isinstance(nested, list):
+                nested[:] = [u for u in nested if _keep(u)]
+
+        # Slice assignment (list[:] = ...) mutates the list object,
+        # so the alias ``import_data["pam_data"]["resources"]`` sees
+        # the same filtered view.
+        mapped.pam_resources[:] = [r for r in mapped.pam_resources if _keep(r)]
+        mapped.pam_users[:] = [u for u in mapped.pam_users if _keep(u)]
+
+    def _apply_record_updates(self, idempotency_ctx: dict) -> dict:
+        """Push UPDATE decisions to the vault via record_management.
+
+        Uses ``vault.KeeperRecord.load`` to grab a fresh copy of the
+        existing record, applies only the fields the mapper actually
+        produced (title, notes, login, password, host, port, ...) and
+        calls ``record_management.update_record`` to persist.  Every
+        exception is caught and counted — a single stale record must
+        never take down the whole re-sync.
+        """
+        from ... import record_management, vault
+        summary = {"updated": 0, "failed": 0, "details": []}
+        for dec in idempotency_ctx.get("decisions", []):
+            if dec.decision is not IdempotencyDecision.UPDATE:
+                continue
+            existing = dec.existing
+            if existing is None or not getattr(existing, "record_uid", ""):
+                continue
+            try:
+                fresh = vault.KeeperRecord.load(self.params, existing.record_uid)
+                if fresh is None:
+                    summary["failed"] += 1
+                    continue
+                self._apply_field_changes(fresh, dec.incoming, dec.change_fields)
+                record_management.update_record(self.params, fresh)
+                summary["updated"] += 1
+                summary["details"].append({
+                    "record_uid": fresh.record_uid,
+                    "title": getattr(fresh, "title", ""),
+                    "fields": dec.change_fields,
+                    "status": "ok",
+                })
+            except Exception as e:  # noqa: BLE001 — surface, don't crash
+                summary["failed"] += 1
+                err_text = str(e) if str(e) else type(e).__name__
+                logging.warning(
+                    "Idempotency update failed for record %s (%s): %s "
+                    "(fields: %s)",
+                    getattr(existing, "record_uid", "?"),
+                    getattr(existing, "title", "?"),
+                    err_text,
+                    ", ".join(dec.change_fields) or "(none)",
+                )
+                summary["details"].append({
+                    "record_uid": getattr(existing, "record_uid", ""),
+                    "title": getattr(existing, "title", ""),
+                    "fields": dec.change_fields,
+                    "status": "failed",
+                    "error": err_text,
+                })
+        return summary
+
+    def _apply_field_changes(self, record, incoming: dict,
+                             changed_fields: list[str]) -> None:
+        """Mutate ``record`` (a loaded KeeperRecord) in place.
+
+        Only the fields listed in ``changed_fields`` are touched —
+        anything else on the record (custom fields, workflow
+        settings, rotation history) is left alone so operator
+        customizations are preserved across re-imports.
+        """
+
+        def _set_field(field_type: str, label: str, value):
+            for f in getattr(record, "fields", []) or []:
+                ftype = getattr(f, "type", "") or ""
+                flabel = getattr(f, "label", "") or ""
+                if ftype != field_type:
+                    continue
+                if label and flabel != label:
+                    continue
+                f.value = [value] if value not in (None, "") else []
+                return
+            # If the record didn't originally carry the field, we
+            # silently drop the update — creating a typed field from
+            # scratch would require record-type schema knowledge that
+            # we don't want to duplicate here.  In practice every
+            # PAM record already has the standard fields provisioned.
+
+        for name in changed_fields:
+            if name == "title":
+                record.title = (incoming.get("title") or "").strip()
+            elif name == "notes":
+                record.notes = incoming.get("notes") or ""
+            elif name == "login":
+                _set_field("login", "", incoming.get("login") or "")
+            elif name == "password":
+                _set_field("password", "", incoming.get("password") or "")
+            elif name == "private_pem_key":
+                _set_field("secret", "privatePEMKey", incoming.get("private_pem_key") or "")
+            elif name == "distinguished_name":
+                _set_field("text", "distinguishedName", incoming.get("distinguished_name") or "")
+            elif name == "connect_database":
+                _set_field("text", "connectDatabase", incoming.get("connect_database") or "")
+            elif name == "url":
+                _set_field("url", "", incoming.get("url") or "")
+            elif name in ("host", "port"):
+                host = (incoming.get("host") or "").strip()
+                port = (incoming.get("port") or "").strip()
+                _set_field("pamHostname", "", {"hostName": host, "port": port})
+            elif name == "operating_system":
+                _set_field("text", "operatingSystem", incoming.get("operating_system") or "")
+
+    def _print_idempotency_summary(self, idempotency_ctx: dict) -> None:
+        summary: PartitionSummary = idempotency_ctx.get("partition_summary")
+        update_summary = idempotency_ctx.get("update_summary") or {}
+        details = update_summary.get("details") or []
+        print()
+        print(f"{bcolors.OKBLUE}Sync results (--sync-mode="
+              f"{self.options.sync_mode}):{bcolors.ENDC}")
+        if summary is not None:
+            print(f"  Created (new):    {summary.created}")
+            print(f"  Updated in place: {update_summary.get('updated', summary.updated)}")
+            print(f"  Unchanged:        {summary.unchanged}")
+            failed = update_summary.get("failed", 0)
+            if failed:
+                print(f"  {bcolors.WARNING}Update failures:  {failed}{bcolors.ENDC}")
+        if details:
+            print()
+            print(f"{bcolors.OKBLUE}Idempotency field updates:{bcolors.ENDC}")
+            for item in details:
+                title = item.get("title") or item.get("record_uid") or "?"
+                fields = item.get("fields") or []
+                field_text = ", ".join(fields) if fields else "(none)"
+                status = item.get("status", "")
+                if status == "failed":
+                    err = item.get("error", "")
+                    print(f"  {bcolors.WARNING}✗{bcolors.ENDC} {title}")
+                    print(f"      fields: {field_text}")
+                    if err:
+                        print(f"      error:  {err}")
+                else:
+                    print(f"  {bcolors.OKGREEN}✓{bcolors.ENDC} {title}")
+                    print(f"      fields: {field_text}")
+        print()
+
+    def _apply_service_dependent_mappings(
+        self, mapped: MappedImportResult, project_result: dict,
+        unmapped_items: list[dict],
+    ) -> Optional[dict]:
+        """Replay CyberArk dependents as KeeperPAM service-account mappings."""
+        opts = self.options
+        if opts.skip_dependents or not mapped.dependents:
+            return None
+
+        gateway = opts.gateway_name or ""
+        config_uid = project_result.get("config_uid") or opts.config_uid or ""
+        if not gateway and not config_uid:
+            logging.debug(
+                "Cannot map CyberArk dependents — gateway/config UID unknown",
+            )
+            return {
+                "total": len(mapped.dependents), "added": 0,
+                "skipped_unsupported": 0, "skipped_non_windows": 0,
+                "skipped_missing_machine": 0, "skipped_missing_user": 0,
+                "skipped_other": len(mapped.dependents),
+                "details": [{"reason": "no gateway/config UID available"}],
+            }
+
+        try:
+            from ... import api, vault, vault_extensions
+            from ...utils import base64_url_encode
+            from ..pam_service.add import PAMActionServiceAddCommand
+            from ..discover import GatewayContext, MultiConfigurationException
+        except ImportError as e:
+            logging.warning("Dependent service mapping unavailable: %s",
+                            type(e).__name__)
+            return None
+
+        api.sync_down(self.params)
+
+        try:
+            if config_uid:
+                gateway_context = GatewayContext.from_configuration_uid(
+                    params=self.params, configuration_uid=config_uid,
+                )
+            else:
+                gateway_context = GatewayContext.from_gateway(
+                    params=self.params, gateway=gateway,
+                )
+        except MultiConfigurationException:
+            logging.warning(
+                "Multiple PAM configurations match this gateway — skipping "
+                "dependent mapping. Re-run 'pam action service add' manually.",
+            )
+            return {
+                "total": len(mapped.dependents), "added": 0,
+                "skipped_other": len(mapped.dependents),
+                "skipped_unsupported": 0, "skipped_non_windows": 0,
+                "skipped_missing_machine": 0, "skipped_missing_user": 0,
+                "details": [{"reason": "multiple matching PAM configurations"}],
+            }
+        if gateway_context is None:
+            logging.warning(
+                "Gateway context unavailable — skipping CyberArk dependent mapping. "
+                "Re-run 'pam action service add' manually for each pair.",
+            )
+            return None
+
+        machine_index, user_index = self._build_record_indexes(
+            mapped, vault, vault_extensions,
+        )
+
+        summary = {
+            "total": len(mapped.dependents),
+            "added": 0,
+            "skipped_unsupported": 0,
+            "skipped_non_windows": 0,
+            "skipped_missing_machine": 0,
+            "skipped_missing_user": 0,
+            "skipped_other": 0,
+            "details": [],
+        }
+        try:
+            gateway_uid = base64_url_encode(gateway_context.gateway.controllerUid)
+        except Exception:
+            gateway_uid = gateway_context.gateway.controllerName
+
+        add_cmd = PAMActionServiceAddCommand()
+
+        for dep in mapped.dependents:
+            # Match pam action service add --type {service,task,iis_pool}
+            service_type = dep.get("service_type")
+            # Legacy persisted project state stored CyberArk IIS dependents as
+            # "iis". Fresh imports emit "iis_pool" via _DEPENDENT_TYPE_ALIASES.
+            if service_type == "iis":
+                service_type = "iis_pool"
+            if service_type not in PAM_SERVICE_ADD_TYPES:
+                summary["skipped_unsupported"] += 1
+                continue
+
+            service_name = (dep.get("service_name") or "").strip()
+            if not service_name:
+                summary["skipped_other"] += 1
+                summary["details"].append({
+                    "service": "",
+                    "host": dep.get("machine_address", ""),
+                    "type": dep.get("raw_type", ""),
+                    "reason": "pam action service add requires --name "
+                              "(Windows service / task / IIS pool name)",
+                })
+                continue
+
+            machine_record = self._find_dependent_machine_record(dep, machine_index)
+            if machine_record is None:
+                summary["skipped_missing_machine"] += 1
+                summary["details"].append({
+                    "service": service_name,
+                    "host": dep.get("machine_address", ""),
+                    "type": dep.get("raw_type", ""),
+                    "reason": "no PAM Machine record imported for this host",
+                })
+                continue
+
+            if not self._is_windows_machine(machine_record):
+                summary["skipped_non_windows"] += 1
+                unmapped_items.append({
+                    "category": "CyberArk dependent",
+                    "item": (f"{service_name or dep.get('raw_type')} "
+                             f"on {dep.get('machine_address')}"),
+                    "action": "Host is not Windows — Keeper PAM can only rotate "
+                              "Windows service / task / IIS credentials",
+                })
+                continue
+
+            user_record = user_index.get(
+                (dep.get("master_user_title") or "").casefold(),
+            )
+            if user_record is None:
+                summary["skipped_missing_user"] += 1
+                summary["details"].append({
+                    "service": service_name,
+                    "host": dep.get("machine_address", ""),
+                    "type": dep.get("raw_type", ""),
+                    "reason": "PAM User record not found in vault after import",
+                })
+                continue
+
+            try:
+                # execute() reads argparse dest names, not CLI flag names:
+                # --type → service_type, --name → name, --machine-uid → machine_uid
+                add_cmd.execute(
+                    self.params,
+                    gateway=gateway_uid,
+                    configuration_uid=gateway_context.configuration.record_uid,
+                    machine_uid=machine_record.record_uid,
+                    user_uid=user_record.record_uid,
+                    service_type=service_type,
+                    name=service_name,
+                )
+                summary["added"] += 1
+            except CommandError as e:
+                summary["skipped_other"] += 1
+                err_text = (e.message or str(e)).strip() or type(e).__name__
+                logging.warning(
+                    "Failed to register %s mapping for %s on %s: %s",
+                    service_type, service_name,
+                    dep.get("machine_address", "?"), err_text,
+                )
+                summary["details"].append({
+                    "service": service_name,
+                    "host": dep.get("machine_address", ""),
+                    "type": dep.get("raw_type", ""),
+                    "reason": f"pam action service add failed: {err_text.splitlines()[0]}",
+                })
+            except Exception as e:  # noqa: BLE001 — never block reporting
+                summary["skipped_other"] += 1
+                err_text = str(e).strip() or type(e).__name__
+                logging.warning(
+                    "Failed to register %s mapping for %s on %s: %s: %s",
+                    service_type, service_name,
+                    dep.get("machine_address", "?"), type(e).__name__,
+                    err_text,
+                )
+                summary["details"].append({
+                    "service": service_name,
+                    "host": dep.get("machine_address", ""),
+                    "type": dep.get("raw_type", ""),
+                    "reason": (
+                        f"pam action service add failed: {type(e).__name__}: "
+                        f"{err_text.splitlines()[0]}"
+                    ),
+                })
+
+        return summary
+
+    @classmethod
+    def _find_dependent_machine_record(cls, dep: dict, machine_index: dict[str, Any]) -> Any:
+        refs = []
+        if isinstance(dep, dict):
+            raw_refs = dep.get("machine_refs")
+            if isinstance(raw_refs, list):
+                refs.extend(raw_refs)
+            refs.extend([
+                dep.get("machine_address", ""),
+                dep.get("machine_title", ""),
+            ])
+        seen = set()
+        for ref in refs:
+            ref = str(ref or "").strip()
+            key = ref.casefold()
+            if not ref or key in seen:
+                continue
+            seen.add(key)
+            machine_record = cls._find_machine_record(ref, machine_index)
+            if machine_record is not None:
+                return machine_record
+        return None
+
+    def _build_record_indexes(self, mapped: MappedImportResult, vault, vault_extensions
+                              ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Build ``(machine, user)`` record lookups from freshly imported vault data.
+
+        Indexes pamMachine records by lowercased host AND lowercased title, and
+        pamUser records by lowercased title — the same identifiers
+        ``AccountMapper`` writes during the mapping phase. Restricting the scan
+        to titles the importer just produced keeps the lookup O(imported) rather
+        than O(vault).
+        """
+        machine_index: dict[str, Any] = {}
+        user_index: dict[str, Any] = {}
+        imported_machine_titles = {
+            (r.get("title") or "").casefold()
+            for r in mapped.pam_resources if r.get("type") == RECORD_TYPE_PAM_MACHINE
+        }
+        imported_user_titles = set()
+        for r in mapped.pam_resources:
+            for u in r.get("users") or []:
+                t = (u.get("title") or "").casefold()
+                if t:
+                    imported_user_titles.add(t)
+        from .record_loader import iter_accessible_record_uids, load_pam_record
+
+        for record_uid in iter_accessible_record_uids(self.params):
+            rec = load_pam_record(self.params, record_uid)
+            if rec is None:
+                continue
+            rtype = getattr(rec, "record_type", "") or ""
+            title = (getattr(rec, "title", "") or "").casefold()
+            if rtype == RECORD_TYPE_PAM_MACHINE and title in imported_machine_titles:
+                machine_index[title] = rec
+                host_field = next(
+                    (f for f in getattr(rec, "fields", []) or []
+                     if (getattr(f, "type", "") or "") == "pamHostname"
+                     or (getattr(f, "label", "") or "").lower() == "host"),
+                    None,
+                )
+                if host_field and host_field.value:
+                    raw = host_field.value[0]
+                    host_str = ""
+                    if isinstance(raw, dict):
+                        host_str = (raw.get("hostName") or raw.get("host") or "")
+                    elif isinstance(raw, str):
+                        host_str = raw
+                    if host_str:
+                        machine_index[host_str.casefold()] = rec
+            elif rtype == "pamUser" and title in imported_user_titles:
+                user_index[title] = rec
+        return machine_index, user_index
+
+    @staticmethod
+    def _find_machine_record(address: str, machine_index: dict[str, Any]
+                             ) -> Any:
+        """Resolve a CyberArk dependent ``Address`` to a Keeper PAM Machine.
+
+        Tries an exact host/title hit first, then a hostname-prefix match
+        (CyberArk stores FQDNs but resources may be titled with the short
+        name and vice-versa). Returns ``None`` when nothing matches.
+        """
+        if not address:
+            return None
+        key = address.casefold()
+        if key in machine_index:
+            return machine_index[key]
+        short = key.split(".", 1)[0]
+        if short and short in machine_index:
+            return machine_index[short]
+        for k, rec in machine_index.items():
+            if k.startswith(short) or short.startswith(k.split(".", 1)[0]):
+                return rec
+        return None
+
+    @staticmethod
+    def _is_windows_machine(machine_record) -> bool:
+        """Mirror PAMActionServiceAddCommand's OS check so we can skip
+        non-Windows hosts before the call (avoiding noisy print output)."""
+        os_field = next(
+            (f for f in machine_record.fields
+             if (f.label or "") == "operatingSystem"),
+            None,
+        )
+        if os_field is None or not os_field.value:
+            return False
+        return str(os_field.value[0]).lower() == "windows"
+
+    @staticmethod
+    def _print_dependent_summary(summary: dict):
+        added = summary.get("added", 0)
+        skipped = (summary.get("skipped_unsupported", 0)
+                   + summary.get("skipped_non_windows", 0)
+                   + summary.get("skipped_missing_machine", 0)
+                   + summary.get("skipped_missing_user", 0)
+                   + summary.get("skipped_other", 0))
+        print()
+        print(f"{bcolors.OKBLUE}CyberArk dependents → "
+              f"'pam action service add':{bcolors.ENDC}")
+        print(f"  Linked:                {added}")
+        if summary.get("skipped_unsupported"):
+            print(f"  Unsupported type:      {summary['skipped_unsupported']}")
+        if summary.get("skipped_non_windows"):
+            print(f"  Non-Windows host:      {summary['skipped_non_windows']}")
+        if summary.get("skipped_missing_machine"):
+            print(f"  Missing PAM Machine:   {summary['skipped_missing_machine']}")
+        if summary.get("skipped_missing_user"):
+            print(f"  Missing PAM User:      {summary['skipped_missing_user']}")
+        if summary.get("skipped_other"):
+            print(f"  Other failures:        {summary['skipped_other']}")
+        if skipped == 0 and added == 0:
+            print(f"  {bcolors.WARNING}No dependents resolvable to imported records.{bcolors.ENDC}")
+        print()
+
+    @staticmethod
+    def _build_resource_counts(mapped: MappedImportResult) -> dict[str, dict[str, int]]:
+        resource_counts: dict[str, dict[str, int]] = {
+            "pamMachine": {"ok": 0, "skip": 0, "err": 0},
+            "pamDatabase": {"ok": 0, "skip": 0, "err": 0},
+            "pamUser": {"ok": 0, "skip": 0, "err": 0},
+            "login": {"ok": 0, "skip": 0, "err": 0},
+        }
+        for r in mapped.pam_resources:
+            rtype = r.get("type", "pamMachine")
+            resource_counts.setdefault(rtype, {"ok": 0, "skip": 0, "err": 0})
+            resource_counts[rtype]["ok"] += 1
+            for u in r.get("users", []):
+                resource_counts["pamUser"]["ok"] += 1
+        for u in mapped.pam_users:
+            resource_counts["login"]["ok"] += 1
+        return resource_counts
+
+    def _attach_report_files(self, notes_text: str, report_config_uid: str,
+                             user_team_matcher: Optional[UserTeamMatcher]):
+        tmp_files: list[str] = []
+        try:
+            from ..record_edit import RecordUploadAttachmentCommand
+            attachments: list[str] = []
+            report_tmp = tempfile.NamedTemporaryFile(
+                mode='w', suffix='.md', prefix='CyberArk-Import-Report-',
+                delete=False, encoding='utf-8',
+            )
+            report_tmp.write(notes_text)
+            report_tmp.close()
+            tmp_files.append(report_tmp.name)
+            attachments.append(report_tmp.name)
+            if user_team_matcher and user_team_matcher.unmatched:
+                csv_content = user_team_matcher.generate_csv()
+                if csv_content:
+                    csv_tmp = tempfile.NamedTemporaryFile(
+                        mode='w', suffix='.csv', prefix='ca_users_to_provision_',
+                        delete=False, encoding='utf-8',
+                    )
+                    csv_tmp.write(csv_content)
+                    csv_tmp.close()
+                    tmp_files.append(csv_tmp.name)
+                    attachments.append(csv_tmp.name)
+            if attachments:
+                RecordUploadAttachmentCommand().execute(
+                    self.params, record=report_config_uid, file=attachments,
+                )
+                try:
+                    print(f"Report saved to PAM config record: {report_config_uid}")
+                    if len(attachments) > 1:
+                        print("CSV (ca_users_to_provision) attached")
+                except (BrokenPipeError, OSError):
+                    pass
+        except Exception as e:
+            logging.warning("Failed to save report attachment: %s", type(e).__name__)
+        finally:
+            for path in tmp_files:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+
+# Unicode dashes that users commonly paste instead of ASCII '-'.
+_DASH_TRANSLATE = str.maketrans({
+    '\u2010': '-',  # hyphen
+    '\u2011': '-',  # non-breaking hyphen
+    '\u2012': '-',  # figure dash
+    '\u2013': '-',  # en dash
+    '\u2014': '-',  # em dash
+    '\u2212': '-',  # minus
+})
+
+
+class CyberArkPAMImportCommand(Command):
+    parser = argparse.ArgumentParser(
+        prog="pam project cyberark-import",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  # Dry-run from Privilege Cloud
+  pam project cyberark-import tenant.cyberark.cloud --dry-run
+
+  # List available safes
+  pam project cyberark-import pvwa.example.com --list-safes
+
+  # Import specific safes only
+  pam project cyberark-import pvwa.example.com --safes "Windows*,Unix*" --name "PAM Migration"
+
+  # Exclude safes
+  pam project cyberark-import pvwa.example.com --exclude-safes "Test*,Dev*"
+
+  # Save JSON for review
+  pam project cyberark-import pvwa.example.com --dry-run --output /tmp/review.json
+
+  # Full import with custom platform mapping
+  pam project cyberark-import pvwa.example.com --platform-map platforms.json --name "Prod"
+
+  # Non-interactive batch mode
+  pam project cyberark-import pvwa.example.com --name "Auto Import" --yes
+
+  # Self-hosted with SSL verification disabled
+  pam project cyberark-import pvwa.internal.com --no-verify-ssl --name "Internal"
+
+  # Self-hosted with mutual TLS client cert (P12)
+  pam project cyberark-import pvwa.internal.com --client-cert-p12 ./client.p12 --name "Internal"
+  # Import into Nested Share Folders (NSF)
+  pam project cyberark-import pvwa.example.com --name "PAM Migration" --nsf
+        ''')
+    parser.add_argument("server", action="store", help="CyberArk PVWA host (e.g. mycompany.cyberark.cloud or pvwa.example.com)")
+    parser.add_argument("--name", "-n", required=False, dest="project_name", action="store",
+                        default="", help="PAM project name (default: CyberArk Migration)")
+    parser.add_argument("--config", "-c", required=False, dest="config", action="store",
+                        default="", help="Extend existing PAM project (PAM Configuration UID or title)")
+    parser.add_argument("--gateway", "-g", required=False, dest="gateway", action="store",
+                        default="", help="Gateway UID or name (new project only)")
+    parser.add_argument("--folder-mode", required=False, dest="folder_mode", action="store",
+                        choices=["safe", "ksm", "exact", "flat"], default="safe",
+                        help="Safe → folder mapping mode (default: safe). "
+                             "'safe' creates one Keeper shared folder per CyberArk safe "
+                             "with that safe's permission set, enabling per-safe access "
+                             "control. 'ksm'/'exact' nest safe-named subfolders under the "
+                             "legacy Resources/Users shared folders. 'flat' puts every "
+                             "record into the two legacy shared folders with aggregated "
+                             "permissions. With --nsf, the same layout is created using "
+                             "Nested Share Folders instead of classic shared folders.")
+    parser.add_argument("--nsf", required=False, dest="use_nsf", action="store_true",
+                        default=False,
+                        help="Create project folders and records in Nested Share Folders "
+                             "(folders, records, rotation, PAM config, and permissions).")
+    parser.add_argument("--safes", required=False, dest="safes", action="store",
+                        default="", help="Include only matching Safes (comma-separated, supports globs)")
+    parser.add_argument("--exclude-safes", required=False, dest="exclude_safes", action="store",
+                        default="", help="Exclude matching Safes (comma-separated, supports globs)")
+    parser.add_argument("--list-safes", required=False, dest="list_safes", action="store_true",
+                        default=False, help="List Safes with account counts and exit")
+    parser.add_argument("--dry-run", "-d", required=False, dest="dry_run", action="store_true",
+                        default=False, help="Preview import without modifying vault")
+    parser.add_argument("--output", "-o", required=False, dest="output", action="store",
+                        default="", help="Save generated import JSON to file")
+    parser.add_argument("--include-credentials", required=False, dest="include_credentials",
+                        action="store_true", default=False,
+                        help="Include passwords in --output or --dry-run display")
+    parser.add_argument("--estimate", required=False, dest="estimate", action="store_true",
+                        default=False, help="Count accounts and estimate import time, then exit")
+    parser.add_argument("--yes", "-y", required=False, dest="yes", action="store_true",
+                        default=False, help="Skip confirmation prompts")
+    parser.add_argument("--skip-users", required=False, dest="skip_users", action="store_true",
+                        default=False, help="Import machine/database records only, skip pamUser records")
+    parser.add_argument("--batch-size", required=False, dest="batch_size", action="store",
+                        type=int, default=100, help="Records per import batch (default: 100)")
+    parser.add_argument("--batch-delay", required=False, dest="batch_delay", action="store",
+                        type=float, default=0.5, help="Base delay between batches in seconds (default: 0.5)")
+    parser.add_argument("--platform-map", required=False, dest="platform_map", action="store",
+                        default="", help="JSON file mapping CyberArk platformIds to KeeperPAM rotation types")
+    parser.add_argument("--state-filter", required=False, dest="state_filter", action="store",
+                        default="", help="Comma-separated CPM states to include (default: all)")
+    parser.add_argument("--no-verify-ssl", required=False, dest="no_verify_ssl", action="store_true",
+                        default=False, help="Disable SSL certificate verification for self-hosted PVWA (insecure)")
+    parser.add_argument("--client-cert-p12", required=False, dest="client_cert_p12", action="store",
+                        default="", help="Path to client certificate P12/PFX for self-hosted PVWA mutual TLS")
+    parser.add_argument("--client-cert-password", required=False, dest="client_cert_password", action="store",
+                        default="", help="Passphrase for --client-cert-p12 (prefer env var in automation)")
+    parser.add_argument("--include-system-safes", required=False, dest="include_system_safes",
+                        action="store_true", default=False,
+                        help="Include CyberArk system safes (VaultInternal, PVWAConfig, etc.)")
+    parser.add_argument("--skip-linked-accounts", required=False, dest="skip_linked_accounts",
+                        action="store_true", default=False,
+                        help="Skip logon/reconcile/enable linked account resolution")
+    parser.add_argument("--skip-members", required=False, dest="skip_members",
+                        action="store_true", default=False,
+                        help="Skip safe member extraction and folder permissions")
+    parser.add_argument("--skip-dependents", required=False, dest="skip_dependents",
+                        action="store_true", default=False,
+                        help="Skip CyberArk dependents → 'pam action service' mapping after import")
+    parser.add_argument("--user-map", required=False, dest="user_map", action="store",
+                        default="", help="JSON file mapping CyberArk users to Keeper emails")
+    parser.add_argument("--sync-mode", required=False, dest="sync_mode",
+                        choices=["upsert", "create"], default="upsert",
+                        help="upsert (default): idempotent — create missing "
+                             "records, update changed ones, skip unchanged. "
+                             "create: legacy always-create (may produce "
+                             "duplicates on re-run).")
+    parser.add_argument("--strict-policies", required=False, dest="strict_policies",
+                        action="store_true", default=False,
+                        help="Fail the import when a platform's rotation policy "
+                             "is inaccessible instead of inheriting the master "
+                             "policy default")
+    parser.add_argument("--add-cyberark-users", required=False, dest="add_cyberark_users",
+                        action="store_true", default=False,
+                        help="Create CybeArk Users in Keeper Admin Console")
+
+    def get_parser(self):
+        return CyberArkPAMImportCommand.parser
+
+    def execute(self, params, **kwargs):
+        server = kwargs.get("server", "")
+        project_name = kwargs.get("project_name", "") or "CyberArk Migration"
+        config_uid = kwargs.get("config", "")
+        gateway_name = kwargs.get("gateway", "")
+        folder_mode = kwargs.get("folder_mode", "flat")
+        safe_include = kwargs.get("safes", "")
+        safe_exclude = kwargs.get("exclude_safes", "")
+        list_safes = kwargs.get("list_safes", False)
+        dry_run = kwargs.get("dry_run", False)
+        output_file = kwargs.get("output", "")
+        include_creds = kwargs.get("include_credentials", False)
+        estimate_only = kwargs.get("estimate", False)
+        skip_confirm = kwargs.get("yes", False)
+        skip_users = kwargs.get("skip_users", False)
+        skip_linked = kwargs.get("skip_linked_accounts", False)
+
+        batch_size = int(kwargs.get("batch_size") or 100)
+        batch_delay = float(kwargs.get("batch_delay") or 0.5)
+        platform_map_file = kwargs.get("platform_map", "")
+        state_filter_str = kwargs.get("state_filter", "")
+        add_cyberark_users = kwargs.get("add_cyberark_users", False)
+
+        # Validate batch parameters
+        if batch_size < 1:
+            raise CommandError("pam project cyberark-import", "--batch-size must be >= 1")
+        if batch_delay < 0:
+            raise CommandError("pam project cyberark-import", "--batch-delay must be >= 0")
+
+        if not server:
+            raise CommandError("pam project cyberark-import", "CyberArk PVWA server is required")
+
+        # Load and validate platform map override
+        platform_map_override = None
+        if platform_map_file:
+            if not os.path.isfile(platform_map_file):
+                raise CommandError("pam project cyberark-import",
+                                   f"Platform map file not found: {platform_map_file}")
+            try:
+                with open(platform_map_file, encoding="utf-8") as f:
+                    platform_map_override = json.load(f)
+            except json.JSONDecodeError as e:
+                raise CommandError("pam project cyberark-import",
+                                   f"Invalid JSON in platform map file: {e}")
+            if not isinstance(platform_map_override, dict):
+                raise CommandError("pam project cyberark-import",
+                                   "Platform map must be a JSON object mapping platformId to settings")
+            for key, entry in platform_map_override.items():
+                if not isinstance(entry, dict) or "record_type" not in entry:
+                    raise CommandError("pam project cyberark-import",
+                                       f"Platform map entry '{key}' must be an object with a 'record_type' field")
+
+        no_verify_ssl = kwargs.get("no_verify_ssl", False)
+        client_cert_p12 = kwargs.get("client_cert_p12", "")
+        client_cert_password = kwargs.get("client_cert_password", "")
+        state_filter = [s.strip() for s in state_filter_str.split(",") if s.strip()] if state_filter_str else None
+
+        if client_cert_p12:
+            os.environ["KEEPER_CYBERARK_CLIENT_CERT_P12"] = client_cert_p12
+        if client_cert_password:
+            os.environ["KEEPER_CYBERARK_CLIENT_CERT_PASSWORD"] = client_cert_password
+
+        # Match legacy `import --format=cyberark` behavior for self-hosted PVWA:
+        # default to verify=False unless a CA bundle is explicitly provided.
+        verify_ssl = not no_verify_ssl
+        if not server.endswith(".cyberark.cloud"):
+            ca_bundle = (
+                os.environ.get("KEEPER_CYBERARK_CA_BUNDLE")
+                or os.environ.get("_CYBERARK_CA_BUNDLE")
+            )
+            if ca_bundle:
+                verify_ssl = ca_bundle
+            elif not no_verify_ssl:
+                verify_ssl = False
+
+        # ── Resolve gateway UID → name if needed ─────────────
+        if gateway_name and not config_uid:
+            try:
+                from ..pam.gateway_helper import get_all_gateways
+                from ...loginv3 import CommonHelperMethods
+                all_gw = get_all_gateways(params)
+                gw_uid_bytes = CommonHelperMethods.url_safe_str_to_bytes(gateway_name)
+                for gw in all_gw:
+                    if gw.controllerUid == gw_uid_bytes:
+                        gateway_name = gw.controllerName
+                        logging.info(f"Resolved gateway UID to name: {gateway_name}")
+                        break
+            except Exception:
+                pass  # Use gateway_name as-is (may be a name already)
+
+        # ── Phase 0: Authenticate ────────────────────────────
+        try:
+            client = CyberArkPVWAClient(server, verify_ssl=verify_ssl)
+        except ValueError as e:
+            raise CommandError("pam project cyberark-import", str(e))
+        if not client.authenticate():
+            raise CommandError("pam project cyberark-import",
+                               "Authentication failed. Check credentials and try again.")
+
+        try:
+            options = ImportRunOptions(
+                server=server,
+                project_name=project_name,
+                config_uid=config_uid,
+                gateway_name=gateway_name,
+                folder_mode=folder_mode,
+                dry_run=dry_run,
+                output_file=output_file,
+                include_creds=include_creds,
+                estimate_only=estimate_only,
+                skip_confirm=skip_confirm,
+                skip_users=skip_users,
+                skip_linked=skip_linked,
+                skip_members=kwargs.get("skip_members", False),
+                skip_dependents=kwargs.get("skip_dependents", False),
+                safe_include=safe_include,
+                safe_exclude=safe_exclude,
+                list_safes=list_safes,
+                batch_size=batch_size,
+                batch_delay=batch_delay,
+                platform_map_override=platform_map_override,
+                state_filter=state_filter,
+                include_system_safes=kwargs.get("include_system_safes", False),
+                user_map_file=kwargs.get("user_map", ""),
+                sync_mode=(kwargs.get("sync_mode") or "upsert").lower(),
+                strict_policies=bool(kwargs.get("strict_policies", False)),
+                use_nsf=kwargs.get("use_nsf", False) is True,
+                raw_kwargs=kwargs,
+                add_cyberark_users=add_cyberark_users
+            )
+            CyberArkImportOrchestrator(self, params, client, options).run()
+        finally:
+            client.logoff()
+
+    def _execute_import(self, params, import_data: dict, project_name: str,
+                        config_uid: str, batch_size: int, batch_delay: float,
+                        resources: list[dict], users: list[dict],
+                        use_nsf: bool = False) -> Optional[dict]:
+        """Execute the vault import using pam project import/extend commands."""
+        from .edit import PAMProjectImportCommand
+        from .extend import PAMProjectExtendCommand
+
+        # Write JSON to temp file for the import command
+        total_records = len(resources) + len(users)
+
+        if total_records <= batch_size:
+            # Single batch — use import or extend directly
+            return self._single_batch_import(
+                params, import_data, project_name, config_uid, use_nsf=use_nsf,
+            )
+        else:
+            # Multi-batch: first batch creates project, remaining extend
+            return self._multi_batch_import(
+                params, import_data, project_name, config_uid,
+                resources, users, batch_size, batch_delay, use_nsf=use_nsf,
+            )
+
+    def _load_existing_keeper_users(self, params) -> tuple[list, str]:
+        # Fetch the initial data
+        enterprise_data = getattr(params, "enterprise", None)
+        if not enterprise_data:
+            try:
+                api.query_enterprise(params)
+            except Exception as e:
+                logging.warning("Error loading existing keeper users: %s", e)
+                return [], "Failed to Load Existing User"
+        # After running the query_enterprise, we will have the enterprise data in the params
+        enterprise_data = getattr(params, "enterprise", None)
+        if not isinstance(enterprise_data, dict):
+            return [], "Failed to Load Existing User"
+        existing_users = []
+        for user in enterprise_data.get("users", []):
+            if isinstance(user, dict):
+                email = self._user_field(user, "email") or self._user_field(user, "username")
+                user_status = user.get("status") or "active"
+                user_details = {
+                    "email": email,
+                    "status": user_status,
+                }
+                existing_users.append(user_details)
+        return existing_users , ""
+
+    def _create_keeper_user(self, params, email: str, name: str) -> dict:
+        from ..enterprise_create_user import CreateEnterpriseUserCommand
+        try:
+            creator = CreateEnterpriseUserCommand()
+            created = creator.execute(params, email=email, name=name)
+            return created
+        except Exception as e:
+            logging.warning('Could not create enterprise user "%s": %s', email, e)
+            return None
+       
+    @staticmethod
+    def _user_field(user: dict, key: str) -> str:
+        return str(user.get(key) or "").strip()
+
+    def _create_enterprise_users(self, params, cyberark_users: list[dict]) -> dict:
+        from ...constants import EMAIL_PATTERN
+        def row(user, flag, **extra):
+            item = {
+                "username": str(user.get("username") or ""),
+                "email": self._user_field(user, "email"),
+                "flag": flag,
+            }
+            item.update(extra)
+            return item
+        seen: set[str] = set()
+        outcomes = []
+        existing_users, error = self._load_existing_keeper_users(params)
+        if error:
+            print(error)
+        is_valid_email = re.compile(EMAIL_PATTERN).match
+        for user in cyberark_users:
+            if not isinstance(user, dict):
+                continue
+            email = self._user_field(user, "email")
+            email_key = email.casefold()
+            if email_key in seen:
+                continue
+            user_exist: dict[Any, Any] = next((u for u in existing_users if (u.get("email") or "").casefold() == email_key), None)
+            if user_exist:
+                seen.add(email_key)
+                status = user_exist.get("status") or "active"
+                outcomes.append(row(user, "existing", status=status))
+            elif is_valid_email(email):
+                seen.add(email_key)
+                create_user = self._create_keeper_user(params, email, user.get("username") or email)
+                if create_user:
+                    outcomes.append(row(user, "created"))
+                else:
+                    outcomes.append(row(user, "failed", reason="user was not created"))
+            else:
+                outcomes.append(row(user, "skipped", reason="invalid email"))
+        return {"users": outcomes}
+
+    def _single_batch_import(self, params, import_data: dict,
+                             project_name: str, config_uid: str,
+                             use_nsf: bool = False) -> dict:
+        """Import all records in a single batch."""
+        from .edit import PAMProjectImportCommand
+        from .extend import PAMProjectExtendCommand
+
+        tmp_path = _temp_store.write_json(import_data)
+        try:
+            if config_uid:
+                # Extend auto-detects NSF from the existing project tree.
+                if use_nsf:
+                    logging.info(
+                        "--nsf is ignored when extending an existing project "
+                        "(--config); Nested Share Folders are detected automatically.")
+                PAMProjectExtendCommand().execute(
+                    params, config=config_uid, file_name=tmp_path, dry_run=False,
+                )
+            else:
+                PAMProjectImportCommand().execute(
+                    params, project_name=project_name, file_name=tmp_path,
+                    dry_run=False, use_nsf=use_nsf,
+                )
+        finally:
+            _temp_store.remove(tmp_path)
+
+        resolved_config_uid = config_uid or self._find_config_uid(params, project_name)
+        return {"project_name": project_name, "config_uid": resolved_config_uid}
+
+    def _multi_batch_import(self, params, import_data: dict,
+                            project_name: str, config_uid: str,
+                            resources: list[dict], users: list[dict],
+                            batch_size: int, batch_delay: float,
+                            use_nsf: bool = False) -> dict:
+        """Import records in multiple batches with adaptive throttling."""
+        from .edit import PAMProjectImportCommand
+        from .extend import PAMProjectExtendCommand
+
+        throttler = AdaptiveThrottler(base_delay=batch_delay, batch_size=batch_size)
+        all_items = resources + users
+
+        for i in range(0, len(all_items), batch_size):
+            batch = all_items[i:i + batch_size]
+            batch_resources = [r for r in batch if r.get("type") in ("pamMachine", "pamDatabase", "pamDirectory", "pamRemoteBrowser")]
+            batch_users = [r for r in batch if r.get("type") in ("login", "pamUser")]
+            batch_num = (i // batch_size) + 1
+            total_batches = (len(all_items) + batch_size - 1) // batch_size
+            print(f"Processing batch {batch_num}/{total_batches} ({len(batch)} records)...")
+
+            batch_start = time.time()
+
+            if i == 0 and not config_uid:
+                # First batch: create project skeleton + records
+                first_batch_data = dict(import_data)
+                first_batch_data["pam_data"] = {
+                    "resources": batch_resources,
+                    "users": batch_users,
+                }
+                tmp_path = _temp_store.write_json(first_batch_data)
+                try:
+                    PAMProjectImportCommand().execute(
+                        params, project_name=project_name, file_name=tmp_path,
+                        dry_run=False, use_nsf=use_nsf,
+                    )
+                finally:
+                    _temp_store.remove(tmp_path)
+
+                # For subsequent batches, we need the PAM config UID
+                # Try to find it by project name
+                if not config_uid:
+                    config_uid = self._find_config_uid(params, project_name)
+            else:
+                # Subsequent batches: extend (NSF auto-detected from project)
+                extend_data = build_extend_json(batch_resources, batch_users)
+                tmp_path = _temp_store.write_json(extend_data)
+                try:
+                    if config_uid:
+                        PAMProjectExtendCommand().execute(
+                            params, config=config_uid, file_name=tmp_path, dry_run=False,
+                        )
+                    else:
+                        logging.error("Cannot extend: PAM configuration UID not found after initial import")
+                        break
+                finally:
+                    _temp_store.remove(tmp_path)
+
+            batch_duration_ms = (time.time() - batch_start) * 1000
+            throttler.record_response(batch_duration_ms, True)
+            if i + batch_size < len(all_items):
+                throttler.wait()
+
+        return {"project_name": project_name, "config_uid": config_uid}
+
+    def _find_config_uid(self, params, project_name: str) -> str:
+        """Find PAM configuration UID by project name after initial import.
+        Handles #N suffix deduplication from PAMProjectImportCommand.
+        Searches classic vault records and Nested Share Folder caches.
+        """
+        api.sync_down(params)
+        config_base = f"{project_name} Configuration".casefold()
+        candidates = []
+
+        # Classic path (keeps existing unit-test mocks working)
+        for c in vault_extensions.find_records(params, record_version=6):
+            if is_matching_title(getattr(c, "title", "") or "", config_base):
+                candidates.append(c)
+
+        # NSF / full-access path — pick up configs that live only in NSF caches
+        seen_uids = {getattr(c, "record_uid", "") for c in candidates}
+        for uid in iter_accessible_record_uids(params):
+            if uid in seen_uids:
+                continue
+            rec = load_pam_record(params, uid)
+            if rec and getattr(rec, "version", None) == 6:
+                if is_matching_title(getattr(rec, "title", "") or "", config_base):
+                    candidates.append(rec)
+                    seen_uids.add(uid)
+
+        if not candidates:
+            exact = find_pam_configuration(params, f"{project_name} Configuration")
+            if exact:
+                return exact.record_uid
+            logging.warning(f"PAM configuration not found for project '{project_name}' after import")
+            return ""
+        # Prefer highest suffix number (most recently created)
+        # Sort numerically, not lexicographically (so #10 > #9)
+        def _sort_key(c):
+            m = re.search(r' #(\d+)$', c.title)
+            return int(m.group(1)) if m else 0
+        candidates.sort(key=_sort_key, reverse=True)
+        return candidates[0].record_uid
+
+    @staticmethod
+    def _list_safes_detailed(safes: list[dict], system_excluded: int):
+        """List safes with details for --list-safes output."""
+        print(f'\n{bcolors.OKBLUE}Available CyberArk Safes:{bcolors.ENDC}')
+        print('=' * 60)
+        print(f'  {"#":<4s} {"Safe Name":<35s} {"CPM":>10s}')
+        print('  ' + '-' * 55)
+        for i, safe in enumerate(safes, 1):
+            name = safe.get("safeName", "?")
+            cpm = safe.get("managingCPM", "—") or "—"
+            print(f'  {i:<4d} {name:<35s} {cpm:>10s}')
+        print('  ' + '-' * 55)
+        print(f'  Total: {len(safes)} safes')
+        if system_excluded > 0:
+            print(f'  ({system_excluded} system safes excluded — use --include-system-safes to show)')
+        print()
+        print('  Use --safes "Name1,Name2" to import specific safes')
+        print('  Use --exclude-safes "Name1,Name2" to exclude safes')
+        print('  Wildcards supported: --safes "Windows*,Unix*"')
+        print()
+
+    @staticmethod
+    def _parse_index_selection(choice: str, count: int) -> list[int]:
+        """Parse a 1-based selection string into 0-based indices."""
+        selected: list[int] = []
+        seen: set[int] = set()
+        if count <= 0:
+            return selected
+        token_re = re.compile(r'^(\d+)(?:-(\d+))?$')
+        errors: list[str] = []
+        for part in choice.split(','):
+            part = part.strip().translate(_DASH_TRANSLATE)
+            part = re.sub(r'\s+', '', part)
+            if not part:
+                continue
+            m = token_re.match(part)
+            if not m:
+                errors.append(part)
+                continue
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) is not None else start
+            lo, hi = min(start, end), max(start, end)
+            if lo < 1 or hi > count:
+                errors.append(part)
+                continue
+            for num in range(lo, hi + 1):
+                idx = num - 1
+                if idx not in seen:
+                    selected.append(idx)
+                    seen.add(idx)
+        if errors:
+            raise ValueError(
+                f"invalid or out-of-range index(es): {', '.join(errors)}"
+            )
+        return selected
+
+    @staticmethod
+    def _interactive_safe_picker(safes: list[dict]) -> Optional[list[str]]:
+        """Show safes and let the user select which to import.
+
+        Returns ``None`` to import all, an empty list if the user cancelled
+        or the selection was invalid, or the list of selected safe names.
+        """
+        print(f'\n{bcolors.OKBLUE}CyberArk Safes Found:{bcolors.ENDC}')
+        print('─' * 50)
+        numbered = []
+        for i, safe in enumerate(safes, 1):
+            name = safe.get("safeName", "?")
+            numbered.append(name)
+            print(f'  [{i}] {name}')
+        print(f'\n  [A] Import ALL safes ({len(safes)})')
+        print()
+
+        try:
+            choice = input(
+                '  Select safes (numbers/ranges e.g. 1-4,6,8-10, or A for all) [A]: '
+            ).strip()
+        except EOFError:
+            return None
+
+        if not choice or choice.upper() == 'A':
+            return None
+
+        try:
+            indices = CyberArkPAMImportCommand._parse_index_selection(
+                choice, len(numbered)
+            )
+        except ValueError as e:
+            print(f'{bcolors.FAIL}{e}. Import cancelled.{bcolors.ENDC}')
+            return []
+
+        selected = [numbered[idx] for idx in indices]
+        if not selected:
+            print(
+                f'{bcolors.FAIL}No valid indexes in {choice!r}. Import cancelled.{bcolors.ENDC}'
+            )
+            return []
+
+        logging.warning('Selected safes: %s', ', '.join(selected))
+        return selected
+
+
+class CyberArkPAMCleanupCommand(Command):
+    """Remove a CyberArk-imported project: records, folders, and PAM config."""
+
+    parser = argparse.ArgumentParser(
+        prog="pam project cyberark-cleanup",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  # Preview what would be deleted
+  pam project cyberark-cleanup --name "CyberArk Migration" --dry-run
+
+  # Delete by project name
+  pam project cyberark-cleanup --name "CyberArk Migration" --yes
+
+  # Delete by PAM config UID
+  pam project cyberark-cleanup --config <PAM_CONFIG_UID> --yes
+        ''')
+    parser.add_argument("--name", "-n", dest="project_name", action="store",
+                        default="", help="Project name (matches PAM config title prefix)")
+    parser.add_argument("--config", "-c", dest="config_uid", action="store",
+                        default="", help="PAM config record UID")
+    parser.add_argument("--dry-run", "-d", dest="dry_run", action="store_true",
+                        default=False, help="Show what would be deleted")
+    parser.add_argument("--yes", "-y", dest="auto_confirm", action="store_true",
+                        default=False, help="Skip confirmation prompt")
+
+    def get_parser(self):
+        return CyberArkPAMCleanupCommand.parser
+
+    def execute(self, params, **kwargs):
+        project_name = kwargs.get("project_name", "")
+        config_uid = kwargs.get("config_uid", "")
+        dry_run = kwargs.get("dry_run", False)
+        auto_confirm = kwargs.get("auto_confirm", False)
+
+        if not project_name and not config_uid:
+            raise CommandError("pam project cyberark-cleanup",
+                               "Either --name or --config is required")
+
+        api.sync_down(params)
+
+        # Find PAM config by name or UID (classic + NSF)
+        if config_uid:
+            config_rec = vault.KeeperRecord.load(params, config_uid)
+            if not config_rec:
+                config_rec = load_pam_record(params, config_uid)
+            if not config_rec:
+                raise CommandError("pam project cyberark-cleanup",
+                                   f"PAM config record '{config_uid}' not found")
+            project_name = config_rec.title.replace(" Configuration", "")
+        else:
+            config_base = f"{project_name} Configuration".casefold()
+            config_rec = None
+            for c in vault_extensions.find_records(params, record_version=6):
+                if is_matching_title(getattr(c, "title", "") or "", config_base):
+                    config_rec = c
+                    config_uid = c.record_uid
+                    break
+            if not config_rec:
+                for uid in iter_accessible_record_uids(params):
+                    rec = load_pam_record(params, uid)
+                    if rec and getattr(rec, "version", None) == 6:
+                        if is_matching_title(getattr(rec, "title", "") or "", config_base):
+                            config_rec = rec
+                            config_uid = uid
+                            break
+            if not config_rec:
+                exact = find_pam_configuration(params, f"{project_name} Configuration")
+                if exact:
+                    config_rec = exact
+                    config_uid = exact.record_uid
+            if not config_rec:
+                raise CommandError("pam project cyberark-cleanup",
+                                   f"PAM config for project '{project_name}' not found")
+
+        # Find shared / NSF folders. The new safe-per-folder layout creates one
+        # folder per CyberArk safe under the project wrapper folder
+        # plus an admin Config folder; each safe folder has two
+        # ``Resources``/``Users`` subfolders that
+        # hold the records. The legacy layout creates exactly two folders
+        # ("{project} - Resources" and "{project} - Users") with safe-named
+        # subfolders inside. Discover everything by walking the project
+        # wrapper under PAM Environments so cleanup handles
+        # both classic shared folders and Nested Share Folders
+        # (and any subset thereof) without hardcoding names.
+        sf_uids = []
+        record_count = 0
+        sf_names: list = []
+        all_record_uids: set = set()
+        res_name = f"{project_name} - Resources"
+        usr_name = f"{project_name} - Users"
+        config_name = f"{project_name} - Config"
+
+        def _collect_records_recursive(folder_uid: str):
+            """Walk the folder subtree and accumulate every record UID
+            (records living directly in this folder + records living in
+            any descendant classic or NSF subfolder)."""
+            stack = [folder_uid]
+            visited: set = set()
+            while stack:
+                fuid = stack.pop()
+                if not fuid or fuid in visited:
+                    continue
+                visited.add(fuid)
+                all_record_uids.update(get_folder_record_uids(params, fuid))
+                folder = params.folder_cache.get(fuid)
+                if not folder:
+                    # NSF-only parents may still appear in nested_share_folders
+                    nsf = getattr(params, "nested_share_folders", None) or {}
+                    for child_uid, info in nsf.items():
+                        if (info.get("parent_uid") or None) == fuid:
+                            stack.append(child_uid)
+                    continue
+                for sub_uid in getattr(folder, "subfolders", []) or []:
+                    stack.append(sub_uid)
+
+        project_folder_uids = self._find_project_wrapper_folder_uids(
+            params, project_name,
+        )
+        if project_folder_uids:
+            sf_uids_seen: set = set()
+            for project_uid in project_folder_uids:
+                for child_uid, child_name in self._iter_project_child_folders(
+                        params, project_uid):
+                    if child_uid in sf_uids_seen:
+                        continue
+                    sf_uids_seen.add(child_uid)
+                    sf_uids.append(child_uid)
+                    sf_names.append(child_name)
+                    _collect_records_recursive(child_uid)
+        else:
+            # Fallback: scan the shared-folder cache by name. Catches the
+            # legacy two-folder layout when the project wrapper folder was
+            # deleted/renamed manually post-import.
+            for sf_uid, sf in params.shared_folder_cache.items():
+                name = sf.get("name_unencrypted", "")
+                if name in (res_name, usr_name, config_name):
+                    sf_uids.append(sf_uid)
+                    sf_names.append(name)
+                    _collect_records_recursive(sf_uid)
+            # NSF fallback by name under nested_share_folders
+            for nsf_uid, info in (getattr(params, "nested_share_folders", None) or {}).items():
+                name = info.get("name", "") or ""
+                if name in (res_name, usr_name, config_name) and nsf_uid not in sf_uids:
+                    sf_uids.append(nsf_uid)
+                    sf_names.append(name)
+                    _collect_records_recursive(nsf_uid)
+        record_count = len(all_record_uids)
+
+        print(f"\nCyberArk PAM Project Cleanup")
+        print("=" * 50)
+        print(f"  Project:   {project_name}")
+        print(f"  Config:    {config_uid}")
+        print(f"  Folders:   {len(sf_uids)}")
+        for sf_name in sf_names:
+            if sf_name:
+                print(f"    • {sf_name}")
+        print(f"  Records:   ~{record_count}")
+
+        if dry_run:
+            print("  (dry run — no changes made)")
+            print("=" * 50)
+            return
+
+        if not auto_confirm:
+            answer = input("\n  Delete project folders (and all records inside)? [y/N]: ").strip().lower()
+            if answer not in ("y", "yes"):
+                print("  Cancelled.")
+                return
+
+        from ..folder import FolderRemoveCommand
+        from ..record import RecordRemoveCommand
+        from ..nested_share_folder.folder_commands import NestedShareFolderRemoveCommand
+        from ..nested_share_folder.record_commands import NestedShareRecordRemoveCommand
+
+        # Prefer folder deletion: records (and nested subfolders) are removed
+        # with the folder tree. Delete content folders first, then wrappers.
+        folders_deleted = 0
+        folders_failed = 0
+        folders_to_remove = list(sf_uids) + list(project_folder_uids)
+        for folder_uid in folders_to_remove:
+            try:
+                if is_nested_share_folder(params, folder_uid):
+                    NestedShareFolderRemoveCommand().execute(
+                        params, folders=[folder_uid], force=True,
+                        operation="folder-trash", quiet=True)
+                else:
+                    FolderRemoveCommand().execute(
+                        params, pattern=[folder_uid], force=True, quiet=True)
+                folders_deleted += 1
+            except Exception as e:
+                folders_failed += 1
+                logging.warning("Failed to delete folder %s: %s",
+                                folder_uid, type(e).__name__)
+
+        api.sync_down(params)
+
+        # PAM config may already be gone with its Config folder; remove only
+        # if it survived (e.g. legacy layout / config outside project folders).
+        config_deleted = False
+        if config_uid and (
+                config_uid in (params.record_cache or {})
+                or config_uid in (getattr(params, "nested_share_records", None) or {})
+                or vault.KeeperRecord.load(params, config_uid)
+                or load_pam_record(params, config_uid)):
+            try:
+                if is_pam_nsf_record(params, config_uid):
+                    NestedShareRecordRemoveCommand().execute(
+                        params, records=[config_uid], force=True,
+                        operation="owner-trash")
+                else:
+                    RecordRemoveCommand().execute(
+                        params, force=True, record=config_uid)
+                config_deleted = True
+                api.sync_down(params)
+            except Exception as e:
+                folders_failed += 1
+                logging.warning("Failed to delete PAM config record %s: %s",
+                                config_uid, type(e).__name__)
+
+        msg = f"\nCleanup complete: {folders_deleted} folders deleted"
+        if config_deleted:
+            msg += " (PAM config removed)"
+        if folders_failed:
+            msg += f" ({folders_failed} failed — see warnings above)"
+        print(msg)
+        print("=" * 50)
+
+    PAM_ROOT_FOLDER_NAME = "PAM Environments"
+
+    @classmethod
+    def _is_project_content_folder(cls, params, folder_uid: str, folder=None) -> bool:
+        """True for classic shared folders or Nested Share Folders under a project."""
+        from ...subfolder import BaseFolderNode
+
+        if is_nested_share_folder(params, folder_uid):
+            return True
+        folder = folder or (params.folder_cache or {}).get(folder_uid)
+        if not folder:
+            return False
+        ftype = getattr(folder, "type", "") or ""
+        return ftype in (
+            BaseFolderNode.SharedFolderType,
+            BaseFolderNode.NestedShareFolderType,
+        )
+
+    @classmethod
+    def _iter_project_child_folders(cls, params, wrapper_uid: str):
+        """Yield ``(uid, name)`` for content folders under a project wrapper.
+
+        Includes classic shared folders and Nested Share Folders so
+        report / idempotency / cleanup share one discovery path.
+        """
+        seen: set = set()
+        folder_cache = getattr(params, "folder_cache", None) or {}
+        wrapper = folder_cache.get(wrapper_uid)
+        if wrapper:
+            for child_uid in getattr(wrapper, "subfolders", []) or []:
+                if child_uid in seen:
+                    continue
+                child = folder_cache.get(child_uid)
+                if not child or not cls._is_project_content_folder(params, child_uid, child):
+                    continue
+                seen.add(child_uid)
+                yield child_uid, getattr(child, "name", "") or ""
+
+        # NSF children may exist in nested_share_folders before folder_cache
+        # parent.subfolders is fully linked after a partial sync.
+        for child_uid, info in (getattr(params, "nested_share_folders", None) or {}).items():
+            if child_uid in seen:
+                continue
+            if (info.get("parent_uid") or None) != wrapper_uid:
+                continue
+            if not cls._is_project_content_folder(params, child_uid):
+                continue
+            seen.add(child_uid)
+            yield child_uid, info.get("name", "") or ""
+
+    @classmethod
+    def _find_project_wrapper_folder_uids(cls, params, project_name: str) -> list:
+        """Return UIDs of every project wrapper folder under
+        ``PAM Environments`` whose name matches ``project_name`` (or
+        ``project_name #N`` when the project was imported multiple times).
+
+        Supports classic user-folder wrappers and Nested Share Folder
+        wrappers created with ``--nsf``. Returning a list keeps cleanup
+        correct in the rare case where two projects share a name
+        (PAMProjectImportCommand allows duplicates via the ``#N`` suffix).
+        """
+        from ...subfolder import BaseFolderNode
+
+        wrapper_uids: list = []
+        folders = params.folder_cache if params and params.folder_cache else {}
+        if not isinstance(folders, dict):
+            folders = {}
+
+        # Locate root "PAM Environments" folder(s) — classic user folder
+        # and/or Nested Share Folder.
+        root_uids: list = []
+        seen_roots: set = set()
+        for uid, f in folders.items():
+            if not f or getattr(f, "parent_uid", None):
+                continue
+            ftype = getattr(f, "type", "") or ""
+            if ftype not in (
+                BaseFolderNode.UserFolderType,
+                BaseFolderNode.NestedShareFolderType,
+            ):
+                continue
+            if getattr(f, "name", "") != cls.PAM_ROOT_FOLDER_NAME:
+                continue
+            root_uids.append(uid)
+            seen_roots.add(uid)
+
+        for uid, info in (getattr(params, "nested_share_folders", None) or {}).items():
+            if uid in seen_roots:
+                continue
+            if (info.get("parent_uid") or None) is not None:
+                continue
+            if info.get("name", "") != cls.PAM_ROOT_FOLDER_NAME:
+                continue
+            root_uids.append(uid)
+            seen_roots.add(uid)
+
+        if not root_uids:
+            return wrapper_uids
+
+        # PAMProjectImportCommand emits "{project_name}" or
+        # "{project_name} #N" for the wrapper folder, so match both
+        # shapes here (classic user folder or NSF).
+        base = project_name
+        name_re = re.compile(rf"^{re.escape(base)} #\d+$")
+        seen_wrappers: set = set()
+
+        def _maybe_add_wrapper(uid: str, name: str, folder=None) -> None:
+            if uid in seen_wrappers:
+                return
+            if name != base and not name_re.match(name):
+                return
+            ftype = getattr(folder, "type", "") if folder else ""
+            if folder is not None:
+                if ftype not in (
+                    BaseFolderNode.UserFolderType,
+                    BaseFolderNode.NestedShareFolderType,
+                ):
+                    return
+            elif not is_nested_share_folder(params, uid):
+                return
+            wrapper_uids.append(uid)
+            seen_wrappers.add(uid)
+
+        for root_uid in root_uids:
+            root_folder = folders.get(root_uid)
+            if root_folder:
+                for child_uid in getattr(root_folder, "subfolders", []) or []:
+                    child = folders.get(child_uid)
+                    if not child:
+                        continue
+                    name = getattr(child, "name", "") or ""
+                    _maybe_add_wrapper(child_uid, name, child)
+
+            for child_uid, info in (getattr(params, "nested_share_folders", None) or {}).items():
+                if (info.get("parent_uid") or None) != root_uid:
+                    continue
+                _maybe_add_wrapper(child_uid, info.get("name", "") or "")
+
+        return wrapper_uids

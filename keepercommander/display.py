@@ -1,0 +1,360 @@
+#  _  __  
+# | |/ /___ ___ _ __  ___ _ _ ®
+# | ' </ -_) -_) '_ \/ -_) '_|
+# |_|\_\___\___| .__/\___|_|
+#              |_|            
+#
+# Keeper Commander 
+# Contact: ops@keepersecurity.com
+#
+import json
+import logging
+import shutil
+from typing import Tuple, List, Union, Optional
+
+from colorama import init, Fore, Back, Style
+from tabulate import tabulate
+
+from . import __version__
+from .subfolder import BaseFolderNode
+
+init()
+
+
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[33m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    HIGHINTENSITYRED = '\033[1;91m'
+    WHITE = '\033[0;37m'
+    HIGHINTENSITYWHITE = '\033[97m'
+
+
+def keeper_color_to_prompt(color):   # type: (Optional[str]) -> str
+    if color is None:
+        return ''
+    if color == 'red':
+        return 'fg:ansired'
+    if color == 'green':
+        return 'fg:ansigreen'
+    if color == 'blue':
+        return 'fg:ansiblue'
+    if color == 'orange':
+        return 'fg:ansimagenta'
+    if color == 'yellow':
+        return 'fg:ansiyellow'
+    if color == 'gray':
+        return 'fg:ansibrightblack'
+    return ''
+
+def keeper_colorize(text, color):
+    if color == 'red':
+        return f'{Fore.RED}{text}{Fore.RESET}'
+    if color == 'green':
+        return f'{Fore.GREEN}{text}{Fore.RESET}'
+    if color == 'blue':
+        return f'{Fore.BLUE}{text}{Fore.RESET}'
+    if color == 'orange':
+        return f'{Fore.MAGENTA}{text}{Fore.RESET}'
+    if color == 'yellow':
+        return f'{Fore.YELLOW}{text}{Fore.RESET}'
+    if color == 'gray':
+        return f'{Fore.LIGHTBLACK_EX}{text}{Fore.RESET}'
+    return text
+
+
+def show_government_warning():
+    """Display U.S. Government Information System warning for GOV environments."""
+    logging.warning('')
+    logging.warning(f'{bcolors.WARNING}' + '=' * 80 + f'{bcolors.ENDC}')
+    logging.warning(f'{bcolors.WARNING}U.S. GOVERNMENT INFORMATION SYSTEM{bcolors.ENDC}')
+    logging.warning(f'{bcolors.WARNING}' + '=' * 80 + f'{bcolors.ENDC}')
+    logging.warning('')
+    logging.warning('You are about to access a U.S. Government Information System. Although the')
+    logging.warning('encrypted vault adheres to a zero-knowledge security architecture, system')
+    logging.warning('access logs are subject to monitoring, recording and audit. Unauthorized')
+    logging.warning('use of this system is prohibited and may result in civil and criminal')
+    logging.warning('penalties. Your use of this system indicates your acknowledgement and consent.')
+    logging.warning('')
+    logging.warning(f'{bcolors.WARNING}' + '=' * 80 + f'{bcolors.ENDC}')
+    logging.warning('')
+
+
+def welcome():
+    lines = []    # type: List[Union[str, Tuple[str, str]]]
+
+    lines.append( r'         /#############/   /#\ ')
+    lines.append( r'        /#############/   /###\      _    __  _______  _______  ______   _______  ______ (R)')
+    lines.append( r'       /#############/   /#####\    | |  / / |  ____/ |  ____/ |  ___ \ |  ____/ |  ___ \ ')
+    lines.append( r'      /######/           \######\   | | / /  | |____  | |____  | | __| || |____  | | __| | ')
+    lines.append( r'     /######/             \######\  | |< <   |  ___/  |  ___/  | |/___/ |  ___/  | |/_  / ')
+    lines.append( r'    /######/               \######\ | | \ \  | |_____ | |_____ | |      | |_____ | |  \ \ ')
+    lines.append( r'    \######\               /######/ |_|  \_\ |_______||_______||_|      |_______||_|   \_\ ')
+    lines.append((r'     \######\             /######/', r'     ____                                          _ '))
+    lines.append((r'      \######\           /######/ ', r'   /  ___|___  _ __ ___  _ __ ___   __ _ _ __   __| | ___ _ __ '))
+    lines.append((r'       \#############\   \#####/  ', r"  /  /   / _ \| '_ ` _ \| '_ ` _ \ / _` | '_ \ / _` |/ _ \ '__| "))
+    lines.append((r'        \#############\   \###/   ', r'  \  \__| (_) | | | | | | | | | | | (_| | | | | (_| |  __/ | '))
+    lines.append((r'         \#############\   \#/    ', r'   \_____\___/|_| |_| |_|_| |_| |_|\__,_|_| |_|\__,_|\___|_| '))
+    lines.append('')
+
+    try:
+        width = shutil.get_terminal_size(fallback=(160, 50)).columns
+    except:
+        width = 160
+    print(Style.RESET_ALL)
+    print(Back.BLACK + Style.BRIGHT + '\n')
+    for line in lines:
+        if isinstance(line, str):
+            if len(line) > width:
+                line = line[:width]
+            print('\033[2K' + Fore.LIGHTYELLOW_EX + line)
+        elif isinstance(line, tuple):
+            yellow_line = line[0] if len(line) > 0 else ''
+            white_line = line[1] if len(line) > 1 else ''
+            if len(yellow_line) > width:
+                yellow_line = yellow_line[:width]
+            if len(yellow_line) + len(white_line) > width:
+                if len(yellow_line) < width:
+                    white_line = white_line[:width - len(yellow_line)]
+                else:
+                    white_line = ''
+            print('\033[2K' + Fore.LIGHTYELLOW_EX + yellow_line + Fore.LIGHTWHITE_EX + white_line)
+
+    print('\033[2K' + Fore.LIGHTBLACK_EX + f'{("v" + __version__):>93}' + Style.RESET_ALL)
+    print()
+
+
+def formatted_records(records, **kwargs):
+    """Display folders/titles/uids for the supplied shared folders"""
+    params = None
+    if 'params' in kwargs:
+        params = kwargs['params']
+
+    # Sort by title
+    records.sort(key=lambda x: x.title.lower(), reverse=False)
+
+    def abbreviate_text(text: str, chars_num: int):
+        if 'verbose' in kwargs and kwargs['verbose']:
+            return text
+        else:
+            return text if len(text) < chars_num else text[:chars_num] + '...'
+
+    if len(records) > 0:
+        shared_folder = None
+        if 'folder' in kwargs and params is not None:
+            fuid = kwargs['folder']
+            if fuid in params.folder_cache:
+                folder = params.folder_cache[fuid]
+                if folder.type in {BaseFolderNode.SharedFolderType, BaseFolderNode.SharedFolderFolderType}:
+                    if folder.type == BaseFolderNode.SharedFolderFolderType:
+                        fuid = folder.shared_folder_uid
+                else:
+                    fuid = None
+                if fuid and fuid in params.shared_folder_cache:
+                    shared_folder = params.shared_folder_cache[fuid]
+
+        table = [[i + 1, r.record_uid, abbreviate_text(r.record_type, 32), abbreviate_text(r.title, 32), r.login, abbreviate_text(r.login_url, 32)] for i, r in enumerate(records)]
+        headers = ["#", 'Record UID', 'Type', 'Title', 'Login', 'URL']
+        if shared_folder and 'records' in shared_folder:
+            headers.append('Permissions')
+            for row in table:
+                permissions = ''
+                for sfr in shared_folder['records']:
+                    if sfr['record_uid'] == row[1]:
+                        if sfr['can_edit']:
+                            permissions = 'Can Edit'
+                        if sfr['can_share']:
+                            if permissions:
+                                permissions += ' & Share'
+                            else:
+                                permissions = 'Can Share'
+                        if not permissions:
+                            permissions = 'Read Only'
+                        break
+                row.append(permissions)
+
+        print(tabulate(table, headers=headers))
+
+
+def formatted_shared_folders(shared_folders, **kwargs):
+    """Display folders/titles/uids for the supplied records"""
+
+    # Sort by folder+title
+    shared_folders.sort(key=lambda x: (x.name if x.name else ' ').lower(), reverse=False)
+
+    if len(shared_folders) > 0:
+
+        table = [[i + 1, sf.shared_folder_uid, sf.name] for i, sf in enumerate(shared_folders)]
+        print(tabulate(table, headers=["#", 'Shared Folder UID', 'Name']))
+
+        print('')
+
+    skip_details = kwargs.get('skip_details') or False
+    # Under 5 recs, just display on the screen
+    if len(shared_folders) < 5 and not skip_details:
+        for sf in shared_folders:
+            sf.display()
+
+
+def formatted_teams(teams, **kwargs):
+    """Display names/uids for the supplied teams"""
+
+    # Sort by name
+    teams.sort(key=lambda x: (x.name if x.name else ' ').lower(), reverse=False)
+
+    if len(teams) > 0:
+
+        table = [[i + 1, team.team_uid, team.name] for i, team in enumerate(teams)]
+        print(tabulate(table, headers=["#", 'Team UID', 'Name']))
+
+        print('')
+
+    skip_details = kwargs.get('skip_details') or False
+    # Under 5 recs, just display on the screen
+    if len(teams) < 5 and not skip_details:
+        for team in teams:
+            team.display()
+
+
+def formatted_history(history):
+    """ Show the history of commands"""
+
+    if not history: return
+    if len(history) == 0: return
+
+    print('')
+    print('Command history:')
+    print('----------------')
+
+    for h in history:
+        print(h)
+
+    print('')
+
+
+def print_record(params, record_uid):
+    """ Show record content """
+
+    try:
+        cached_rec = params.record_cache[record_uid]
+    except KeyError as e:
+        raise Exception('Record not found: ' + record_uid)
+    data = json.loads(cached_rec['data_unencrypted'].decode('utf-8'))
+    print(data)
+
+
+import sys
+import time
+import threading
+
+
+class Spinner:
+    """Animated spinner for long-running operations.
+
+    WARNING: every frame starts with '\\r' and overwrites the current console
+    row with the frame, message and padding spaces. A spinner that is still
+    (or again) ticking while other code prints can therefore erase chunks of
+    large multi-row output - especially long single-line blobs like base64
+    KSM config tokens (`pam project import`/`pam gateway new` access_token),
+    silently corrupting what the user copies. Callers MUST guarantee stop()
+    via try/finally, and any change here must keep frames out of stopped
+    spinners and out of redirected/captured output.
+    """
+
+    # Claude-style spinner frames
+    FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
+    def __init__(self, message=""):
+        self.message = message
+        self.running = False
+        self.thread = None
+        self._last_visible_len = 0
+
+    def _animate(self):
+        idx = 0
+        while self.running:
+            frame = self.FRAMES[idx % len(self.FRAMES)]
+            message = self.message or ''
+            visible_len = len(message) + 2  # frame + space + message
+            pad = max(0, self._last_visible_len - visible_len)
+            # Re-check right before the write: a stale tick firing after
+            # stop() has returned (join timed out on a blocked console write)
+            # would '\r'-overwrite output printed in the meantime - erasing a
+            # row of large output such as a printed KSM config token.
+            # Skipping costs only one cosmetic frame.
+            if not self.running:
+                break
+            # Frames go to stderr (codebase convention for '\r' progress, see
+            # sox/aram/record_totp): on stdout they land inside redirected or
+            # captured command output, e.g. corrupting the base64 config in
+            # `pam project import ... > out.json`.
+            sys.stderr.write(f'\r{Fore.CYAN}{frame}{Fore.RESET} {message}' + (' ' * pad))
+            sys.stderr.flush()
+            self._last_visible_len = visible_len + pad
+            idx += 1
+            time.sleep(0.08)
+
+    def start(self):
+        # Spin only on a real console; in a redirected/captured stream the
+        # frames cannot animate and would pile up as '\r' noise in the data.
+        try:
+            if not sys.stderr.isatty():
+                return
+        except Exception:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._animate, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if not self.thread:
+            return
+        self.thread.join(timeout=0.5)
+        self.thread = None
+        # Clear the spinner line from the calling thread after the animator
+        # has exited; clearing from the animator raced with output printed
+        # right after stop() and could blank part of it (erased lines in
+        # large output, e.g. ksm config tokens) with the padding spaces.
+        clear_len = max(self._last_visible_len, len(self.message or '') + 2)
+        sys.stderr.write('\r' + ' ' * clear_len + '\r')
+        sys.stderr.flush()
+        self._last_visible_len = 0
+
+
+def post_login_summary(record_count=0, breachwatch_count=0, show_tips=True):
+    """Display a polished post-login summary."""
+
+    ACCENT = Fore.GREEN
+    DIM = Fore.WHITE
+    WARN = Fore.YELLOW
+
+    logging.info('')
+
+    # Vault summary
+    if record_count > 0:
+        logging.info(f"  {ACCENT}✓{Fore.RESET} Decrypted {record_count} records")
+
+    # BreachWatch warning
+    if breachwatch_count > 0:
+        logging.info(f"  {WARN}⚠ {breachwatch_count} high-risk passwords{Fore.RESET} - run {ACCENT}breachwatch list{Fore.RESET}")
+
+    if show_tips:
+        logging.info('')
+        logging.info(f"  {DIM}Quick Start:{Fore.RESET}")
+        logging.info(f"    {ACCENT}ls{Fore.RESET}            List records")
+        logging.info(f"    {ACCENT}ls -l -f{Fore.RESET}      List folders")
+        logging.info(f"    {ACCENT}cd <UID>{Fore.RESET}      Change folder")
+        logging.info(f"    {ACCENT}get <UID>{Fore.RESET}     Get record or folder info")
+        logging.info(f"    {ACCENT}supershell{Fore.RESET}    Launch vault TUI")
+        logging.info(f"    {ACCENT}search{Fore.RESET} <text> Search your vault")
+        logging.info(f"    {ACCENT}this-device{Fore.RESET}   Configure device settings")
+        logging.info(f"    {ACCENT}whoami{Fore.RESET}        Display account info")
+        logging.info(f"    {ACCENT}?{Fore.RESET}             List all commands")
+
+    logging.info('')

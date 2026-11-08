@@ -1,0 +1,210 @@
+from unittest import TestCase, mock
+from flask import Flask
+from keepercommander.service.decorators.auth import auth_check, policy_check
+from keepercommander.service.decorators.security import security_check, is_allowed_ip
+from keepercommander.service.util.config_reader import ConfigReader
+from keepercommander.service.util.verified_command import Verifycommand
+
+class TestAuthSecurity(TestCase):
+    def setUp(self):
+        self.app = Flask(__name__)
+        self.client = self.app.test_client()
+            
+        @self.app.route('/test', methods=['POST'])
+        @security_check
+        @auth_check
+        @policy_check
+        def test_endpoint():
+            return {'status': 'success'}, 200
+
+    def test_auth_check_missing_api_key(self):
+        """Test authentication with missing API key"""
+        with self.app.test_request_context('/test', method='POST'):
+            response = auth_check(lambda *args, **kwargs: ({'status': 'success'}, 200))()
+            self.assertEqual(response[1], 401)
+            self.assertEqual(response[0]['status'], 'error')
+            self.assertIn('api key', response[0]['error'])
+
+    @mock.patch.object(ConfigReader, 'read_config')
+    def test_auth_check_invalid_api_key(self, mock_read_config):
+        """Test authentication with invalid API key"""
+        mock_read_config.return_value = "different_key"
+            
+        with self.app.test_request_context('/test', method='POST', 
+                                        headers={'api-key': 'test_key'}):
+            response = auth_check(lambda *args, **kwargs: ({'status': 'success'}, 200))()
+            self.assertEqual(response[1], 401)
+            self.assertEqual(response[0]['status'], 'error')
+
+    @mock.patch.object(ConfigReader, 'read_config')
+    def test_auth_check_expired_key(self, mock_read_config):
+        """Test authentication with expired API key"""
+        mock_read_config.side_effect = [
+            "test_key",
+            "2024-01-01T00:00:00"
+        ]
+            
+        with self.app.test_request_context('/test', method='POST', 
+                                        headers={'api-key': 'test_key'}):
+            response = auth_check(lambda *args, **kwargs: ({'status': 'success'}, 200))()
+            self.assertEqual(response[1], 401)
+            self.assertEqual(response[0]['status'], 'error')
+            self.assertIn('expired', response[0]['error'])
+
+    # def test_security_check_blocked_ip(self):
+    #     """Test security check with blocked IP"""
+    #     with mock.patch.object(ConfigReader, 'read_config', return_value="192.168.1.1"):
+    #         with self.app.test_request_context('/test', method='POST', 
+    #                                         environ_base={'REMOTE_ADDR': '192.168.1.1'}):
+    #             response = security_check(lambda *args, **kwargs: ({'status': 'success'}, 200))()
+    #             response_data = response[0].get_json()
+    #             self.assertEqual(response[1], 403) 
+    #             self.assertEqual(response_data['error'], 'IP is blocked')
+
+    def test_is_blocked_ip_single_ip(self):
+        """Test IP blocking with single IP address"""
+        blocked_ips = "192.168.1.1"
+        allowed_ips="192.168.1.2"
+        self.assertFalse(is_allowed_ip("192.168.1.1", allowed_ips, blocked_ips))
+        self.assertTrue(is_allowed_ip("192.168.1.2", allowed_ips, blocked_ips))
+
+    def test_is_blocked_ip_cidr(self):
+        """Test IP blocking with CIDR notation"""
+        allowed_ips="192.168.1.1"
+        blocked_ips = "192.168.1.0"
+        self.assertTrue(is_allowed_ip("192.168.1.1", allowed_ips, blocked_ips))
+        self.assertFalse(is_allowed_ip("192.168.1.254", allowed_ips, blocked_ips))
+        self.assertFalse(is_allowed_ip("192.168.2.1", allowed_ips, blocked_ips))
+
+    @mock.patch.object(ConfigReader, 'read_config')
+    def test_policy_check_allowed_command(self, mock_read_config):
+        """Test policy check with allowed command"""
+        mock_read_config.return_value = "list,get,search"
+            
+        with self.app.test_request_context('/test', method='POST',
+                                        json={"command": "list"}):
+            response = policy_check(lambda *args, **kwargs: ({'status': 'success'}, 200))()
+            self.assertEqual(response[1], 200)
+            self.assertEqual(response[0]['status'], 'success')
+
+    @mock.patch.object(ConfigReader, 'read_config')
+    def test_policy_check_denied_command(self, mock_read_config):
+        """Test policy check with denied command"""
+        mock_read_config.return_value = "list,get,search"
+            
+        with self.app.test_request_context('/test', method='POST',
+                                        json={"command": "delete"}):
+            response = policy_check(lambda *args, **kwargs: ({'status': 'success'}, 200))()
+            self.assertEqual(response[1], 403)
+            self.assertEqual(response[0]['status'], 'error')
+            self.assertIn('Not permitted', response[0]['error'])
+
+    @mock.patch.object(ConfigReader, 'read_config', return_value='nsf-convert')
+    def test_policy_check_requires_force_for_nsf_conversion(self, _mock_read_config):
+        endpoint = lambda *args, **kwargs: ({'status': 'success'}, 200)
+        headers = {'api-key': 'test_key'}
+
+        with self.app.test_request_context(
+                '/test', method='POST', json={'command': 'nsf-convert RECORD_UID'},
+                headers=headers):
+            response = policy_check(endpoint)()
+            self.assertEqual(response[1], 400)
+            self.assertIn('-f/--force', response[0]['error'])
+
+        with self.app.test_request_context(
+                '/test', method='POST',
+                json={'command': 'nsf-convert RECORD_UID --force'}, headers=headers):
+            response = policy_check(endpoint)()
+            self.assertEqual(response[1], 200)
+            self.assertEqual(response[0]['status'], 'success')
+
+    @mock.patch.object(ConfigReader, 'read_config', return_value='nsf-convert')
+    def test_policy_check_does_not_treat_force_in_quoted_title_as_flag(self, _mock_read_config):
+        with self.app.test_request_context(
+                '/test', method='POST',
+                json={'command': 'nsf-convert "my --force record"'},
+                headers={'api-key': 'test_key'}):
+            response = policy_check(lambda *args, **kwargs: ({'status': 'success'}, 200))()
+
+        self.assertEqual(response[1], 400)
+        self.assertIn('-f/--force', response[0]['error'])
+
+    @mock.patch.object(ConfigReader, 'read_config')
+    def test_policy_check_allows_pam_tunnel_start_at_http_layer(self, mock_read_config):
+        """PAM tunnel restrictions are enforced by the command executor."""
+        mock_read_config.return_value = "pam"
+
+        with self.app.test_request_context(
+            '/test', method='POST',
+            json={"command": "pam tunnel start uid --run id"},
+            headers={'api-key': 'test_key'},
+        ):
+            response = policy_check(lambda *args, **kwargs: ({'status': 'success'}, 200))()
+            self.assertEqual(response[1], 200)
+            self.assertEqual(response[0]['status'], 'success')
+
+    @mock.patch.object(ConfigReader, 'read_config')
+    def test_policy_check_allows_pam_tunnel_edit(self, mock_read_config):
+        """pam tunnel edit remains allowed through policy_check"""
+        mock_read_config.return_value = "pam"
+
+        with self.app.test_request_context(
+            '/test', method='POST',
+            json={"command": "pam tunnel edit uid --enable-tunneling"},
+            headers={'api-key': 'test_key'},
+        ):
+            response = policy_check(lambda *args, **kwargs: ({'status': 'success'}, 200))()
+            self.assertEqual(response[1], 200)
+            self.assertEqual(response[0]['status'], 'success')
+
+    def test_validate_service_mode_restrictions_pam_tunnel(self):
+        """Unit-level checks for pam tunnel Service Mode allowlist (post-shlex tokens)"""
+        ban = 'not available in Service Mode'
+        check = Verifycommand.validate_service_mode_restrictions
+        self.assertIsNone(check(['pam', 'tunnel', 'edit', 'uid']))
+        self.assertIsNone(check(['pam', 't', 'e', 'uid']))
+        self.assertIsNone(check(['pam', 'rotation', 'list']))
+        self.assertIn(ban, check(['pam', 'tunnel', 'start', 'uid', '--run', 'id']))
+        self.assertIn(ban, check(['pam', 'tunnel', 'list']))
+        self.assertIn(ban, check(['pam', 'tunnel', 'stop', 'uid']))
+        self.assertIn(ban, check(['pam', 'tunnel', 'diagnose']))
+        self.assertIn(ban, check(['pam', 't', 's', 'uid']))
+        # Case-insensitive (executor-normalized tokens)
+        self.assertIn(ban, check(['pam', 'TUNNEL', 'START', 'uid']))
+        self.assertIsNone(check(['pam', 'TUNNEL', 'EDIT', 'uid']))
+
+    def test_validate_service_mode_restrictions_attachments(self):
+        check = Verifycommand.validate_service_mode_restrictions
+        self.assertIn('Download', check(['download-attachment', 'uid']))
+        self.assertIn('Upload', check(['upload-attachment', '/tmp/x', '--record', 'uid']))
+        self.assertIn(
+            'File attachments',
+            check(['record-add', '--title', 't', '-rt', 'login', 'file=@/tmp/x']),
+        )
+        self.assertIn(
+            'File attachments',
+            check(['record-update', '--force', '--record', 'uid', "f.file=/tmp/service_config.json"]),
+        )
+        self.assertIn(
+            'File attachments',
+            check(['ra', '--title', 't', '-rt', 'login', 'file=@/etc/passwd']),
+        )
+        self.assertIn(
+            'File attachments',
+            check(['ru', '--force', '--record', 'uid', 'f.file.doc=@/etc/passwd']),
+        )
+        self.assertIn(
+            'File attachments',
+            check(['record-add', '--title', 't', '-rt', 'login', 'c.file.doc=@/etc/passwd']),
+        )
+        self.assertIsNone(check(['record-add', '--title', 't', '-rt', 'login', 'login=user']))
+        self.assertIsNone(check(['record-add', '--title', 't', '-rt', 'login', 'my.file=x']))
+
+    def test_validate_service_mode_restrictions_host_filesystem(self):
+        check = Verifycommand.validate_service_mode_restrictions
+        ban = 'Local filesystem access'
+        self.assertIn(ban, check(['run-batch', '--dry-run', '/etc/passwd']))
+        self.assertIn(ban, check(['export', '--format=json', '/tmp/out.json']))
+        self.assertIn(ban, check(['audit-report', '--format=json', '--output=/tmp/r.json']))
+        self.assertIsNone(check(['audit-report', '--format=json']))
+        self.assertIsNone(check(['clipboard-copy', 'uid', '--output=stdout']))

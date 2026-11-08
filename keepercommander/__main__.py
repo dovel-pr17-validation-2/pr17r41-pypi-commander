@@ -1,0 +1,414 @@
+# -*- coding: utf-8 -*-
+#  _  __
+# | |/ /___ ___ _ __  ___ _ _ ®
+# | ' </ -_) -_) '_ \/ -_) '_|
+# |_|\_\___\___| .__/\___|_|
+#              |_|
+#
+# Keeper Commander
+# Copyright 2018 Keeper Security Inc.
+# Contact: ops@keepersecurity.com
+#
+
+
+import argparse
+import json
+import logging
+import os
+import re
+import shlex
+import sys
+
+from pathlib import Path
+from typing import Optional
+
+from . import __version__
+from . import cli, rest_api, utils
+from .params import KeeperParams
+from .config_storage import loader
+from .constants import resolve_server, invalid_server_message
+
+
+def get_params_from_config(config_filename=None, launched_with_shortcut=False, data_dir=None):    # type: (Optional[str], bool, Optional[str]) -> KeeperParams
+    if os.getenv("KEEPER_COMMANDER_DEBUG"):
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.info('Debug ON')
+
+    def get_env_config():
+        path = os.getenv('KEEPER_CONFIG_FILE')
+        if path:
+            logging.debug(f'Setting config file from KEEPER_CONFIG_FILE env variable {path}')
+        return path
+
+    config_filename = config_filename or get_env_config()
+    if not config_filename:
+        config_filename = 'config.json'
+        if launched_with_shortcut or not os.path.isfile(config_filename):
+            config_filename = os.path.join(utils.get_default_path(data_dir), config_filename)
+        else:
+            config_filename = os.path.join(os.getcwd(), config_filename)
+    else:
+        config_filename = os.path.expanduser(config_filename)
+
+    params = KeeperParams()
+    params.config_filename = config_filename
+    if os.path.exists(config_filename):
+        try:
+            try:
+                with open(params.config_filename) as config_file:
+                    params.config = json.load(config_file)
+                    loader.load_config_properties(params)
+                    rest_api.load_server_keys(params.config)
+                    if 'fail_on_throttle' in params.config:
+                        params.rest_context.fail_on_throttle = params.config['fail_on_throttle'] is True
+                    if 'certificate_check' in params.config:
+                        params.rest_context.certificate_check = params.config['certificate_check'] is True
+                    if 'commands' in params.config:
+                        if params.config['commands']:
+                            params.commands.extend(params.config['commands'])
+                    if 'plugins' in params.config:
+                        params.plugins = params.config['plugins']
+                    if params.config.get('debug') is True:
+                        params.debug = True
+            except loader.SecureStorageException as sse:
+                logging.error('Unable to load configuration from secure storage:\n%s',
+                              '\033[1m' + str(sse) + '\033[0m')
+                logging.error('Please check configuration file "%s" to make sure "%s" property is valid or deleted it.',
+                              os.path.abspath(params.config_filename),
+                              loader.CONFIG_STORAGE_URL)
+                input('Press <Enter> to close Keeper Commander')
+                sys.exit(1)
+            except Exception as e:
+                logging.error('Unable to parse JSON configuration file "%s"', os.path.abspath(params.config_filename))
+                answer = input('Do you want to delete it (y/N): ')
+                if answer in ['y', 'Y']:
+                    os.remove(params.config_filename)
+                else:
+                    raise e
+        except IOError as ioe:
+            logging.warning('Error: Unable to open config file %s: %s', params.config_filename, ioe)
+
+    if not params.server:
+        params.server = 'keepersecurity.com'
+
+    return params
+
+
+def usage(m):
+    """Show full help with all commands - used for 'keeper help' or 'keeper ?'"""
+    print(m)
+    parser.print_help()
+    cli.display_command_help(show_enterprise=True, show_shell=True, show_legacy=False)
+    sys.exit(1)
+
+
+def show_brief_help():
+    """Show brief help for 'keeper -h' - just global options and guidance"""
+    print('')
+    print('Keeper Commander - CLI-based vault and admin interface to the Keeper platform')
+    print('')
+    print('Usage: keeper [OPTIONS] [COMMAND] [COMMAND_OPTIONS]')
+    print('')
+    print('Global Options:')
+    print('  --server, -ks SERVER     Keeper region or host')
+    print('                           Regions: US, EU, AU, CA, JP, GOV')
+    print('                           Dev/QA:  US_DEV, EU_DEV, GOV_QA, etc.')
+    print('  --user, -ku USER         Email address for the account')
+    print('  --password, -kp PASSWORD Master password for the account')
+    print('  --config CONFIG          Config file to use')
+    print('  --debug                  Turn on debug mode')
+    print('  --silent                 Turn off all logging statements')    
+    print('  --batch-mode             Run in batch/non-interactive mode')
+    print('  --proxy PROXY            Proxy server')
+    print('  --new-login              Force full login (bypass persistent login)')
+    print('  --version                Display version')
+    print('')
+    print('Getting Started:')
+    print('  keeper shell             Open interactive command shell')
+    print('  keeper supershell        Open full-screen vault browser (TUI)')
+    print('  keeper login             Login to your Keeper account')
+    print('')
+    print('Getting Help:')
+    print('  keeper help              Show hundreds of available commands')
+    print('  keeper help <command>    Show help for a specific command')
+    print('  keeper <command> -h      Show help for a specific command')
+    print('')
+    print('Examples:')
+    print('  keeper shell                         # Start interactive shell')
+    print('  keeper --server EU login             # Login to EU region')
+    print('  keeper login -h                      # Show login command help')
+    print('  keeper search "github" --format=json # Search and output JSON')
+    print('')
+    print('User Guide: https://docs.keeper.io/en/keeperpam/commander-cli')
+    print('')
+    sys.exit(0)
+
+
+parser = argparse.ArgumentParser(prog='keeper', add_help=False, allow_abbrev=False)
+parser.add_argument('--server', '-ks', dest='server', action='store', help='Keeper Host address.')
+parser.add_argument('--user', '-ku', dest='user', action='store', help='Email address for the account.')
+parser.add_argument('--password', '-kp', dest='password', action='store', help='Master password for the account.')
+parser.add_argument('--version', dest='version', action='store_true', help='Display version')
+parser.add_argument('--config', dest='config', action='store', help='Config file to use')
+parser.add_argument('--debug', dest='debug', action='store_true', help='Turn on debug mode')
+parser.add_argument('--silent', dest='silent', action='store_true', help='Turn off all logging statements')
+parser.add_argument('--batch-mode', dest='batch_mode', action='store_true', help='Run commander in batch or basic UI mode.')
+parser.add_argument('--launched-with-shortcut', '-lwsc', dest='launched_with_shortcut', action='store',
+                    help='Indicates that the app was launched using a shortcut, for example using Mac App or from '
+                         'Windows Start Menu.')
+parser.add_argument('--proxy', dest='proxy', action='store', help='Proxy server')
+unmask_help = 'Disable default masking of sensitive information (e.g., passwords) in output'
+parser.add_argument('--unmask-all', action='store_true', help=unmask_help)
+fail_on_throttle_help = 'Disable default client-side pausing of command execution and re-sending of requests upon ' \
+                        'server-side throttling'
+parser.add_argument('--fail-on-throttle', action='store_true', help=fail_on_throttle_help)
+parser.add_argument('--data-dir', dest='data_dir', action='store', help='Directory to use for Commander data (config, cache, etc.). Overrides environment variables.')
+parser.add_argument('--new-login', dest='new_login', action='store_true', help='Force full login flow (bypass persistent login)')
+parser.add_argument('--config-file', dest='config_file', action='store_true',
+                    help='Store credentials in config.json instead of the OS-native keychain')
+parser.add_argument('command', nargs='?', type=str, action='store', help='Command')
+parser.add_argument('options', nargs='*', action='store', help='Options')
+parser.error = usage
+
+
+def handle_exceptions(exc_type, exc_value, exc_traceback):
+    import traceback
+    traceback.print_exception(exc_type, exc_value, exc_traceback)
+    input('Press Enter to exit')
+    sys.exit(-1)
+
+
+def main(from_package=False):
+    if sys.platform == 'win32':
+        try:
+            sys.stdout.reconfigure(encoding='utf-8')
+            sys.stderr.reconfigure(encoding='utf-8')
+        except:
+            pass
+    logging.basicConfig(format='%(message)s', force=True)
+    logger = logging.getLogger()
+    if logger:
+        logger.name = 'keepercommander'
+
+    ssl_cert_file = utils.get_ssl_cert_file()
+    if ssl_cert_file:
+        os.environ['SSL_CERT_FILE'] = ssl_cert_file
+    else:
+        logging.warning("Warning: SSL certificate verification has been disabled. This is not recommended for production use.")
+        os.environ.pop('SSL_CERT_FILE', None)
+
+    errno = 0
+
+    if from_package:
+        sys.excepthook = handle_exceptions
+
+    # Internal: background service mode for a frozen (PyInstaller) executable - see service_app.py.
+    is_frozen = getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
+    if is_frozen:
+        from .service.core.service_app import SERVICE_MODE_FLAG, run_background_service
+        if len(sys.argv) > 1 and sys.argv[1] == SERVICE_MODE_FLAG:
+            run_background_service()
+            return
+
+    sys.argv[0] = re.sub(r'(-script\.pyw?|\.exe)?$', '', sys.argv[0])
+    opts, flags = parser.parse_known_args(sys.argv[1:])
+    
+    # Store the original command arguments for proper reconstruction
+    if opts.command:
+        # Find where the command starts in the original args and take everything after it
+        try:
+            cmd_index = sys.argv[1:].index(opts.command)
+            original_args_after_command = sys.argv[1:][cmd_index+1:]
+            
+            # Filter out arguments that were consumed by the main parser
+            filtered_args = []
+            skip_next = False
+            for arg in original_args_after_command:
+                if skip_next:
+                    skip_next = False
+                    continue
+                    
+                # Skip arguments that were handled by main parser.
+                # Value flags: skip the flag AND the following value argument.
+                # Boolean flags: skip only the flag itself (no value follows).
+                value_main_parser_args = ['--config', '--server', '--user', '--password',
+                                          '--launched-with-shortcut', '--proxy',
+                                          '--data-dir', '-ks', '-ku', '-kp', '-lwsc']
+                bool_main_parser_args = ['--version', '--debug', '--silent', '--batch-mode',
+                                         '--unmask-all', '--fail-on-throttle',
+                                         '--new-login', '--config-file']
+                main_parser_args = value_main_parser_args + bool_main_parser_args
+
+                is_main_parser_arg = False
+                for main_arg in main_parser_args:
+                    if arg.startswith(main_arg + '=') or arg == main_arg:
+                        is_main_parser_arg = True
+                        # Only skip the next token for flags that consume a value.
+                        if arg == main_arg and main_arg in value_main_parser_args:
+                            skip_next = True
+                        break
+                
+                if is_main_parser_arg:
+                    continue
+                    
+                filtered_args.append(arg)
+            
+            original_args_after_command = filtered_args
+        except ValueError:
+            original_args_after_command = []
+    else:
+        original_args_after_command = []
+    if opts.launched_with_shortcut:
+        os.chdir(Path.home())
+
+    if opts.silent:
+        logging.disable(logging.CRITICAL)
+
+    params = get_params_from_config(opts.config, opts.launched_with_shortcut, opts.data_dir)
+
+    if opts.batch_mode:
+        params.batch_mode = True
+
+    if opts.debug:
+        params.debug = opts.debug
+
+    logging.getLogger().setLevel(logging.WARNING if params.batch_mode else logging.DEBUG if opts.debug else logging.INFO)
+
+    # Log SSL certificate selection in debug mode (after logging is configured)
+    if opts.debug:
+        ssl_cert_from_env = os.environ.get('SSL_CERT_FILE')
+        if ssl_cert_from_env:
+            logging.debug(f"Using SSL certificate file: {ssl_cert_from_env}")
+
+    if opts.proxy:
+        params.proxy = opts.proxy
+
+    if opts.server:
+        resolved_server = resolve_server(opts.server)
+        if not resolved_server:
+            logging.error('\nError: %s\n', invalid_server_message(opts.server))
+            sys.exit(1)
+        params.server = resolved_server
+
+    if opts.user is not None:
+        params.user = opts.user
+
+    if opts.unmask_all:
+        params.unmask_all = opts.unmask_all
+
+    if opts.fail_on_throttle:
+        params.rest_context.fail_on_throttle = opts.fail_on_throttle
+
+    if opts.password:
+        params.password = opts.password
+    else:
+        pwd = os.getenv('KEEPER_PASSWORD')
+        if pwd:
+            params.password = pwd
+
+    if opts.version:
+        print(f'Keeper Commander, version {__version__}')
+        return
+
+    # Handle help flags and commands
+    has_help_flag = flags and len(flags) > 0 and flags[0] in ('-h', '--help')
+
+    if has_help_flag:
+        if not opts.command:
+            # 'keeper -h' with no command → show brief help
+            show_brief_help()
+        else:
+            # 'keeper <command> -h' → pass -h to the command (keep it in original_args)
+            # The -h is already in original_args_after_command, so just continue
+            pass
+
+    # Handle 'keeper help' and 'keeper help <command>'
+    if opts.command == 'help':
+        if len(opts.options) == 0:
+            # 'keeper help' with no args → show full command list
+            usage('')
+        else:
+            # 'keeper help <command>' → convert to '<command> --help'
+            opts.command = opts.options[0]
+            original_args_after_command = ['--help']
+
+    # Handle 'keeper ?'
+    if opts.command == '?':
+        usage('')
+
+    if not opts.command and from_package:
+        opts.command = 'shell'
+
+    # If no command provided, show helpful welcome message
+    if not opts.command and not params.commands:
+        logging.warning('')
+        logging.warning('Keeper Commander - CLI-based vault and admin interface to the Keeper platform')
+        logging.warning('')
+        logging.warning('To get started:')
+        logging.warning('  keeper login          Authenticate to Keeper')
+        logging.warning('  keeper shell          Open interactive command shell')
+        logging.warning('  keeper supershell     Open full-screen vault browser (TUI)')
+        logging.warning('  keeper -h             Show help and available options')
+        logging.warning('')
+        logging.warning('Learn more at https://docs.keeper.io/en/keeperpam/commander-cli/overview')
+        logging.warning('')
+        return
+
+    if isinstance(params.timedelay, int) and params.timedelay >= 1 and params.commands:
+        cli.runcommands(params)
+    else:
+        # Check if -h/--help is in the arguments for a command
+        command_wants_help = any(arg in ('-h', '--help') for arg in original_args_after_command)
+
+        if opts.command in {'shell', '-'} and not command_wants_help:
+            # Special handling for shell/- when NOT asking for help
+            if opts.command == '-':
+                params.batch_mode = True
+            # Pre-queue any sub-command passed after 'shell', or apply session-level
+            # flags when no explicit sub-command is given.
+            if original_args_after_command:
+                sub_cmd = ' '.join([shlex.quote(x) for x in original_args_after_command])
+                first_token = original_args_after_command[0]
+                if first_token == 'login':
+                    # Inject main-parser flags that were stripped from original_args_after_command
+                    login_flags = ''
+                    if opts.new_login:
+                        login_flags += ' --new-login'
+                    if opts.config_file:
+                        login_flags += ' --config-file'
+                    if login_flags:
+                        rest = sub_cmd[len('login'):].strip()
+                        sub_cmd = f'login{login_flags} {rest}'.strip()
+                params.commands.insert(0, sub_cmd)
+            elif opts.config_file:
+                # `keeper shell --config-file` with no sub-command:
+                # set the file sentinel for this session so any subsequent login
+                # uses file-based storage, without forcing a re-login now.
+                params.config[loader.CONFIG_STORAGE_URL] = 'file'
+        elif opts.command and os.path.isfile(opts.command):
+            with open(opts.command, 'r') as f:
+                lines = f.readlines()
+                params.commands.extend([x.strip() for x in lines])
+            params.commands.append('q')
+            params.batch_mode = True
+        else:
+            if opts.command:
+                # Use the filtered original argument order to preserve proper flag/value pairing
+                options = ' '.join([shlex.quote(x) for x in original_args_after_command]) if original_args_after_command else ''
+                # Inject --new-login / --config-file into login if main parser captured them
+                if opts.command == 'login' and opts.new_login:
+                    options = '--new-login ' + options if options else '--new-login'
+                if opts.command == 'login' and opts.config_file:
+                    options = '--config-file ' + options if options else '--config-file'
+                command = ' '.join([opts.command or '', options]).strip()
+                params.commands.append(command)
+            params.commands.append('q')
+            params.batch_mode = True
+
+        errno = cli.loop(params, new_login=opts.new_login)
+
+    sys.exit(errno)
+
+
+if __name__ == '__main__':
+    main()

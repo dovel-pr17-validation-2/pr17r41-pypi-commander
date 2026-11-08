@@ -1,0 +1,1080 @@
+"""
+Nested Share Folder — record CRUD, sharing, and ownership transfer.
+"""
+
+import json
+import logging
+import os
+from typing import Optional, List, Dict, Any
+
+from .. import utils, crypto, api
+from ..params import KeeperParams
+from ..proto import record_pb2, folder_pb2, record_endpoints_pb2, record_details_pb2, record_sharing_pb2, tla_pb2
+from ..error import KeeperApiError
+from ..api import pad_aes_gcm
+
+from .common import (
+    get_folder_key, get_record_key, get_record_from_cache,
+    get_record_revision, patch_record_revision,
+    get_user_public_key, encrypt_for_recipient, handle_share_invite,
+    parse_sharing_status,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Low-level protobuf builder
+# ══════════════════════════════════════════════════════════════════════════
+
+def create_record_data_v3(record_uid, record_key, data,
+                           non_shared_data=None, folder_uid=None,
+                           folder_key=None, record_key_type=None,
+                           client_modified_time=None, data_key=None,
+                           owner_key=None, audit=None):
+    ra = record_endpoints_pb2.RecordAdd()
+    ra.recordUid = utils.base64_url_decode(record_uid)
+
+    if folder_uid and folder_key:
+        ra.recordKey = crypto.encrypt_aes_v2(record_key, folder_key)
+        ra.folderUid = utils.base64_url_decode(folder_uid)
+        ra.recordKeyEncryptedBy = folder_pb2.ENCRYPTED_BY_PARENT_KEY
+    elif folder_uid and not folder_key:
+        raise ValueError("folder_key required when folder_uid is provided")
+    else:
+        if data_key is None:
+            raise ValueError("data_key required when creating at vault root")
+        ra.recordKey = crypto.encrypt_aes_v2(record_key, data_key)
+
+    owner_encryption_key = owner_key or data_key
+    if owner_encryption_key is not None:
+        ra.recordKeyEncryptedByOwnerKey = crypto.encrypt_aes_v2(record_key, owner_encryption_key)
+
+    ra.recordKeyType = (record_key_type if record_key_type is not None
+                        else folder_pb2.encrypted_by_data_key_gcm)
+
+    data_json = pad_aes_gcm(json.dumps(data))
+    data_bytes = data_json.encode() if isinstance(data_json, str) else data_json
+    ra.data = crypto.encrypt_aes_v2(data_bytes, record_key)
+
+    if non_shared_data:
+        ns = pad_aes_gcm(json.dumps(non_shared_data))
+        ns_bytes = ns.encode() if isinstance(ns, str) else ns
+        ra.nonSharedData = crypto.encrypt_aes_v2(ns_bytes, record_key)
+    if client_modified_time:
+        ra.clientModifiedTime = client_modified_time
+    if audit is not None:
+        ra.audit.CopyFrom(audit)
+    return ra
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Transport: record_add_v3 / record_update_v3
+# ══════════════════════════════════════════════════════════════════════════
+
+def record_add_v3(params, records, client_time=None, security_data_key_type=None):
+    if not records or len(records) > 1000:
+        raise ValueError("Provide 1..1000 records")
+    rq = record_endpoints_pb2.RecordsAddRequest()
+    rq.records.extend(records)
+    if client_time:
+        rq.clientTime = client_time
+    if security_data_key_type:
+        rq.securityDataKeyType = security_data_key_type
+    return api.communicate_rest(params, rq, 'vault/records/v3/add',
+                                rs_type=record_pb2.RecordsModifyResponse)
+
+
+def record_add_pam_configuration_v3(params, records, client_time=None, security_data_key_type=None):
+    if not records or len(records) > 1000:
+        raise ValueError("Provide 1..1000 records")
+    rq = record_endpoints_pb2.RecordsAddRequest()
+    rq.records.extend(records)
+    rq.clientTime = client_time if client_time is not None else utils.current_milli_time()
+    if security_data_key_type:
+        rq.securityDataKeyType = security_data_key_type
+    return api.communicate_rest(params, rq, 'vault/records/v3/add_pam_configuration',
+                                rs_type=record_pb2.RecordsModifyResponse)
+
+
+def record_update_v3(params, records, client_time=None, security_data_key_type=None):
+    if not records or len(records) > 1000:
+        raise ValueError("Provide 1..1000 records")
+    rq = record_pb2.RecordsUpdateRequest()
+    rq.records.extend(records)
+    if client_time:
+        rq.client_time = client_time
+    if security_data_key_type:
+        rq.security_data_key_type = security_data_key_type
+    return api.communicate_rest(params, rq, 'vault/records/v3/update',
+                                rs_type=record_pb2.RecordsModifyResponse)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# High-level: create / update / batch
+# ══════════════════════════════════════════════════════════════════════════
+
+def create_record_v3(params, record_type='', title='', fields=None,
+                     folder_uid=None, notes=None, custom_fields=None,
+                     record_data=None, record_uid=None):
+    uid = record_uid or utils.generate_uid()
+    rk = os.urandom(32)
+
+    if record_data is not None:
+        data = record_data
+    else:
+        data = {'type': record_type, 'title': title, 'fields': []}
+        if fields:
+            for ft, fv in fields.items():
+                data['fields'].append({'type': ft, 'value': fv if isinstance(fv, list) else [fv]})
+        if notes is not None:
+            data['notes'] = notes
+        if custom_fields:
+            data['fields'].extend(custom_fields)
+
+    fk = get_folder_key(params, folder_uid, raise_on_missing=True) if folder_uid else None
+
+    ra = create_record_data_v3(
+        record_uid=uid, record_key=rk, data=data,
+        folder_uid=folder_uid, folder_key=fk,
+        data_key=params.data_key, client_modified_time=utils.current_milli_time())
+    response = record_add_v3(params, [ra])
+
+    if response.records:
+        r = response.records[0]
+        return {
+            'record_uid': uid,
+            'status': record_pb2.RecordModifyResult.Name(r.status),
+            'message': r.message,
+            'success': r.status == record_pb2.RS_SUCCESS,
+            'revision': getattr(response, 'revision', 0),
+        }
+    raise KeeperApiError('no_results', 'No results from record creation')
+
+
+def _load_existing_record_data(params, record_uid, rec=None):
+    """Load decrypted record JSON for update"""
+    candidates = []
+    if rec is not None:
+        candidates.append(rec.get('data_unencrypted'))
+    cache_rec = getattr(params, 'record_cache', {}).get(record_uid) or {}
+    candidates.append(cache_rec.get('data_unencrypted'))
+    nsf_data = getattr(params, 'nested_share_record_data', {}).get(record_uid) or {}
+    candidates.append(nsf_data.get('data_json'))
+
+    for raw in candidates:
+        if raw is None:
+            continue
+        if isinstance(raw, bytes):
+            return json.loads(raw.decode('utf-8'))
+        if isinstance(raw, str):
+            return json.loads(raw)
+        if isinstance(raw, dict):
+            return raw.copy()
+    return None
+
+
+def _apply_record_update_overrides(data, title=None, record_type=None, fields=None, notes=None):
+    """Apply optional title/type/fields/notes overrides onto a record data dict."""
+    if title is not None:
+        data['title'] = title
+    if record_type is not None:
+        data['type'] = record_type
+    if fields is not None:
+        by_type = {}
+        for ef in data.get('fields', []):
+            by_type.setdefault(ef.get('type'), []).append(ef)
+        for ft, fv in fields.items():
+            fv = fv if isinstance(fv, list) else [fv]
+            if ft in by_type and by_type[ft]:
+                by_type[ft][0]['value'] = fv
+            else:
+                data.setdefault('fields', []).append({'type': ft, 'value': fv})
+    if notes is not None:
+        data['notes'] = notes
+    return data
+
+
+def _sync_down_for_nsf_update(params):
+    """Sync while preserving NSF folder keys when possible."""
+    try:
+        from ..commands.pam_import.nsf_helpers import sync_down_preserving_nsf_keys as _sync
+    except ImportError:
+        from .. import sync_down as sync_down_mod
+        _sync = sync_down_mod.sync_down
+    _sync(params)
+
+
+def update_record_v3(params, record_uid, data=None, title=None,
+                     record_type=None, fields=None, notes=None,
+                     non_shared_data=None, revision=None):
+    """Update an NSF/classic-cached record via vault/records/v3/update.
+
+    On ``RS_OUT_OF_SYNC`` with no explicit *revision*, syncs once. When the
+    update can be rebuilt from *title* / *record_type* / *fields* / *notes*
+    (or when *data* was omitted), the retry applies those overrides to the
+    refreshed record. When the caller supplied a full *data* payload only,
+    the sync runs but no retry is attempted — the caller must re-run.
+    """
+    rec = get_record_from_cache(params, record_uid)
+    if not rec:
+        _sync_down_for_nsf_update(params)
+        rec = get_record_from_cache(params, record_uid)
+    if not rec:
+        raise ValueError(f"Record {record_uid} not found")
+
+    rk = rec.get('record_key_unencrypted') or get_record_key(params, record_uid)
+    can_rebuild_on_retry = (
+        data is None or title is not None or record_type is not None
+        or fields is not None or notes is not None
+    )
+
+    if data is None:
+        existing = _load_existing_record_data(params, record_uid, rec)
+        data = existing.copy() if existing else {'fields': []}
+        _apply_record_update_overrides(data, title, record_type, fields, notes)
+
+    def _build_update(payload, rev):
+        ru = record_pb2.RecordUpdate()
+        ru.record_uid = utils.base64_url_decode(record_uid)
+        ru.client_modified_time = utils.current_milli_time()
+        # Prefer the highest known revision: NSF metadata can lag classic sync_down.
+        ru.revision = (rev if rev is not None
+                       else get_record_revision(params, record_uid, rec.get('revision') or 0))
+        dj = pad_aes_gcm(json.dumps(payload))
+        db = dj.encode() if isinstance(dj, str) else dj
+        ru.data = crypto.encrypt_aes_v2(db, rk)
+        if non_shared_data:
+            nsj = pad_aes_gcm(json.dumps(non_shared_data))
+            nsb = nsj.encode() if isinstance(nsj, str) else nsj
+            ru.non_shared_data = crypto.encrypt_aes_v2(nsb, rk)
+        return ru
+
+    ru = _build_update(data, revision)
+    response = record_update_v3(params, [ru])
+    if response.records:
+        r = response.records[0]
+        # After PAM/classic edits, sync can leave NSF metadata lagging. Refresh
+        # once and retry when overrides allow a safe rebuild from fresh caches.
+        if r.status == record_pb2.RS_OUT_OF_SYNC and revision is None:
+            _sync_down_for_nsf_update(params)
+            if not can_rebuild_on_retry:
+                return {
+                    'record_uid': record_uid,
+                    'status': record_pb2.RecordModifyResult.Name(r.status),
+                    'message': (r.message or
+                                'Record was modified concurrently; please re-run the command.'),
+                    'success': False,
+                    'revision': getattr(response, 'revision', 0),
+                }
+            rec = get_record_from_cache(params, record_uid) or rec
+            rk = rec.get('record_key_unencrypted') or rk
+            existing = _load_existing_record_data(params, record_uid, rec)
+            retry_data = existing.copy() if existing else {'fields': []}
+            _apply_record_update_overrides(
+                retry_data, title, record_type, fields, notes)
+            ru = _build_update(retry_data, None)
+            response = record_update_v3(params, [ru])
+            if not response.records:
+                raise KeeperApiError('no_results', 'No results from record update')
+            r = response.records[0]
+        success = r.status == record_pb2.RS_SUCCESS
+        # For single-record updates the server returns the record revision here.
+        new_revision = getattr(response, 'revision', 0)
+        if success:
+            patch_record_revision(params, record_uid, new_revision)
+            nsf_data = getattr(params, 'nested_share_record_data', {}).get(record_uid)
+            if nsf_data is not None:
+                # Update NSF cache with decrypted record data (dict form)
+                nsf_data['data_json'] = data
+            cached_record = getattr(params, 'record_cache', {}).get(record_uid)
+            if cached_record is not None and cached_record.get('data_unencrypted') is not None:
+                # Update classic cache with decrypted record data (JSON string form)
+                cached_record['data_unencrypted'] = json.dumps(data)
+        return {
+            'record_uid': record_uid,
+            'status': record_pb2.RecordModifyResult.Name(r.status),
+            'message': r.message,
+            'success': success,
+            'revision': new_revision,
+        }
+    raise KeeperApiError('no_results', 'No results from record update')
+
+
+def create_records_batch_v3(params, record_specs):
+    if len(record_specs) > 1000:
+        raise ValueError("Maximum 1000 records at a time")
+    adds, uid_map = [], {}
+    for idx, spec in enumerate(record_specs):
+        uid = utils.generate_uid()
+        uid_map[idx] = uid
+        rk = os.urandom(32)
+        data = {'type': spec['type'], 'title': spec['title'], 'fields': []}
+        for ft, fv in spec.get('fields', {}).items():
+            data['fields'].append({'type': ft, 'value': fv if isinstance(fv, list) else [fv]})
+        if spec.get('notes') is not None:
+            data['notes'] = spec['notes']
+        if spec.get('custom_fields'):
+            data['fields'].extend(spec['custom_fields'])
+
+        fuid = spec.get('folder_uid')
+        fk = get_folder_key(params, fuid) if fuid else None
+        adds.append(create_record_data_v3(
+            record_uid=uid, record_key=rk, data=data,
+            folder_uid=fuid, folder_key=fk,
+            data_key=params.data_key, client_modified_time=utils.current_milli_time()))
+
+    response = record_add_v3(params, adds)
+    return [{
+        'record_uid': uid_map.get(i, utils.base64_url_encode(r.record_uid)),
+        'title': record_specs[i].get('title'),
+        'status': record_pb2.RecordModifyResult.Name(r.status),
+        'message': r.message,
+        'success': r.status == record_pb2.RS_SUCCESS,
+        'revision': getattr(response, 'revision', 0),
+    } for i, r in enumerate(response.records)]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Record details / access
+# ══════════════════════════════════════════════════════════════════════════
+
+def get_record_details_v3(params, record_uids, client_time=None):
+    if not record_uids:
+        raise ValueError("At least one record UID required")
+    rq = record_details_pb2.RecordDataRequest()
+    for uid in record_uids:
+        rq.recordUids.append(utils.base64_url_decode(uid))
+    rq.clientTime = client_time or utils.current_milli_time()
+
+    rs = api.communicate_rest(params, rq, 'vault/records/v3/details/data',
+                              rs_type=record_details_pb2.RecordDataResponse)
+    result = {'data': [], 'forbidden_records': []}
+
+    for rd in rs.data:
+        uid = utils.base64_url_encode(getattr(rd, 'recordUid', getattr(rd, 'record_uid', b'')))
+        title, rtype = 'Unknown', 'Unknown'
+        try:
+            title, rtype = _decrypt_record_data(params, rd, uid)
+        except Exception:
+            pass
+        result['data'].append({
+            'record_uid': uid, 'title': title, 'type': rtype,
+            'revision': getattr(rd, 'revision', 0),
+            'version': getattr(rd, 'version', 0),
+        })
+    for fu in rs.forbiddenRecords:
+        result['forbidden_records'].append(utils.base64_url_encode(fu))
+    return result
+
+
+def _decrypt_record_data(params, rd, uid):
+    rk_val = getattr(rd, 'recordKey', getattr(rd, 'record_key', None))
+    if not rk_val:
+        raise ValueError("No record key")
+    enc_rk = utils.base64_url_decode(rk_val) if isinstance(rk_val, str) else rk_val
+    rk_type = getattr(rd, 'recordKeyType', getattr(rd, 'record_key_type', None))
+
+    drk = _try_decrypt_record_key(params, enc_rk, rk_type, uid)
+    enc_data = getattr(rd, 'encryptedRecordData', getattr(rd, 'encrypted_record_data', None))
+    if drk and enc_data:
+        raw = utils.base64_url_decode(enc_data) if isinstance(enc_data, str) else enc_data
+        dec = crypto.decrypt_aes_v2(raw, drk)
+        dj = json.loads(dec.decode().rstrip(' '))
+        return dj.get('title', 'Unknown'), dj.get('type', 'Unknown')
+    return 'Unknown', 'Unknown'
+
+
+def _try_decrypt_record_key(params, enc_rk, rk_type, uid):
+    drk = None
+    if rk_type in (record_pb2.ENCRYPTED_BY_DATA_KEY, 'ENCRYPTED_BY_DATA_KEY'):
+        try: drk = crypto.decrypt_aes_v1(enc_rk, params.data_key)
+        except Exception: pass
+    elif rk_type in (record_pb2.ENCRYPTED_BY_DATA_KEY_GCM, 'ENCRYPTED_BY_DATA_KEY_GCM', None):
+        try: drk = crypto.decrypt_aes_v2(enc_rk, params.data_key)
+        except Exception: pass
+    elif rk_type in (record_pb2.ENCRYPTED_BY_PUBLIC_KEY, 'ENCRYPTED_BY_PUBLIC_KEY'):
+        drk = crypto.decrypt_rsa(enc_rk, params.rsa_key2)
+    elif rk_type in (record_pb2.ENCRYPTED_BY_PUBLIC_KEY_ECC, 'ENCRYPTED_BY_PUBLIC_KEY_ECC'):
+        drk = crypto.decrypt_ec(enc_rk, params.ecc_key)
+
+    if not drk and uid in getattr(params, 'nested_share_record_keys', {}):
+        for rk_entry in params.nested_share_record_keys[uid]:
+            fuid = rk_entry.get('folder_uid')
+            if fuid:
+                fobj = getattr(params, 'nested_share_folders', {}).get(fuid, {})
+                fk = fobj.get('folder_key_unencrypted')
+                if fk:
+                    try: drk = crypto.decrypt_aes_v2(enc_rk, fk); break
+                    except Exception:
+                        try: drk = crypto.decrypt_aes_v1(enc_rk, fk); break
+                        except Exception: pass
+    return drk
+
+
+def _access_type_name(access_type):
+    try:
+        return folder_pb2.AccessType.Name(access_type)
+    except (ValueError, TypeError):
+        return 'AT_UNKNOWN'
+
+
+def _parse_record_access_response(rs, result):
+    for ra in rs.recordAccesses:
+        d = ra.data
+        ai = ra.accessorInfo
+        ao = {
+            'record_uid': utils.base64_url_encode(d.recordUid),
+            'accessor_name': ai.name,
+            'access_type': _access_type_name(d.accessType),
+            'access_type_uid': utils.base64_url_encode(d.accessTypeUid),
+            'owner': getattr(d, 'owner', False),
+            'inherited': bool(getattr(d, 'inherited', False)),
+            'denied_access': bool(getattr(d, 'deniedAccess', False)),
+            'access_role_type': int(getattr(d, 'accessRoleType', 0) or 0),
+        }
+        for flag in ('can_view_title', 'can_edit', 'can_view', 'can_list_access',
+                     'can_update_access', 'can_delete', 'can_change_ownership',
+                     'can_request_access', 'can_approve_access'):
+            ao[flag] = getattr(d, flag, False)
+        # Proto3 scalar fields have no presence; only test the submessage.
+        if d.HasField('tlaProperties'):
+            ao['tla_expiration'] = d.tlaProperties.expiration
+            ao['tla_rotate_on_expiration'] = bool(
+                getattr(d.tlaProperties, 'rotateOnExpiration', False))
+        result['record_accesses'].append(ao)
+    for fu in rs.forbiddenRecords:
+        fuid = utils.base64_url_encode(fu)
+        if fuid not in result['forbidden_records']:
+            result['forbidden_records'].append(fuid)
+
+
+def filter_record_accesses(accesses, show_inherited=False, show_denied=False):
+    """Filter record access rows for display.
+
+    Inherited (folder-level) and denied-access rows are omitted by default;
+    pass ``show_inherited=True`` / ``show_denied=True`` to include them.
+    """
+    return [
+        a for a in accesses
+        if (show_inherited or not a.get('inherited'))
+        and (show_denied or not a.get('denied_access'))
+    ]
+
+
+def get_record_accesses_v3(params, record_uids):
+    if not record_uids:
+        raise ValueError("At least one record UID required")
+    from ..proto import pagination_pb2
+
+    result = {'record_accesses': [], 'forbidden_records': []}
+    cursor = ''
+    page_number = 1
+    use_page = False
+    # Guard against runaway pagination.
+    for _ in range(50):
+        rq = record_details_pb2.RecordAccessRequest()
+        for uid in record_uids:
+            rq.recordUids.append(utils.base64_url_decode(uid))
+        # First request matches historical nsf-get behavior (no page).
+        # Only send Page on follow-ups; forcing pageSize on page 1 caused
+        # incomplete accessor lists for some vaults.
+        if use_page:
+            page = pagination_pb2.Page()
+            page.pageNumber = page_number
+            page.pageSize = 500  # server max
+            if cursor:
+                page.cursorToken = cursor
+            rq.page.CopyFrom(page)
+
+        rs = api.communicate_rest(params, rq, 'vault/records/v3/details/access',
+                                  rs_type=record_details_pb2.RecordAccessResponse)
+        _parse_record_access_response(rs, result)
+
+        page_info = rs.pageInfo if rs.HasField('pageInfo') else None
+        if not page_info or not page_info.hasMore:
+            break
+        cursor = page_info.cursorToken or ''
+        page_number = (page_info.pageNumber or page_number) + 1
+        use_page = True
+    return result
+
+
+def find_direct_user_share_access(access_result, record_uid, email):
+    """Return the direct AT_USER share row for *email* on *record_uid*, or None."""
+    email_cf = email.casefold()
+    for access in access_result.get('record_accesses', []):
+        if access.get('record_uid') != record_uid or access.get('owner', False):
+            continue
+        if access.get('access_type') and access.get('access_type') != 'AT_USER':
+            continue
+        if access.get('inherited'):
+            continue
+        if access.get('accessor_name', '').casefold() == email_cf:
+            return access
+    return None
+
+
+def find_record_owner_username(access_result, record_uid):
+    """Return the owner username for *record_uid* from a get_record_accesses_v3 result."""
+    return next(
+        (
+            access.get('accessor_name') or ''
+            for access in access_result.get('record_accesses', [])
+            if access.get('record_uid') == record_uid and access.get('owner')
+        ),
+        '',
+    )
+
+_SHARE_EXPIRATION_NOOP_TOLERANCE_MS = 60_000
+
+
+def is_record_share_update_noop(existing, access_role_type, expiration_timestamp,
+                                 rotate_on_expiration=False):
+    """True when an update would leave role, expiration, and ROE unchanged."""
+    if rotate_on_expiration and not existing.get('tla_rotate_on_expiration'):
+        return False
+    if existing.get('access_role_type') != access_role_type:
+        return False
+    existing_exp = existing.get('tla_expiration')
+    if expiration_timestamp is None:
+        return True
+    if expiration_timestamp == -1:
+        return not existing_exp or existing_exp <= 0
+    if expiration_timestamp > 0:
+        if not existing_exp or existing_exp <= 0:
+            return False
+        return abs(existing_exp - expiration_timestamp) <= _SHARE_EXPIRATION_NOOP_TOLERANCE_MS
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Record sharing  (Strategy: share / update / revoke)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _apply_share_expiration_tla(tla_props, expiration_timestamp,
+                                 rotate_on_expiration=False):
+    """Set expiration / notification / ROE fields on a TLAProperties proto."""
+    if expiration_timestamp is None:
+        return
+    tla_props.expiration = expiration_timestamp
+    if expiration_timestamp > 0:
+        tla_props.timerNotificationType = tla_pb2.NOTIFY_OWNER
+        if rotate_on_expiration:
+            tla_props.rotateOnExpiration = True
+
+
+def _build_revoke_permission(params, record_uid, recipient_email):
+    """Build a minimal Permissions proto for revokeSharingPermissions."""
+    _, _, uid_bytes, _ = get_user_public_key(params, recipient_email)
+    if not uid_bytes:
+        raise ValueError(f"User {recipient_email} not found")
+
+    uid_b = utils.base64_url_decode(record_uid)
+    perm = record_sharing_pb2.Permissions()
+    perm.recipientUid = uid_bytes
+    perm.recordUid = uid_b
+    perm.rules.accessTypeUid = uid_bytes
+    perm.rules.accessType = folder_pb2.AT_USER
+    perm.rules.recordUid = uid_b
+    return perm
+
+
+def _build_share_permissions(params, record_uid, recipient_email, access_role_type,
+                              expiration_timestamp, include_role, skip_sync=False,
+                              rotate_on_expiration=False):
+    """Build a Permissions protobuf for share/update — single source of truth."""
+    if not skip_sync:
+        from .. import sync_down as sd
+        sd.sync_down(params)
+
+    rec = get_record_from_cache(params, record_uid)
+    if not rec:
+        raise ValueError(f"Record {record_uid} not found in cache")
+    rk = rec.get('record_key_unencrypted')
+    if not rk:
+        raise ValueError(f"Record {record_uid} has no decrypted key")
+
+    pub_key, use_ecc, uid_bytes, needs_invite = get_user_public_key(params, recipient_email)
+    if not pub_key:
+        handle_share_invite(params, recipient_email, needs_invite)
+        raise ValueError(f"User {recipient_email} has no public key")
+    if not uid_bytes:
+        raise ValueError(f"User {recipient_email} not found")
+
+    enc_rk = encrypt_for_recipient(rk, pub_key, use_ecc)
+    uid_b = utils.base64_url_decode(record_uid)
+
+    perm = record_sharing_pb2.Permissions()
+    perm.recipientUid = uid_bytes
+    perm.recordUid = uid_b
+    perm.recordKey = enc_rk
+    perm.useEccKey = use_ecc
+
+    perm.rules.accessTypeUid = uid_bytes
+    perm.rules.accessType = folder_pb2.AT_USER
+    perm.rules.recordUid = uid_b
+    perm.rules.owner = False
+    if include_role and access_role_type is not None:
+        perm.rules.accessRoleType = access_role_type
+    _apply_share_expiration_tla(
+        perm.rules.tlaProperties, expiration_timestamp,
+        rotate_on_expiration=rotate_on_expiration)
+    return perm
+
+
+def _send_revoke_share_request(params, record_uid, recipient_email):
+    perm = _build_revoke_permission(params, record_uid, recipient_email)
+    rq = record_sharing_pb2.Request()
+    rq.revokeSharingPermissions.append(perm)
+    rs = api.communicate_rest(params, rq, 'vault/records/v3/share',
+                              rs_type=record_sharing_pb2.Response)
+    results = [parse_sharing_status(s) for s in rs.revokedSharingStatus]
+    return {'results': results, 'success': all(r['success'] for r in results)}
+
+
+def _send_create_share_request(params, record_uid, recipient_email, access_role_type,
+                               expiration_timestamp, skip_sync=False,
+                               rotate_on_expiration=False):
+    perm = _build_share_permissions(params, record_uid, recipient_email,
+                                     access_role_type, expiration_timestamp,
+                                     include_role=True, skip_sync=skip_sync,
+                                     rotate_on_expiration=rotate_on_expiration)
+    rq = record_sharing_pb2.Request()
+    rq.createSharingPermissions.append(perm)
+    rs = api.communicate_rest(params, rq, 'vault/records/v3/share',
+                              rs_type=record_sharing_pb2.Response)
+    results = [parse_sharing_status(s) for s in rs.createdSharingStatus]
+    return {'results': results, 'success': all(r['success'] for r in results)}
+
+
+def share_record_v3(params, record_uid, recipient_email, access_role_type,
+                    expiration_timestamp=None, rotate_on_expiration=False):
+    perm = _build_share_permissions(params, record_uid, recipient_email,
+                                     access_role_type, expiration_timestamp,
+                                     include_role=True,
+                                     rotate_on_expiration=rotate_on_expiration)
+    rq = record_sharing_pb2.Request()
+    rq.createSharingPermissions.append(perm)
+    rs = api.communicate_rest(params, rq, 'vault/records/v3/share',
+                              rs_type=record_sharing_pb2.Response)
+    results = [parse_sharing_status(s) for s in rs.createdSharingStatus]
+    return {'results': results, 'success': all(r['success'] for r in results)}
+
+
+def _application_record_role(is_editable):
+    return folder_pb2.CONTENT_MANAGER if is_editable else folder_pb2.VIEWER
+
+
+def _build_application_share_permission(params, record_uid, app_uid, app_key,
+                                         is_editable=False, include_key=True):
+    rec = get_record_from_cache(params, record_uid)
+    if not rec:
+        raise ValueError(f"Record {record_uid} not found in cache")
+    rk = rec.get('record_key_unencrypted')
+    if not rk and include_key:
+        rk = get_record_key(params, record_uid, raise_on_missing=False)
+    if include_key and not rk:
+        raise ValueError(f"Record {record_uid} has no decrypted key")
+    if not app_uid:
+        raise ValueError('Application UID is required')
+
+    app_uid_bytes = utils.base64_url_decode(app_uid)
+    record_uid_bytes = utils.base64_url_decode(record_uid)
+
+    perm = record_sharing_pb2.Permissions()
+    perm.recipientUid = app_uid_bytes
+    perm.recordUid = record_uid_bytes
+    if include_key:
+        perm.recordKey = crypto.encrypt_aes_v2(rk, app_key)
+        perm.useEccKey = False
+
+    perm.rules.accessTypeUid = app_uid_bytes
+    perm.rules.accessType = folder_pb2.AT_APPLICATION
+    perm.rules.recordUid = record_uid_bytes
+    perm.rules.owner = False
+    perm.rules.accessRoleType = _application_record_role(is_editable)
+    return perm
+
+
+def share_record_to_application_v3(params, record_uid, app_uid, app_key,
+                                    is_editable=False):
+    """Share an NSF record with a Secrets Manager application via records/v3/share."""
+    perm = _build_application_share_permission(
+        params, record_uid, app_uid, app_key, is_editable=is_editable, include_key=True)
+    rq = record_sharing_pb2.Request()
+    rq.createSharingPermissions.append(perm)
+    rs = api.communicate_rest(params, rq, 'vault/records/v3/share',
+                              rs_type=record_sharing_pb2.Response)
+    results = [parse_sharing_status(s) for s in rs.createdSharingStatus]
+    return {'results': results, 'success': all(r['success'] for r in results)}
+
+
+def update_record_share_to_application_v3(params, record_uid, app_uid, app_key,
+                                           is_editable=False):
+    """Update an NSF record's application share role."""
+    perm = _build_application_share_permission(
+        params, record_uid, app_uid, app_key, is_editable=is_editable, include_key=True)
+    rq = record_sharing_pb2.Request()
+    rq.updateSharingPermissions.append(perm)
+    rs = api.communicate_rest(params, rq, 'vault/records/v3/share',
+                              rs_type=record_sharing_pb2.Response)
+    results = [parse_sharing_status(s) for s in rs.updatedSharingStatus]
+    return {'results': results, 'success': all(r['success'] for r in results)}
+
+
+def unshare_record_from_application_v3(params, record_uid, app_uid):
+    """Revoke a Secrets Manager application's access to an NSF record."""
+    perm = _build_application_share_permission(
+        params, record_uid, app_uid, app_key=None, is_editable=False, include_key=False)
+    rq = record_sharing_pb2.Request()
+    rq.revokeSharingPermissions.append(perm)
+    rs = api.communicate_rest(params, rq, 'vault/records/v3/share',
+                              rs_type=record_sharing_pb2.Response)
+    results = [parse_sharing_status(s) for s in rs.revokedSharingStatus]
+    return {'results': results, 'success': all(r['success'] for r in results)}
+
+
+def update_record_share_v3(params, record_uid, recipient_email,
+                            access_role_type=None, expiration_timestamp=None,
+                            rotate_on_expiration=False):
+    """Update an existing direct share.
+
+    Role changes use ``updateSharingPermissions``.  Positive expirations use
+    revoke then create (two requests) because the server only INSERTs
+    ``record_access_expiration`` on create — sending ``tlaProperties`` on
+    update fails when the share already exists.
+    """
+    from .. import sync_down as sd
+    sd.sync_down(params)
+
+    rec = get_record_from_cache(params, record_uid)
+    if not rec:
+        raise ValueError(f"Record {record_uid} not found in cache")
+
+    if expiration_timestamp is not None and expiration_timestamp > 0:
+        if access_role_type is None:
+            raise ValueError(
+                'access_role_type is required when setting share expiration')
+        # Expiration must be applied via create, not update.  The server
+        # rejects revoke+create for the same (recipient, record) in one
+        # request, so run them sequentially (one sync_down above only).
+        logger.info(
+            "Revoking existing share with '%s' before re-granting with expiration...",
+            recipient_email)
+        revoke_result = _send_revoke_share_request(params, record_uid, recipient_email)
+        if not revoke_result.get('success'):
+            return revoke_result
+        logger.info(
+            "Re-granting share to '%s' with updated role and expiration...",
+            recipient_email)
+        return _send_create_share_request(
+            params, record_uid, recipient_email, access_role_type,
+            expiration_timestamp, skip_sync=True,
+            rotate_on_expiration=rotate_on_expiration)
+
+    perm = _build_share_permissions(params, record_uid, recipient_email,
+                                     access_role_type, expiration_timestamp,
+                                     include_role=True, skip_sync=True,
+                                     rotate_on_expiration=rotate_on_expiration)
+    rq = record_sharing_pb2.Request()
+    rq.updateSharingPermissions.append(perm)
+    rs = api.communicate_rest(params, rq, 'vault/records/v3/share',
+                              rs_type=record_sharing_pb2.Response)
+    results = [parse_sharing_status(s) for s in rs.updatedSharingStatus]
+    return {'results': results, 'success': all(r['success'] for r in results)}
+
+def unshare_record_v3(params, record_uid, recipient_email, skip_sync=False):
+    if not skip_sync:
+        from .. import sync_down as sd
+        sd.sync_down(params)
+
+    rec = get_record_from_cache(params, record_uid)
+    if not rec:
+        raise ValueError(f"Record {record_uid} not found in cache")
+
+    return _send_revoke_share_request(params, record_uid, recipient_email)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Batch record sharing  (bulk update / revoke in a single REST call per chunk)
+# ══════════════════════════════════════════════════════════════════════════
+
+_SHARE_BATCH_SIZE = 200
+"""Maximum number of permissions per vault/records/v3/share request."""
+
+
+def batch_update_record_shares_v3(params, updates, expiration_timestamp=None, chunk_size=_SHARE_BATCH_SIZE):
+    """Send multiple updateSharingPermissions in as few REST calls as possible.
+
+    *updates* is a list of dicts with keys:
+        ``record_uid``, ``email``, ``access_role_type``,
+        ``cur_role`` (for logging), ``new_role`` (for logging).
+
+    Returns a list of ``(item_dict, result_dict)`` pairs, one per permission
+    in input order (skipped items carry ``result['skipped'] = True``).
+    """
+    from .. import sync_down as sd
+    sd.sync_down(params)
+
+    outcomes = []
+    recreate = expiration_timestamp is not None and expiration_timestamp > 0
+    if recreate:
+        for i in range(0, len(updates), chunk_size):
+            chunk = updates[i:i + chunk_size]
+            rq = record_sharing_pb2.Request()
+            built = []
+            for u in chunk:
+                try:
+                    rq.revokeSharingPermissions.append(
+                        _build_revoke_permission(params, u['record_uid'], u['email']))
+                    built.append(u)
+                except Exception as exc:
+                    outcomes.append((u, {'success': False, 'skipped': True,
+                                          'message': str(exc)}))
+            if not built:
+                continue
+            try:
+                rs = api.communicate_rest(params, rq, 'vault/records/v3/share',
+                                          rs_type=record_sharing_pb2.Response)
+                statuses = [parse_sharing_status(x) for x in rs.revokedSharingStatus]
+                if statuses:
+                    revoked = {s['record_uid'] for s in statuses if s['success']}
+                else:
+                    revoked = {u['record_uid'] for u in built}
+                for u in built:
+                    if u['record_uid'] not in revoked:
+                        outcomes.append((u, {'success': False,
+                                              'message': 'Revoke failed'}))
+            except Exception as exc:
+                for u in built:
+                    outcomes.append((u, {'success': False, 'message': str(exc)}))
+        failed_uids = {u['record_uid'] for u, r in outcomes if not r.get('success')}
+        create_updates = [u for u in updates if u['record_uid'] not in failed_uids]
+        if create_updates:
+            create_outcomes = batch_create_record_shares_v3(
+                params, create_updates, expiration_timestamp, chunk_size)
+            outcomes.extend(create_outcomes)
+        return outcomes
+
+    for i in range(0, len(updates), chunk_size):
+        chunk = updates[i:i + chunk_size]
+        rq = record_sharing_pb2.Request()
+        built = []
+        for u in chunk:
+            try:
+                perm = _build_share_permissions(
+                    params, u['record_uid'], u['email'],
+                    u['access_role_type'], expiration_timestamp,
+                    include_role=True, skip_sync=True,
+                )
+                rq.updateSharingPermissions.append(perm)
+                built.append(u)
+            except Exception as exc:
+                outcomes.append((u, {'success': False, 'skipped': True,
+                                      'message': str(exc)}))
+
+        if not built:
+            continue
+
+        try:
+            rs = api.communicate_rest(params, rq, 'vault/records/v3/share',
+                                      rs_type=record_sharing_pb2.Response)
+            statuses = [parse_sharing_status(s) for s in rs.updatedSharingStatus]
+            status_by_uid = {s['record_uid']: s for s in statuses}
+            for u in built:
+                outcomes.append((u, status_by_uid.get(u['record_uid'],
+                                                        {'success': False,
+                                                         'message': 'No status returned'})))
+        except Exception as exc:
+            for u in built:
+                outcomes.append((u, {'success': False, 'message': str(exc)}))
+
+    return outcomes
+
+
+def batch_create_record_shares_v3(params, creates, expiration_timestamp=None, chunk_size=_SHARE_BATCH_SIZE):
+    """Send multiple createSharingPermissions in as few REST calls as possible.
+
+    Used when granting a role to a recipient who currently only has an
+    *inherited* (folder-level) permission on the record. The
+    ``vault/records/v3/share`` endpoint cannot ``update`` an inherited row
+    because no direct sharing entry exists; a ``create`` adds a new direct
+    permission that overrides the inherited one.
+
+    *creates* is a list of dicts with keys:
+        ``record_uid``, ``email``, ``access_role_type``,
+        ``cur_role`` (for logging), ``new_role`` (for logging).
+
+    Returns a list of ``(item_dict, result_dict)`` pairs in input order
+    (skipped items carry ``result['skipped'] = True``).
+    """
+    from .. import sync_down as sd
+    sd.sync_down(params)
+
+    outcomes = []
+    for i in range(0, len(creates), chunk_size):
+        chunk = creates[i:i + chunk_size]
+        rq = record_sharing_pb2.Request()
+        built = []
+        for c in chunk:
+            try:
+                perm = _build_share_permissions(
+                    params, c['record_uid'], c['email'],
+                    c['access_role_type'], expiration_timestamp,
+                    include_role=True, skip_sync=True,
+                )
+                rq.createSharingPermissions.append(perm)
+                built.append(c)
+            except Exception as exc:
+                outcomes.append((c, {'success': False, 'skipped': True,
+                                      'message': str(exc)}))
+
+        if not built:
+            continue
+
+        try:
+            rs = api.communicate_rest(params, rq, 'vault/records/v3/share',
+                                      rs_type=record_sharing_pb2.Response)
+            statuses = [parse_sharing_status(s) for s in rs.createdSharingStatus]
+            status_by_uid = {s['record_uid']: s for s in statuses}
+            for c in built:
+                outcomes.append((c, status_by_uid.get(c['record_uid'],
+                                                        {'success': False,
+                                                         'message': 'No status returned'})))
+        except Exception as exc:
+            for c in built:
+                outcomes.append((c, {'success': False, 'message': str(exc)}))
+
+    return outcomes
+
+
+def batch_unshare_records_v3(params, revokes, chunk_size=_SHARE_BATCH_SIZE):
+    """Send multiple revokeSharingPermissions in as few REST calls as possible.
+
+    *revokes* is a list of dicts with keys:
+        ``record_uid``, ``email``, ``cur_role`` (for logging).
+
+    Returns a list of ``(item_dict, result_dict)`` pairs.
+    """
+    from .. import sync_down as sd
+    sd.sync_down(params)
+
+    outcomes = []
+    for i in range(0, len(revokes), chunk_size):
+        chunk = revokes[i:i + chunk_size]
+        rq = record_sharing_pb2.Request()
+        built = []
+        for r in chunk:
+            try:
+                rec = get_record_from_cache(params, r['record_uid'])
+                if not rec:
+                    raise ValueError(f"Record {r['record_uid']} not found in cache")
+                _, _, uid_bytes, _ = get_user_public_key(params, r['email'])
+                if not uid_bytes:
+                    raise ValueError(f"User {r['email']} not found")
+
+                uid_b = utils.base64_url_decode(r['record_uid'])
+                perm = record_sharing_pb2.Permissions()
+                perm.recipientUid = uid_bytes
+                perm.recordUid = uid_b
+                perm.rules.accessTypeUid = uid_bytes
+                perm.rules.accessType = folder_pb2.AT_USER
+                perm.rules.recordUid = uid_b
+
+                rq.revokeSharingPermissions.append(perm)
+                built.append(r)
+            except Exception as exc:
+                outcomes.append((r, {'success': False, 'skipped': True,
+                                      'message': str(exc)}))
+
+        if not built:
+            continue
+
+        try:
+            rs = api.communicate_rest(params, rq, 'vault/records/v3/share',
+                                      rs_type=record_sharing_pb2.Response)
+            statuses = [parse_sharing_status(s) for s in rs.revokedSharingStatus]
+            status_by_uid = {s['record_uid']: s for s in statuses}
+            for r in built:
+                outcomes.append((r, status_by_uid.get(r['record_uid'],
+                                                        {'success': False,
+                                                         'message': 'No status returned'})))
+        except Exception as exc:
+            for r in built:
+                outcomes.append((r, {'success': False, 'message': str(exc)}))
+
+    return outcomes
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Ownership transfer
+# ══════════════════════════════════════════════════════════════════════════
+
+def _build_transfer_record(params, record_uid, new_owner_email, require_uid=False):
+    rec = get_record_from_cache(params, record_uid) or params.record_cache.get(record_uid)
+    if not rec:
+        return None
+    rk = rec.get('record_key_unencrypted')
+    if not rk:
+        return None
+
+    pub_key, use_ecc, _, _ = get_user_public_key(params, new_owner_email, require_uid=require_uid)
+    if not pub_key:
+        return None
+    enc_rk = encrypt_for_recipient(rk, pub_key, use_ecc)
+
+    tr = record_pb2.TransferRecord()
+    tr.username = new_owner_email
+    tr.recordUid = utils.base64_url_decode(record_uid)
+    tr.recordKey = enc_rk
+    tr.useEccKey = use_ecc
+    return tr
+
+
+def transfer_record_ownership_v3(params, record_uid, new_owner_email):
+    from .. import sync_down as sd
+    sd.sync_down(params)
+
+    tr = _build_transfer_record(params, record_uid, new_owner_email, require_uid=False)
+    if not tr:
+        raise ValueError(f"Cannot prepare transfer for record {record_uid}")
+
+    rq = record_pb2.RecordsOnwershipTransferRequest()
+    rq.transferRecords.append(tr)
+    rs = api.communicate_rest(params, rq, 'vault/records/v3/transfer',
+                              rs_type=record_pb2.RecordsOnwershipTransferResponse)
+    results = [{
+        'record_uid': utils.base64_url_encode(s.recordUid),
+        'username': s.username, 'status': s.status, 'message': s.message,
+        'success': 'success' in s.status.lower(),
+    } for s in rs.transferRecordStatus]
+    params.sync_data = True
+    return {'results': results, 'success': all(r['success'] for r in results)}
+
+
+def transfer_records_ownership_batch_v3(params, transfers):
+    from .. import sync_down as sd
+    sd.sync_down(params)
+
+    trs = []
+    for spec in transfers:
+        tr = _build_transfer_record(params, spec['record_uid'], spec['new_owner_email'])
+        if tr:
+            trs.append(tr)
+    if not trs:
+        raise ValueError("No valid transfer records to process")
+
+    rq = record_pb2.RecordsOnwershipTransferRequest()
+    rq.transferRecords.extend(trs)
+    rs = api.communicate_rest(params, rq, 'vault/records/v3/transfer',
+                              rs_type=record_pb2.RecordsOnwershipTransferResponse)
+    results = [{
+        'record_uid': utils.base64_url_encode(s.recordUid),
+        'username': s.username, 'status': s.status, 'message': s.message,
+        'success': 'success' in s.status.lower(),
+    } for s in rs.transferRecordStatus]
+    params.sync_data = True
+    ok = sum(1 for r in results if r['success'])
+    return {'results': results, 'success': all(r['success'] for r in results),
+            'total': len(results), 'successful': ok, 'failed': len(results) - ok}

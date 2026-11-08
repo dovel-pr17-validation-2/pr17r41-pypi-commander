@@ -1,0 +1,600 @@
+import json
+import os
+import tempfile
+from unittest import TestCase, mock
+
+from keepercommander.commands.base import ParseError
+from keepercommander.error import KeeperApiError
+from keepercommander.importer import imp_exp, nsf_import
+from keepercommander.importer.commands import RecordImportCommand, import_parser
+from keepercommander.importer.csv.csv import KeeperCsvImporter
+from keepercommander.importer.importer import Folder, Record, SharedFolder, Permission
+from keepercommander.importer.json.json import KeeperJsonImporter
+from keepercommander.subfolder import NestedShareFolderNode
+
+SAMPLE = os.path.join(os.path.dirname(__file__), '..', 'sample_data')
+GRANT = 'keepercommander.nested_share_folder.folder_api.grant_folder_access_v3'
+CREATE = 'keepercommander.importer.nsf_import.create_nsf_folders_batch'
+
+
+def _params(folders=None):
+    p = mock.MagicMock()
+    p.nested_share_folders = folders or {}
+    p.subfolder_cache = {}
+    p.folder_cache = {}
+    p.enforcements = None
+    return p
+
+
+def _record(path):
+    rec = Record()
+    fol = Folder()
+    fol.path = path
+    rec.folders = [fol]
+    return rec, fol
+
+
+def _perm(name=None, uid=None, role=None, manage_records=False, manage_users=False):
+    p = Permission()
+    p.name = name
+    p.uid = uid
+    p.role = role
+    p.manage_records = manage_records
+    p.manage_users = manage_users
+    return p
+
+
+def _login_record():
+    rec = Record()
+    rec.type = 'login'
+    rec.title = 'Database Account'
+    rec.login = 'svc_db'
+    rec.password = 'secret'
+    return rec
+
+
+def _login_data():
+    return {
+        'type': 'login',
+        'title': 'Database Account',
+        'fields': [
+            {'type': 'login', 'value': ['svc_db']},
+            {'type': 'password', 'value': ['secret']},
+        ],
+    }
+
+
+def _cached_login_record(uid):
+    return {
+        'record_uid': uid,
+        'version': 3,
+        'data_unencrypted': json.dumps(_login_data()),
+    }
+
+
+class TestNsfImport(TestCase):
+    def test_classic_perms_to_nsf_role(self):
+        cases = [
+            ((True, True), 'full-manager'),
+            ((False, True), 'content-manager'),
+            ((False, False), 'viewer'),
+        ]
+        for args, role in cases:
+            self.assertEqual(nsf_import.classic_perms_to_nsf_role(*args), role)
+        self.assertEqual(
+            nsf_import.classic_perms_to_nsf_role(False, True, can_share=True),
+            'content-share-manager')
+        self.assertEqual(
+            nsf_import.classic_perms_to_nsf_role(False, False, can_share=True),
+            'share-manager')
+
+    def test_flatten_and_find(self):
+        rec, fol = _record('')
+        fol.domain = 'Shared'
+        fol.path = 'Team\\Apps'
+        nsf_import.flatten_record_folder_paths([rec])
+        self.assertEqual((fol.domain, fol.path), ('', 'Shared\\Team\\Apps'))
+
+        params = _params({
+            'root1': {'name': 'Migration', 'parent_uid': ''},
+            'child1': {'name': 'Apps', 'parent_uid': 'root1'},
+        })
+        self.assertEqual(nsf_import.find_nsf_child(params, 'Migration', ''), 'root1')
+        self.assertEqual(nsf_import.find_nsf_child(params, 'Apps', 'root1'), 'child1')
+        self.assertIsNone(nsf_import.find_nsf_child(params, 'Missing', 'root1'))
+
+    def test_is_nsf_folder(self):
+        params = _params({'nsf1': {'name': 'Root'}})
+        params.subfolder_cache = {'nsf2': {'source': 'nested_share_folder'}}
+        node = NestedShareFolderNode()
+        node.uid = 'nsf3'
+        params.folder_cache = {'nsf3': node}
+        self.assertTrue(nsf_import.is_nsf_folder(params, 'nsf1'))
+        self.assertTrue(nsf_import.is_nsf_folder(params, 'nsf2'))
+        self.assertTrue(nsf_import.is_nsf_folder(params, 'nsf3'))
+        self.assertFalse(nsf_import.is_nsf_folder(params, 'missing'))
+
+    def test_prepare_nsf_folders(self):
+        params = _params({
+            'root1': {'name': 'Migration', 'parent_uid': ''},
+            'child1': {'name': 'Apps', 'parent_uid': 'root1'},
+        })
+        rec, fol = _record('Migration\\Apps')
+        created, mapping = nsf_import.prepare_nsf_folders(params, [], [rec])
+        self.assertEqual(created, 0)
+        self.assertEqual(fol.uid, 'child1')
+        self.assertEqual(mapping, [('Migration\\Apps', 'Migration\\Apps', 'child1')])
+
+        rec, fol = _record('Migration\\New')
+        with mock.patch(CREATE, return_value=['new1']) as m:
+            nsf_import.prepare_nsf_folders(params, [], [rec])
+            m.assert_called_once_with(params, [('New', 'root1')])
+            self.assertEqual(fol.uid, 'new1')
+
+        sf = SharedFolder()
+        sf.path = 'ProjectA'
+        with mock.patch(CREATE, return_value=['proj1']) as m:
+            nsf_import.prepare_nsf_folders(_params({'base': {'name': 'Base', 'parent_uid': ''}}),
+                                          [sf], [], 'base')
+            m.assert_called_once_with(mock.ANY, [('ProjectA', 'base')])
+            self.assertEqual(sf.uid, 'proj1')
+
+    def test_prepare_nsf_folders_default_depth_flattens(self):
+        rec, fol = _record('L1\\L2\\L3\\L4\\L5\\L6\\L7')
+        params = _params({})
+        uids = iter(['uid1', 'uid2', 'uid3', 'uid4', 'uidL7', 'uidL5', 'uidL6'])
+        with mock.patch(CREATE, side_effect=lambda p, batch: [next(uids) for _ in batch]) as m:
+            created, mapping = nsf_import.prepare_nsf_folders(params, [], [rec])
+            # Default depth is 5: L1-L4 stay a normal chain; the path's own leaf
+            # (L7) attaches directly under L4. L5 and L6 - the levels skipped to
+            # get there - each still get their own sibling folder under L4, with
+            # no name ever merged or renamed.
+            calls = [c.args[1] for c in m.call_args_list]
+            self.assertEqual(calls, [
+                [('L1', '')],
+                [('L2', 'uid1')],
+                [('L3', 'uid2')],
+                [('L4', 'uid3')],
+                [('L7', 'uid4'), ('L5', 'uid4'), ('L6', 'uid4')],
+            ])
+            # `created` counts new entries in params.nested_share_folders, which the
+            # mocked create_nsf_folders_batch (via seed_nsf_folder_cache) never populates here.
+            self.assertEqual(created, 0)
+            self.assertEqual(mapping, [
+                ('L1\\L2\\L3\\L4\\L5\\L6\\L7', 'L1\\L2\\L3\\L4\\L7', 'uidL7'),
+                ('L1\\L2\\L3\\L4\\L5', 'L1\\L2\\L3\\L4\\L5', 'uidL5'),
+                ('L1\\L2\\L3\\L4\\L5\\L6', 'L1\\L2\\L3\\L4\\L6', 'uidL6'),
+            ])
+            self.assertEqual(fol.uid, 'uidL7')
+
+    def test_prepare_nsf_folders_siblings_under_same_parent(self):
+        """Two paths overflowing under the same kept ancestor become sibling folders."""
+        rec_a, fol_a = _record('Dept\\Team-Infra\\App-Billing')
+        rec_b, fol_b = _record('Dept\\Team-Infra\\App-Billing\\Env-Prod')
+        params = _params({})
+        uids = iter(['uidDept', 'uidAppBilling', 'uidTeamInfra', 'uidEnvProd'])
+        with mock.patch(CREATE, side_effect=lambda p, batch: [next(uids) for _ in batch]) as m:
+            created, mapping = nsf_import.prepare_nsf_folders(params, [], [rec_a, rec_b], folder_depth=2)
+            calls = [c.args[1] for c in m.call_args_list]
+            self.assertEqual(calls, [
+                [('Dept', '')],
+                [('App-Billing', 'uidDept'), ('Team-Infra', 'uidDept'), ('Env-Prod', 'uidDept')],
+            ])
+            self.assertEqual(fol_a.uid, 'uidAppBilling')
+            self.assertEqual(fol_b.uid, 'uidEnvProd')
+            # Team-Infra is skipped by both paths and is reported once (deduped),
+            # keeping its own true original ancestor path.
+            self.assertEqual(mapping, [
+                ('Dept\\Team-Infra\\App-Billing', 'Dept\\App-Billing', 'uidAppBilling'),
+                ('Dept\\Team-Infra', 'Dept\\Team-Infra', 'uidTeamInfra'),
+                ('Dept\\Team-Infra\\App-Billing\\Env-Prod', 'Dept\\Env-Prod', 'uidEnvProd'),
+            ])
+
+    def test_depth_flattening_is_generic_across_import_formats(self):
+        """--folder-depth flattening is applied centrally in prepare_nsf_folders,
+        independent of which --format produced the records - verify with CSV
+        (a non-JSON format) that the same sibling-folder result occurs."""
+        deep_path = 'Migration\\Region-East\\Site-NYC\\Dept-IT\\Team-Infra\\App-Billing\\Env-Prod'
+        with tempfile.NamedTemporaryFile('w', suffix='.csv', delete=False, encoding='utf-8') as tf:
+            tf.write(f'{deep_path},Billing DB - Prod,billing_svc,Prod!Pass123,https://billing-prod.internal,\n')
+            path = tf.name
+        try:
+            items = list(KeeperCsvImporter().do_import(path))
+        finally:
+            os.unlink(path)
+
+        records = [x for x in items if isinstance(x, Record)]
+        self.assertEqual(len(records), 1)
+
+        params = _params({})
+        uids = iter(['uidMigration', 'uidRegionEast', 'uidSiteNYC', 'uidDeptIT',
+                     'uidEnvProd', 'uidTeamInfra', 'uidAppBilling'])
+        with mock.patch(CREATE, side_effect=lambda p, batch: [next(uids) for _ in batch]) as m:
+            created, mapping = nsf_import.prepare_nsf_folders(params, [], records)
+            calls = [c.args[1] for c in m.call_args_list]
+            self.assertEqual(calls, [
+                [('Migration', '')],
+                [('Region-East', 'uidMigration')],
+                [('Site-NYC', 'uidRegionEast')],
+                [('Dept-IT', 'uidSiteNYC')],
+                [('Env-Prod', 'uidDeptIT'), ('Team-Infra', 'uidDeptIT'), ('App-Billing', 'uidDeptIT')],
+            ])
+            self.assertEqual(records[0].folders[0].uid, 'uidEnvProd')
+            self.assertEqual(mapping, [
+                ('Migration\\Region-East\\Site-NYC\\Dept-IT\\Team-Infra\\App-Billing\\Env-Prod',
+                 'Migration\\Region-East\\Site-NYC\\Dept-IT\\Env-Prod', 'uidEnvProd'),
+                ('Migration\\Region-East\\Site-NYC\\Dept-IT\\Team-Infra',
+                 'Migration\\Region-East\\Site-NYC\\Dept-IT\\Team-Infra', 'uidTeamInfra'),
+                ('Migration\\Region-East\\Site-NYC\\Dept-IT\\Team-Infra\\App-Billing',
+                 'Migration\\Region-East\\Site-NYC\\Dept-IT\\App-Billing', 'uidAppBilling'),
+            ])
+
+    def test_prepare_nsf_folders_explicit_depth_override(self):
+        rec, fol = _record('A\\B\\C\\D\\E')
+        params = _params({})
+        uids = iter(['uidA', 'uidE', 'uidB', 'uidC', 'uidD'])
+        with mock.patch(CREATE, side_effect=lambda p, batch: [next(uids) for _ in batch]) as m:
+            created, mapping = nsf_import.prepare_nsf_folders(params, [], [rec], folder_depth=2)
+            # Depth 2: only room for 1 chained level (A); the leaf (E) attaches
+            # directly under it. B, C, D - the skipped levels - each still get
+            # their own sibling folder under A.
+            calls = [c.args[1] for c in m.call_args_list]
+            self.assertEqual(calls, [
+                [('A', '')],
+                [('E', 'uidA'), ('B', 'uidA'), ('C', 'uidA'), ('D', 'uidA')],
+            ])
+            self.assertEqual(created, 0)
+            self.assertEqual(mapping, [
+                ('A\\B\\C\\D\\E', 'A\\E', 'uidE'),
+                ('A\\B', 'A\\B', 'uidB'),
+                ('A\\B\\C', 'A\\C', 'uidC'),
+                ('A\\B\\C\\D', 'A\\D', 'uidD'),
+            ])
+            self.assertEqual(fol.uid, 'uidE')
+
+    def test_prepare_nsf_folders_batches_same_depth(self):
+        params = _params({'root': {'name': 'Root', 'parent_uid': ''}})
+        rec_a, fol_a = _record('Root\\A')
+        rec_b, fol_b = _record('Root\\B')
+        with mock.patch(CREATE, return_value=['uidA', 'uidB']) as m:
+            nsf_import.prepare_nsf_folders(params, [], [rec_a, rec_b])
+            m.assert_called_once_with(params, [('A', 'root'), ('B', 'root')])
+            self.assertEqual((fol_a.uid, fol_b.uid), ('uidA', 'uidB'))
+
+    def test_throttle_retry(self):
+        n = {'c': 0}
+
+        def flaky():
+            n['c'] += 1
+            if n['c'] < 3:
+                raise KeeperApiError('throttled', 'throttled')
+            return 'ok'
+
+        with mock.patch('keepercommander.importer.nsf_import.time.sleep') as sleep:
+            self.assertEqual(nsf_import._call_with_throttle_retry('t', flaky), 'ok')
+        self.assertEqual((n['c'], sleep.call_count), (3, 2))
+
+    def test_apply_permissions_classic_and_role(self):
+        params = _params({'f1': {'name': 'Team', 'parent_uid': ''}})
+        sf = SharedFolder()
+        sf.uid = 'f1'
+        sf.path = 'Team'
+        sf.permissions = [
+            _perm(name='user@example.com', manage_records=True),
+            _perm(name='viewer@example.com', role='viewer'),
+            _perm(name='admin@example.com', role='full-manager'),
+            _perm(name='editor@example.com', role='content_manager'),
+            _perm(name='bad@example.com', role='superuser'),
+        ]
+        with mock.patch(GRANT, return_value={'success': True}) as grant:
+            nsf_import.apply_nsf_folder_permissions(params, [sf])
+            roles = [c.kwargs.get('role') for c in grant.call_args_list]
+            self.assertEqual(roles, ['content-manager', 'viewer', 'full-manager', 'content-manager'])
+            self.assertEqual(grant.call_args_list[0].args[2], 'user@example.com')
+
+    def test_json_loads_permissions_and_roles(self):
+        payload = {
+            'shared_folders': [{
+                'path': 'NSF\\Team',
+                'permissions': [
+                    {'name': 'u@ex.com', 'manage_records': True},
+                    {'name': 'a@ex.com', 'role': 'full-manager'},
+                    {'uid': 'teamUid12345678901234', 'role': 'viewer'},
+                ],
+            }],
+            'records': [{'title': 'R', 'login': 'u', 'password': 'p',
+                         'folders': [{'folder': 'NSF\\Team'}]}],
+        }
+        with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False, encoding='utf-8') as tf:
+            json.dump(payload, tf)
+            path = tf.name
+        try:
+            items = list(KeeperJsonImporter().do_import(path))
+        finally:
+            os.unlink(path)
+
+        folders = [x for x in items if isinstance(x, SharedFolder)]
+        self.assertEqual(len(folders), 1)
+        perms = folders[0].permissions
+        self.assertEqual(len(perms), 3)
+        self.assertEqual(perms[0].name, 'u@ex.com')
+        self.assertTrue(perms[0].manage_records)
+        self.assertEqual(perms[1].role, 'full-manager')
+        self.assertEqual(perms[2].uid, 'teamUid12345678901234')
+
+    def test_sample_files(self):
+        for name, check in (
+            ('import_nsf.txt', lambda fs: any(p.name == 'user@mycompany.com'
+                                             for f in fs for p in (f.permissions or []))),
+            ('import_nsf_permissions.txt', lambda fs: {
+                p.role for f in fs for p in (f.permissions or []) if p.role
+            } >= {'viewer', 'full-manager', 'content-manager'}),
+        ):
+            path = os.path.join(SAMPLE, name)
+            if not os.path.isfile(path):
+                self.skipTest(f'{name} missing')
+            folders = [x for x in KeeperJsonImporter().do_import(path) if isinstance(x, SharedFolder)]
+            self.assertTrue(check(folders), name)
+
+    def test_cli_nsf_skips_classic_prompt(self):
+        cmd = RecordImportCommand()
+        with mock.patch('keepercommander.importer.commands.user_choice') as choice, \
+             mock.patch('keepercommander.importer.commands.imp_exp._import') as imp:
+            cmd.execute(_params(), format='json', name='sample_data/import_nsf.txt',
+                        use_nsf=True, users_only=True)
+            choice.assert_not_called()
+            self.assertTrue(all(not imp.call_args.kwargs.get(k)
+                                for k in ('manage_users', 'manage_records', 'can_edit', 'can_share')))
+
+            # classic --shared still prompts (name is unused; import is mocked)
+            choice.reset_mock()
+            choice.return_value = 'a'
+            cmd.execute(_params(), format='json', name='sample_data/import_nsf.txt', shared=True)
+            choice.assert_called_once()
+            self.assertTrue(all(imp.call_args.kwargs.get(k)
+                                for k in ('manage_users', 'manage_records', 'can_edit', 'can_share')))
+
+    def test_cli_folder_mapping_report_output_modes(self):
+        cmd = RecordImportCommand()
+        mapping = [('Old\\Path', 'New\\Path', 'uid1')]
+        with mock.patch('keepercommander.importer.commands.imp_exp._import', return_value=mapping), \
+             mock.patch('keepercommander.importer.commands.dump_report_data') as dump:
+            cases = [
+                ({'use_nsf': True, 'output': '/tmp/out.csv'}, 'csv', '/tmp/out.csv'),
+                ({'use_nsf': True, 'output': 'table'}, 'table', None),
+                ({'use_nsf': True}, None, None),
+                ({}, None, None),
+            ]
+            for extra_kwargs, expected_fmt, expected_filename in cases:
+                dump.reset_mock()
+                cmd.execute(_params(), format='json', name='sample_data/import_nsf.txt', **extra_kwargs)
+                if expected_fmt:
+                    dump.assert_called_once_with(
+                        [['Old\\Path', 'New\\Path', 'uid1']],
+                        ['JSON Path', 'New Path', 'Folder UID'],
+                        fmt=expected_fmt,
+                        filename=expected_filename,
+                    )
+                else:
+                    dump.assert_not_called()
+
+
+    def test_parser_and_path_resolve(self):
+        self.assertTrue(any('--nsf' in (a.option_strings or []) for a in import_parser._actions))
+        self.assertTrue(any('--folder-depth' in (a.option_strings or []) for a in import_parser._actions))
+        self.assertEqual(
+            import_parser.parse_args(['--format=json', '--folder-depth=1', 'sample.json']).folder_depth,
+            1)
+        with self.assertRaises(ParseError) as cm:
+            import_parser.parse_args(['--format=json', '--folder-depth=0', 'sample.json'])
+        self.assertIn('--folder-depth must be >= 1', str(cm.exception))
+
+        nsf_txt = os.path.join(SAMPLE, 'import_nsf.txt')
+        if not os.path.isfile(nsf_txt):
+            self.skipTest('sample_data/import_nsf.txt missing')
+
+        json_imp = KeeperJsonImporter()
+        # stem → import_nsf.txt
+        self.assertTrue(
+            json_imp.resolve_file_path(os.path.join(SAMPLE, 'import_nsf')).endswith('import_nsf.txt'))
+        # exact .txt path
+        self.assertEqual(
+            os.path.abspath(json_imp.resolve_file_path(nsf_txt)),
+            os.path.abspath(nsf_txt))
+
+        csv_path = os.path.join(SAMPLE, 'import_nsf.csv')
+        if os.path.isfile(csv_path):
+            self.assertEqual(
+                os.path.abspath(KeeperCsvImporter().resolve_file_path(csv_path)),
+                os.path.abspath(csv_path))
+
+    def test_import_users_only_passes_folder_depth_to_nsf_preparation(self):
+        sf = SharedFolder()
+        sf.path = 'Root\\Team\\Leaf'
+
+        class FakeImporter:
+            verbose_import_summary = False
+
+            def execute(self, *args, **kwargs):
+                yield sf
+
+        with mock.patch('keepercommander.importer.imp_exp.importer_for_format', return_value=FakeImporter), \
+             mock.patch('keepercommander.importer.imp_exp.sync_down.sync_down'), \
+             mock.patch('keepercommander.importer.nsf_import.prepare_nsf_folders') as prepare, \
+             mock.patch('keepercommander.importer.nsf_import.apply_nsf_folder_permissions'):
+            imp_exp._import(_params(), 'json', 'sample.json', use_nsf=True, users_only=True, folder_depth=2)
+
+        prepare.assert_called_once_with(mock.ANY, [sf], [], '', folder_depth=2)
+
+    def test_classic_import_ignores_existing_nsf_folders_when_building_paths(self):
+        params = _params()
+        params.data_key = b'1' * 32
+
+        root = NestedShareFolderNode()
+        root.uid = 'nsf_root'
+        root.name = 'Root'
+        root.parent_uid = ''
+        team = NestedShareFolderNode()
+        team.uid = 'nsf_team'
+        team.name = 'Team'
+        team.parent_uid = root.uid
+        params.folder_cache = {
+            root.uid: root,
+            team.uid: team,
+        }
+        params.shared_folder_cache = {}
+
+        rec, fol = _record('Root\\Team\\Leaf')
+        with mock.patch(
+                'keepercommander.importer.imp_exp.api.generate_record_uid',
+                side_effect=['AAAAAAAAAAAAAAAAAAAAAA', 'BBBBBBBBBBBBBBBBBBBBBB', 'CCCCCCCCCCCCCCCCCCCCCC']):
+            folder_add = imp_exp.prepare_folder_add(params, [], [rec], False, False, False, False)
+
+        self.assertEqual([x.folderType for x in folder_add], [1, 1, 1])
+        self.assertEqual(fol.uid, 'CCCCCCCCCCCCCCCCCCCCCC')
+
+    def test_cyberark_style_nsf_folder_paths(self):
+        """CyberArk --nsf places safes as NSF paths (not classic shared domains)."""
+        rec = Record()
+        fol = Folder()
+        fol.path = 'RootSafe'
+        rec.folders = [fol]
+        sf = SharedFolder()
+        sf.path = 'RootSafe'
+
+        nsf_import.flatten_record_folder_paths([rec])
+        self.assertEqual((fol.domain or '', fol.path), ('', 'RootSafe'))
+
+        params = _params({})
+        with mock.patch(CREATE, return_value=['safe_uid']) as m:
+            nsf_import.prepare_nsf_folders(params, [sf], [rec])
+            m.assert_called_once_with(params, [('RootSafe', '')])
+            self.assertEqual(fol.uid, 'safe_uid')
+            self.assertEqual(sf.uid, 'safe_uid')
+
+    def test_cyberark_portal_style_nsf_folder_paths(self):
+        """CyberArk Portal --nsf uses Identity folder names as NSF paths."""
+        rec = Record()
+        fol = Folder()
+        fol.path = 'Identity Collection'
+        rec.folders = [fol]
+        sf = SharedFolder()
+        sf.path = 'Identity Collection'
+
+        params = _params({})
+        with mock.patch(CREATE, return_value=['portal_uid']) as m:
+            nsf_import.prepare_nsf_folders(params, [sf], [rec])
+            m.assert_called_once_with(params, [('Identity Collection', '')])
+            self.assertEqual((fol.uid, sf.uid), ('portal_uid', 'portal_uid'))
+
+    def test_classic_cyberark_domain_flattens_for_nsf(self):
+        """Legacy domain placement still flattens correctly when --nsf is used."""
+        rec = Record()
+        fol = Folder()
+        fol.domain = 'LegacySafe'
+        rec.folders = [fol]
+        nsf_import.flatten_record_folder_paths([rec])
+        self.assertEqual((fol.domain, fol.path), ('', 'LegacySafe'))
+
+    def test_ensure_nsf_record_folders_leaves_portal_root_empty(self):
+        rec = Record()
+        rec.title = 'GitHub'
+        folders = []
+        nsf_import.ensure_nsf_record_folders([rec], folders)
+        self.assertFalse(rec.folders)
+        self.assertEqual(folders, [])
+
+    def test_ensure_nsf_record_folders_keeps_cyberark_safe_path(self):
+        rec = Record()
+        fol = Folder()
+        fol.path = 'RootSafe'
+        rec.folders = [fol]
+        folders = []
+        result = nsf_import.ensure_nsf_record_folders([rec], folders)
+        self.assertEqual(fol.path, 'RootSafe')
+        self.assertEqual(folders[0].path, 'RootSafe')
+        self.assertIsNone(result)
+
+    def test_build_nsf_record_add_at_vault_root(self):
+        rec = Record()
+        rec.uid = 'rec1'
+        rec.title = 'GitHub'
+        params = _params()
+        params.data_key = b'\x00' * 32
+        with mock.patch('keepercommander.nested_share_folder.record_api.create_record_data_v3',
+                        return_value='payload') as create:
+            payload = nsf_import.build_nsf_record_add(params, rec, b'\x01' * 32, {'title': 'GitHub'})
+            self.assertEqual(payload, 'payload')
+            kwargs = create.call_args.kwargs
+            self.assertIsNone(kwargs['folder_uid'])
+            self.assertIsNone(kwargs['folder_key'])
+            self.assertEqual(kwargs['data_key'], params.data_key)
+
+    def test_prepare_record_link_skips_nsf_root_records(self):
+        from keepercommander.importer.imp_exp import prepare_record_link
+        rec = Record()
+        rec.uid = 'nsf_rec'
+        rec.title = 'GitHub'
+        params = _params()
+        params.nested_share_records = {'nsf_rec': {}}
+        params.record_cache = {'nsf_rec': {'record_key_unencrypted': b'\x00' * 32}}
+        params.subfolder_record_cache = {'AAAAAAAAAAAAAAAAAUIpTQ': {'nsf_rec'}}
+        params.folder_cache = {}
+        params.root_folder = mock.MagicMock(type='/', uid='')
+        self.assertEqual(prepare_record_link(params, [rec]), [])
+
+    def test_nsf_duplicate_matching_uses_only_existing_nsf_records(self):
+        from keepercommander.importer.imp_exp import prepare_record_add_or_update
+
+        existing_uid = 'classic_rec'
+        params = _params()
+        params.record_type_cache = {}
+        params.record_cache = {existing_uid: _cached_login_record(existing_uid)}
+        params.nested_share_records = {}
+
+        nsf_import, nsf_exists, _ = prepare_record_add_or_update(
+            False, False, params, [_login_record()], 'json', use_nsf=True)
+        self.assertEqual(len(nsf_import), 1)
+        self.assertEqual(nsf_exists, [])
+
+        params = _params()
+        params.record_type_cache = {}
+        params.record_cache = {}
+        params.nested_share_records = {
+            'nsf_rec': {'record_uid': 'nsf_rec', 'version': 3},
+        }
+        params.nested_share_record_data = {'nsf_rec': {'data_json': _login_data()}}
+
+        records_to_import, record_exists, _ = prepare_record_add_or_update(
+            False, False, params, [_login_record()], 'json', use_nsf=True)
+        self.assertEqual(records_to_import, [])
+        self.assertEqual(len(record_exists), 1)
+
+    def test_classic_duplicate_matching_ignores_existing_nsf_records(self):
+        from keepercommander.importer.imp_exp import prepare_record_add_or_update
+
+        existing_uid = 'nsf_rec'
+        params = _params()
+        params.record_type_cache = {}
+        params.record_cache = {existing_uid: _cached_login_record(existing_uid)}
+        params.nested_share_records = {
+            existing_uid: {'record_uid': existing_uid, 'version': 3},
+        }
+
+        records_to_import, record_exists, _ = prepare_record_add_or_update(
+            False, False, params, [_login_record()], 'thycotic', use_nsf=False)
+        self.assertEqual(len(records_to_import), 1)
+        self.assertEqual(record_exists, [])
+
+    def test_cyberark_import_creates_duplicate_instead_of_shortcut(self):
+        from keepercommander.importer.imp_exp import prepare_record_add_or_update
+
+        existing_uid = 'classic_rec'
+        params = _params()
+        params.record_type_cache = {}
+        params.record_cache = {existing_uid: _cached_login_record(existing_uid)}
+
+        records_to_import, record_exists, _ = prepare_record_add_or_update(
+            False, False, params, [_login_record()], 'cyberark')
+        self.assertEqual(len(records_to_import), 1)
+        self.assertEqual(record_exists, [])

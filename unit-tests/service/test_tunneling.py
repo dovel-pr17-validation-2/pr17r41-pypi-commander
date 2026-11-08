@@ -1,0 +1,552 @@
+import json
+import os
+import tempfile
+import unittest
+from unittest import mock
+
+from keepercommander.service.util import tunneling
+
+
+class TestStartNgrok(unittest.TestCase):
+    def _mock_ngrok_setup(self):
+        return [
+            mock.patch('keepercommander.service.util.tunneling.conf.get_default', return_value=mock.Mock(ngrok_path='/bin/ngrok')),
+            mock.patch('keepercommander.service.util.tunneling.ngrok.install_ngrok'),
+            mock.patch('keepercommander.service.util.tunneling.time.sleep'),
+        ]
+
+    def test_raises_when_ngrok_exits_immediately(self):
+        """A dead-on-arrival ngrok process (bad token, invalid flags, ...) must be
+        reported as a failure, not returned to the caller as if it started fine."""
+        mock_process = mock.Mock(pid=111, returncode=1)
+        mock_process.poll.return_value = 1  # process has already exited
+
+        patches = self._mock_ngrok_setup()
+        with patches[0], patches[1], patches[2], \
+             mock.patch('keepercommander.service.util.tunneling.spawn_detached_process', return_value=mock_process):
+            with self.assertRaises(RuntimeError):
+                tunneling.start_ngrok(port=8000, auth_token='tok')
+
+    def test_returns_pid_when_ngrok_stays_running(self):
+        mock_process = mock.Mock(pid=111, returncode=None)
+        mock_process.poll.return_value = None  # still running
+
+        patches = self._mock_ngrok_setup()
+        with patches[0], patches[1], patches[2], \
+             mock.patch('keepercommander.service.util.tunneling.spawn_detached_process', return_value=mock_process):
+            # No real process has ppid 111, so the psutil lookup falls through and
+            # start_ngrok returns the wrapper PID unchanged.
+            pid = tunneling.start_ngrok(port=8000, auth_token='tok')
+
+            self.assertEqual(pid, 111)
+
+
+class TestStartNgrokWithUrl(unittest.TestCase):
+    def test_raises_when_process_died_after_the_initial_doa_check(self):
+        """A slower failure (e.g. a bad auth token) can exit ngrok after start_ngrok's
+        initial liveness check but before any URL ever becomes available - that must
+        still be reported as a failure, not returned as a silent (pid, None)."""
+        with mock.patch('keepercommander.service.util.tunneling.start_ngrok', return_value=111), \
+             mock.patch('keepercommander.service.util.tunneling.time.sleep'), \
+             mock.patch('keepercommander.service.util.tunneling.get_ngrok_url_from_api', return_value=None), \
+             mock.patch('keepercommander.service.util.tunneling.get_ngrok_url_from_log', return_value=None), \
+             mock.patch('psutil.pid_exists', return_value=False):
+            with self.assertRaises(RuntimeError):
+                tunneling.start_ngrok_with_url(port=8000, auth_token='tok')
+
+    def test_returns_url_when_process_is_alive(self):
+        with mock.patch('keepercommander.service.util.tunneling.start_ngrok', return_value=111), \
+             mock.patch('keepercommander.service.util.tunneling.time.sleep'), \
+             mock.patch('keepercommander.service.util.tunneling.get_ngrok_url_from_api',
+                         return_value='https://example.ngrok.io'):
+            pid, public_url = tunneling.start_ngrok_with_url(port=8000, auth_token='tok')
+
+            self.assertEqual(pid, 111)
+            self.assertEqual(public_url, 'https://example.ngrok.io')
+
+    def test_no_url_but_process_still_alive_does_not_raise(self):
+        """A tunnel that's just slow to report its URL (still alive) shouldn't be
+        treated as a failure - only an actually-dead process should be."""
+        with mock.patch('keepercommander.service.util.tunneling.start_ngrok', return_value=111), \
+             mock.patch('keepercommander.service.util.tunneling.time.sleep'), \
+             mock.patch('keepercommander.service.util.tunneling.get_ngrok_url_from_api', return_value=None), \
+             mock.patch('keepercommander.service.util.tunneling.get_ngrok_url_from_log', return_value=None), \
+             mock.patch('psutil.pid_exists', return_value=True):
+            pid, public_url = tunneling.start_ngrok_with_url(port=8000, auth_token='tok')
+
+            self.assertEqual(pid, 111)
+            self.assertIsNone(public_url)
+
+
+class TestGenerateNgrokUrl(unittest.TestCase):
+    def test_background_mode_skips_fd_redirection_and_uses_subprocess(self):
+        with mock.patch('keepercommander.service.util.tunneling.start_ngrok_with_url',
+                         return_value=(1234, 'https://example.ngrok.io')) as mock_start, \
+             mock.patch('keepercommander.service.util.tunneling.os.dup') as mock_dup:
+            public_url, ngrok_pid = tunneling.generate_ngrok_url(
+                port=8000, auth_token='tok', ngrok_custom_domain=None, run_mode='background'
+            )
+
+            self.assertEqual(public_url, 'https://example.ngrok.io')
+            self.assertEqual(ngrok_pid, 1234)
+            mock_start.assert_called_once_with(port=8000, auth_token='tok')
+            # Background mode must not touch the process's own stdout/stderr fds -
+            # doing so previously corrupted the interactive shell's console on Windows.
+            mock_dup.assert_not_called()
+
+    def test_foreground_mode_uses_pyngrok_connect(self):
+        mock_tunnel = mock.Mock(public_url='https://example.ngrok.io')
+        with mock.patch('keepercommander.service.util.tunneling.ngrok.connect', return_value=mock_tunnel) as mock_connect, \
+             mock.patch('keepercommander.service.util.tunneling.os.dup', side_effect=[1, 2]), \
+             mock.patch('keepercommander.service.util.tunneling.os.dup2'), \
+             mock.patch('keepercommander.service.util.tunneling.os.open', return_value=3), \
+             mock.patch('keepercommander.service.util.tunneling.os.close'):
+            public_url, ngrok_pid = tunneling.generate_ngrok_url(
+                port=8000, auth_token='tok', ngrok_custom_domain=None, run_mode='foreground'
+            )
+
+            self.assertEqual(public_url, 'https://example.ngrok.io')
+            self.assertIsNone(ngrok_pid)
+            mock_connect.assert_called_once()
+
+    def test_missing_port_or_token_raises(self):
+        with self.assertRaises(ValueError):
+            tunneling.generate_ngrok_url(port=None, auth_token='tok', ngrok_custom_domain=None, run_mode='background')
+        with self.assertRaises(ValueError):
+            tunneling.generate_ngrok_url(port=8000, auth_token=None, ngrok_custom_domain=None, run_mode='background')
+
+    def test_foreground_mode_closes_dupd_fds_if_redirection_setup_fails_partway(self):
+        """If os.dup(1)/os.dup(2) succeed but the later os.open(devnull) fails, the
+        duplicated fds must be closed instead of leaked - and ngrok should still start."""
+        mock_tunnel = mock.Mock(public_url='https://example.ngrok.io')
+        with mock.patch('keepercommander.service.util.tunneling.ngrok.connect', return_value=mock_tunnel) as mock_connect, \
+             mock.patch('keepercommander.service.util.tunneling.os.dup', side_effect=[10, 11]), \
+             mock.patch('keepercommander.service.util.tunneling.os.open', side_effect=OSError("too many open files")), \
+             mock.patch('keepercommander.service.util.tunneling.os.dup2'), \
+             mock.patch('keepercommander.service.util.tunneling.os.close') as mock_close:
+            public_url, ngrok_pid = tunneling.generate_ngrok_url(
+                port=8000, auth_token='tok', ngrok_custom_domain=None, run_mode='foreground'
+            )
+
+            self.assertEqual(public_url, 'https://example.ngrok.io')
+            mock_connect.assert_called_once()
+            mock_close.assert_any_call(10)
+            mock_close.assert_any_call(11)
+
+    def test_foreground_mode_restores_stdout_if_second_dup2_fails(self):
+        """If dup2(devnull, 1) succeeds but dup2(devnull, 2) then fails, fd 1 must be
+        restored back to the original console fd before the backup is closed - otherwise
+        fd 1 is left pointed at devnull permanently, silently losing all console output."""
+        mock_tunnel = mock.Mock(public_url='https://example.ngrok.io')
+        dup2_calls = []
+
+        def dup2_side_effect(fd, target):
+            dup2_calls.append((fd, target))
+            if fd == 20 and target == 2:
+                raise OSError("bad file descriptor")
+
+        with mock.patch('keepercommander.service.util.tunneling.ngrok.connect', return_value=mock_tunnel) as mock_connect, \
+             mock.patch('keepercommander.service.util.tunneling.os.dup', side_effect=[10, 11]), \
+             mock.patch('keepercommander.service.util.tunneling.os.open', return_value=20), \
+             mock.patch('keepercommander.service.util.tunneling.os.dup2', side_effect=dup2_side_effect), \
+             mock.patch('keepercommander.service.util.tunneling.os.close') as mock_close:
+            public_url, _ = tunneling.generate_ngrok_url(
+                port=8000, auth_token='tok', ngrok_custom_domain=None, run_mode='foreground'
+            )
+
+            self.assertEqual(public_url, 'https://example.ngrok.io')
+            mock_connect.assert_called_once()
+            # fd 1 was redirected to devnull (20) then must be restored back to the
+            # original console fd (10) before that backup is closed.
+            self.assertIn((20, 1), dup2_calls)
+            self.assertIn((10, 1), dup2_calls)
+            mock_close.assert_any_call(10)
+            mock_close.assert_any_call(11)
+
+
+class TestGetCloudflareUrlFromLog(unittest.TestCase):
+    """The localhost/127.0.0.1 exclusion must gate every OR-branch (trycloudflare.com,
+    cfargotunnel.com, custom_domain) - a prior operator-precedence bug let the
+    cfargotunnel.com/custom_domain branches bypass that exclusion entirely."""
+
+    def setUp(self):
+        fd, self.log_path = tempfile.mkstemp()
+        os.close(fd)
+
+    def tearDown(self):
+        os.unlink(self.log_path)
+
+    def _write_log(self, content):
+        with open(self.log_path, 'w') as f:
+            f.write(content)
+
+    def test_rejects_a_match_that_contains_localhost_even_if_it_also_contains_the_custom_domain(self):
+        # The regex excludes '/', so this is a single continuous match containing both
+        # 'localhost' and the custom domain - exactly what let the old buggy precedence
+        # accept it via the unguarded custom_domain OR-branch. No match should pass the
+        # filter, so this falls through to the constructed https://{custom_domain} URL,
+        # not the bad captured match.
+        self._write_log("https://localhost.acme.example.com\n")
+        url = tunneling.get_cloudflare_url_from_log(self.log_path, custom_domain='acme.example.com', max_retries=1)
+        self.assertEqual(url, 'https://acme.example.com')
+
+    def test_accepts_cfargotunnel_url(self):
+        self._write_log("connected to https://mytunnel.cfargotunnel.com\n")
+        url = tunneling.get_cloudflare_url_from_log(self.log_path, custom_domain=None, max_retries=1)
+        self.assertEqual(url, 'https://mytunnel.cfargotunnel.com')
+
+    def test_no_custom_domain_still_rejects_localhost(self):
+        """Previously, a falsy custom_domain made the whole filter degrade to accept-anything."""
+        self._write_log("https://localhost\n")
+        url = tunneling.get_cloudflare_url_from_log(self.log_path, custom_domain=None, max_retries=1)
+        self.assertIsNone(url)
+
+
+class TestGenerateCloudflareUrl(unittest.TestCase):
+    def test_returns_public_url_and_pid_in_correct_order(self):
+        # start_cloudflare_tunnel_with_url returns (pid, url); generate_cloudflare_url
+        # must swap that to (url, pid) to match what CloudflareConfigurator expects.
+        with mock.patch('keepercommander.service.util.tunneling.start_cloudflare_tunnel_with_url',
+                         return_value=(4321, 'https://tunnel.example.com')):
+            public_url, tunnel_pid = tunneling.generate_cloudflare_url(
+                port=8000, tunnel_token='tok', custom_domain=None, run_mode='background'
+            )
+
+            self.assertEqual(public_url, 'https://tunnel.example.com')
+            self.assertEqual(tunnel_pid, 4321)
+
+    def test_missing_port_raises(self):
+        with self.assertRaises(ValueError):
+            tunneling.generate_cloudflare_url(port=None, tunnel_token='tok', custom_domain=None, run_mode='background')
+
+    def test_missing_tunnel_token_raises(self):
+        with self.assertRaises(ValueError):
+            tunneling.generate_cloudflare_url(port=8000, tunnel_token='  ', custom_domain=None, run_mode='background')
+
+
+class TestDownloadCloudflared(unittest.TestCase):
+    def test_lookup_failure_is_logged_not_swallowed_silently(self):
+        # Force platform.system() to an unsupported value so _download_cloudflared
+        # raises right after the (logged) lookup failure, without attempting a real download.
+        # sys.platform is pinned to a POSIX value too -- the PATH lookup this test exercises
+        # is skipped entirely on real win32 (see test_windows_never_searches_path_or_cwd), so
+        # this must not depend on which OS actually runs the test.
+        with mock.patch('keepercommander.service.util.tunneling.sys.platform', 'darwin'), \
+             mock.patch('keepercommander.service.util.tunneling.subprocess.run',
+                         side_effect=OSError("cloudflared not found")), \
+             mock.patch('keepercommander.service.util.tunneling.logging.debug') as mock_debug, \
+             mock.patch('platform.system', return_value='unsupported'):
+            with self.assertRaises(Exception):
+                tunneling._download_cloudflared()
+
+            mock_debug.assert_called_once()
+            self.assertIn('cloudflared', mock_debug.call_args[0][0])
+
+    def test_windows_never_searches_path_or_cwd(self):
+        """`where` (like shutil.which) searches the current directory before PATH on
+        Windows - a planted cloudflared.exe in whatever directory the user happens to
+        run Commander from would get executed. Only search PATH on POSIX, where `which`
+        doesn't consult the current directory."""
+        with mock.patch('keepercommander.service.util.tunneling.sys.platform', 'win32'), \
+             mock.patch('keepercommander.service.util.tunneling.subprocess.run') as mock_run, \
+             mock.patch('platform.system', return_value='unsupported'):
+            with self.assertRaises(Exception):
+                tunneling._download_cloudflared()
+
+            mock_run.assert_not_called()
+
+
+class TestTunnelLogFiles(unittest.TestCase):
+    def test_ngrok_and_cloudflare_logs_share_the_same_directory(self):
+        ngrok_log = tunneling.get_tunnel_log_file('ngrok_subprocess.log')
+        cloudflare_log = tunneling.get_tunnel_log_file('cloudflare_tunnel_subprocess.log')
+
+        self.assertEqual(os.path.dirname(ngrok_log), os.path.dirname(cloudflare_log))
+
+    def test_resolves_the_data_dir_at_call_time_not_import_time(self):
+        """A --data-dir/KEEPER_DATA_HOME override set after this module is imported
+        must still be honored - the log dir can't be cached as a module-level constant."""
+        import tempfile
+        overridden_dir = tempfile.mkdtemp()
+        with mock.patch('keepercommander.utils.get_default_path', return_value=overridden_dir):
+            log_file = tunneling.get_tunnel_log_file('ngrok_subprocess.log')
+            self.assertTrue(log_file.startswith(os.path.join(overridden_dir, 'service_logs')))
+
+
+class TestStartTailscaleFunnel(unittest.TestCase):
+    def test_rejects_port_not_in_allowed_set(self):
+        """Tailscale Funnel only accepts 443/8443/10000 as the external-facing port -
+        catch an invalid value before it ever reaches the CLI."""
+        with self.assertRaises(ValueError):
+            tunneling.start_tailscale_funnel(local_port=8080, funnel_port=9999)
+
+    def test_accepts_each_allowed_port(self):
+        with tempfile.NamedTemporaryFile() as tmp:
+            for allowed_port in tunneling.TAILSCALE_FUNNEL_ALLOWED_PORTS:
+                with mock.patch('keepercommander.service.util.tunneling._get_tailscale_log_path', return_value=tmp.name), \
+                     mock.patch('keepercommander.service.util.tunneling.subprocess.run',
+                                 return_value=mock.Mock(returncode=0)) as mock_run:
+                    tunneling.start_tailscale_funnel(local_port=8080, funnel_port=allowed_port)
+                    cmd = mock_run.call_args[0][0]
+                    self.assertIn(f"--https={allowed_port}", cmd)
+
+    def test_missing_local_port_raises(self):
+        with self.assertRaises(ValueError):
+            tunneling.start_tailscale_funnel(local_port=None)
+
+    def test_raises_with_guidance_when_cli_exits_nonzero(self):
+        with tempfile.NamedTemporaryFile() as tmp, \
+             mock.patch('keepercommander.service.util.tunneling._get_tailscale_log_path', return_value=tmp.name), \
+             mock.patch('keepercommander.service.util.tunneling.subprocess.run',
+                         return_value=mock.Mock(returncode=1)):
+            with self.assertRaisesRegex(Exception, "Failed to start Tailscale Funnel"):
+                tunneling.start_tailscale_funnel(local_port=8080)
+
+
+class TestGetTailscaleFunnelStatus(unittest.TestCase):
+    """Schema verified live against a real `tailscale funnel status --json` while a
+    Funnel target was actually running: {"Web": {"<host>:<port>": {"Handlers":
+    {"<path>": {"Proxy": "http://localhost:<port>"}}}}}."""
+
+    def test_true_when_local_port_is_an_active_proxy_target(self):
+        payload = {
+            "Web": {"example.ts.net:443": {"Handlers": {"/": {"Proxy": "http://localhost:8080"}}}},
+            "AllowFunnel": {"example.ts.net:443": True},
+        }
+        with mock.patch('keepercommander.service.util.tunneling.subprocess.run',
+                         return_value=mock.Mock(returncode=0, stdout=json.dumps(payload))):
+            self.assertTrue(tunneling.get_tailscale_funnel_status(8080))
+
+    def test_false_when_no_matching_target(self):
+        payload = {
+            "Web": {"example.ts.net:443": {"Handlers": {"/": {"Proxy": "http://localhost:9999"}}}},
+            "AllowFunnel": {"example.ts.net:443": True},
+        }
+        with mock.patch('keepercommander.service.util.tunneling.subprocess.run',
+                         return_value=mock.Mock(returncode=0, stdout=json.dumps(payload))):
+            self.assertFalse(tunneling.get_tailscale_funnel_status(8080))
+
+    def test_false_when_proxy_matches_but_allow_funnel_is_false(self):
+        """A tailnet-only `tailscale serve` on the same target shows up under the same
+        "Web" entry as Funnel - AllowFunnel must also be true, or this isn't actually
+        publicly exposed via Funnel, just privately via Serve."""
+        payload = {
+            "Web": {"example.ts.net:443": {"Handlers": {"/": {"Proxy": "http://localhost:8080"}}}},
+            "AllowFunnel": {"example.ts.net:443": False},
+        }
+        with mock.patch('keepercommander.service.util.tunneling.subprocess.run',
+                         return_value=mock.Mock(returncode=0, stdout=json.dumps(payload))):
+            self.assertFalse(tunneling.get_tailscale_funnel_status(8080))
+
+    def test_false_when_no_funnel_configured_at_all(self):
+        with mock.patch('keepercommander.service.util.tunneling.subprocess.run',
+                         return_value=mock.Mock(returncode=0, stdout='{}')):
+            self.assertFalse(tunneling.get_tailscale_funnel_status(8080))
+
+    def test_false_on_cli_failure_not_raised(self):
+        """A status check is diagnostic, not authoritative - a CLI/parsing error must
+        report 'not active' rather than bubbling up and crashing the caller."""
+        with mock.patch('keepercommander.service.util.tunneling.subprocess.run',
+                         side_effect=Exception("boom")):
+            self.assertFalse(tunneling.get_tailscale_funnel_status(8080))
+
+
+class TestStopTailscaleFunnel(unittest.TestCase):
+    def test_returns_true_on_success(self):
+        with tempfile.NamedTemporaryFile() as tmp, \
+             mock.patch('keepercommander.service.util.tunneling._get_tailscale_log_path', return_value=tmp.name), \
+             mock.patch('keepercommander.service.util.tunneling.subprocess.run',
+                         return_value=mock.Mock(returncode=0)):
+            self.assertTrue(tunneling.stop_tailscale_funnel(8080))
+
+    def test_returns_false_on_nonzero_exit(self):
+        """Both the scoped command and the reset fallback failing, with the target
+        confirmed still active, is a genuine failure."""
+        with tempfile.NamedTemporaryFile() as tmp, \
+             mock.patch('keepercommander.service.util.tunneling._get_tailscale_log_path', return_value=tmp.name), \
+             mock.patch('keepercommander.service.util.tunneling.get_tailscale_funnel_status', return_value=True), \
+             mock.patch('keepercommander.service.util.tunneling.subprocess.run',
+                         return_value=mock.Mock(returncode=1)):
+            self.assertFalse(tunneling.stop_tailscale_funnel(8080))
+
+    def test_uses_scoped_teardown_first_not_broad_reset(self):
+        """Scoped `--https=<port> off` must be tried before the broad `reset`, which
+        would wipe any other Serve/Funnel config a user set up outside Commander."""
+        with tempfile.NamedTemporaryFile() as tmp, \
+             mock.patch('keepercommander.service.util.tunneling._get_tailscale_log_path', return_value=tmp.name), \
+             mock.patch('keepercommander.service.util.tunneling.subprocess.run',
+                         return_value=mock.Mock(returncode=0)) as mock_run:
+            self.assertTrue(tunneling.stop_tailscale_funnel(8080))
+            first_cmd = mock_run.call_args_list[0].args[0]
+            self.assertEqual(first_cmd, ["tailscale", "funnel", "--https=443", "off"])
+            self.assertEqual(mock_run.call_count, 1)
+
+    def test_falls_back_to_reset_when_scoped_teardown_fails(self):
+        with tempfile.NamedTemporaryFile() as tmp, \
+             mock.patch('keepercommander.service.util.tunneling._get_tailscale_log_path', return_value=tmp.name), \
+             mock.patch('keepercommander.service.util.tunneling.get_tailscale_funnel_status', return_value=True), \
+             mock.patch('keepercommander.service.util.tunneling.subprocess.run',
+                         side_effect=[mock.Mock(returncode=1), mock.Mock(returncode=0)]) as mock_run:
+            self.assertTrue(tunneling.stop_tailscale_funnel(8080))
+            self.assertEqual(mock_run.call_count, 2)
+            self.assertEqual(mock_run.call_args_list[1].args[0], ["tailscale", "funnel", "reset"])
+
+    def test_already_inactive_target_does_not_escalate_to_destructive_reset(self):
+        """The scoped command exits non-zero for an already-removed target ("handler
+        does not exist"), which happens routinely on double teardown (service-stop
+        racing a foreground service's own exit handler). That must not escalate to
+        `funnel reset`, which would wipe unrelated Serve/Funnel config."""
+        with tempfile.NamedTemporaryFile() as tmp, \
+             mock.patch('keepercommander.service.util.tunneling._get_tailscale_log_path', return_value=tmp.name), \
+             mock.patch('keepercommander.service.util.tunneling.get_tailscale_funnel_status', return_value=False), \
+             mock.patch('keepercommander.service.util.tunneling.subprocess.run',
+                         return_value=mock.Mock(returncode=1)) as mock_run:
+            self.assertTrue(tunneling.stop_tailscale_funnel(8080))
+            commands = [call.args[0] for call in mock_run.call_args_list]
+            self.assertNotIn(["tailscale", "funnel", "reset"], commands)
+
+
+class TestTailscaleUp(unittest.TestCase):
+    """A fresh Linux install leaves the tailscaled control socket root-owned by
+    default, so `tailscale up` fails there with a specific "checkprefs access
+    denied" message rather than a bad-key error - this must be distinguished
+    so callers can offer the one-time operator-grant fix instead of treating
+    it as an invalid auth key."""
+
+    def _run_with_log_content(self, log_content, returncode=1, advertise_tags=None):
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.log', delete=False) as tmp:
+            tmp.write(log_content)
+            tmp_path = tmp.name
+        try:
+            with mock.patch('keepercommander.service.util.tunneling._get_tailscale_log_path', return_value=tmp_path), \
+                 mock.patch('keepercommander.service.util.tunneling.subprocess.run',
+                             return_value=mock.Mock(returncode=returncode)):
+                tunneling.tailscale_up('tskey-auth-xxx', advertise_tags)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_raises_access_denied_error_when_not_operator(self):
+        with self.assertRaises(tunneling.TailscaleAccessDeniedError):
+            self._run_with_log_content("Access denied: checkprefs access denied\n")
+
+    def test_raises_generic_exception_for_other_failures(self):
+        with self.assertRaises(Exception) as ctx:
+            self._run_with_log_content("backend error: invalid key\n")
+        self.assertNotIsInstance(ctx.exception, tunneling.TailscaleAccessDeniedError)
+
+    def test_missing_auth_key_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            tunneling.tailscale_up(None)
+
+    def test_no_identity_check_before_authenticating(self):
+        """No pre-flight warning/check - tailscale_up goes straight to `up`, same as
+        before; blocking or warning here would be noise on every normal dev/test run
+        against an already-authenticated host, and headless invocations can't prompt."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.log', delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            with mock.patch('keepercommander.service.util.tunneling._get_tailscale_log_path', return_value=tmp_path), \
+                 mock.patch('keepercommander.service.util.tunneling.subprocess.run',
+                             return_value=mock.Mock(returncode=0)) as mock_run, \
+                 mock.patch('builtins.print') as mock_print:
+                tunneling.tailscale_up('tskey-auth-xxx')
+                self.assertEqual(mock_print.call_count, 0)
+                self.assertEqual(mock_run.call_count, 1)
+        finally:
+            os.unlink(tmp_path)
+
+
+class TestSetTailscaleOperator(unittest.TestCase):
+    def test_returns_false_when_username_unavailable(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(tunneling.set_tailscale_operator())
+
+    def test_runs_sudo_tailscale_set_operator_with_current_user(self):
+        with mock.patch.dict(os.environ, {'USER': 'alice'}, clear=True), \
+             mock.patch('keepercommander.service.util.tunneling.subprocess.run',
+                         return_value=mock.Mock(returncode=0)) as mock_run:
+            self.assertTrue(tunneling.set_tailscale_operator())
+            cmd = mock_run.call_args[0][0]
+            self.assertEqual(cmd, ["sudo", "tailscale", "set", "--operator=alice"])
+
+    def test_prefers_sudo_user_over_user_when_run_under_sudo(self):
+        """Under `sudo keeper ...`, $USER/$LOGNAME resolve to root - SUDO_USER holds
+        the actual invoking user, who is who should actually get operator rights."""
+        with mock.patch.dict(os.environ, {'USER': 'root', 'SUDO_USER': 'alice'}, clear=True), \
+             mock.patch('keepercommander.service.util.tunneling.subprocess.run',
+                         return_value=mock.Mock(returncode=0)) as mock_run:
+            self.assertTrue(tunneling.set_tailscale_operator())
+            cmd = mock_run.call_args[0][0]
+            self.assertEqual(cmd, ["sudo", "tailscale", "set", "--operator=alice"])
+
+    def test_returns_false_when_command_fails(self):
+        with mock.patch.dict(os.environ, {'USER': 'alice'}), \
+             mock.patch('keepercommander.service.util.tunneling.subprocess.run',
+                         return_value=mock.Mock(returncode=1)):
+            self.assertFalse(tunneling.set_tailscale_operator())
+
+
+class TestTailscaleUpUnattended(unittest.TestCase):
+    """Windows keeps a node up only while the GUI client runs, and Commander installs
+    the MSI with TS_NOLAUNCH=1 (no GUI). Without --unattended the backend sits at
+    NoState after a successful login, so Funnel has nothing to bind to."""
+
+    def _cmd_for_platform(self, system):
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.log', delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            with mock.patch('keepercommander.service.util.tunneling._get_tailscale_log_path', return_value=tmp_path), \
+                 mock.patch('platform.system', return_value=system), \
+                 mock.patch('keepercommander.service.util.tunneling.subprocess.run',
+                             return_value=mock.Mock(returncode=0)) as mock_run:
+                tunneling.tailscale_up('tskey-auth-xxx')
+                return mock_run.call_args[0][0]
+        finally:
+            os.unlink(tmp_path)
+
+    def test_windows_gets_unattended_flag(self):
+        self.assertIn('--unattended', self._cmd_for_platform('Windows'))
+
+    def test_macos_and_linux_do_not_get_unattended_flag(self):
+        for system in ('Darwin', 'Linux'):
+            self.assertNotIn('--unattended', self._cmd_for_platform(system),
+                             f'--unattended is Windows-only, leaked into {system}')
+
+    def test_unattended_does_not_displace_the_existing_flags(self):
+        cmd = self._cmd_for_platform('Windows')
+        self.assertIn('--force-reauth', cmd)
+        self.assertIn('--advertise-tags=', cmd)
+        self.assertTrue(any(a.startswith('--auth-key=file:') for a in cmd))
+
+
+class TestInstallTailscaleLinux(unittest.TestCase):
+    def _run_with_script(self, content: bytes):
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        try:
+            with mock.patch('keepercommander.service.util.tunneling._downloaded_to_tempfile') as mock_dl, \
+                 mock.patch('keepercommander.service.util.tunneling._run_privileged_tailscale_command',
+                             return_value=True) as mock_run:
+                mock_dl.return_value.__enter__.return_value = tmp_path
+                result = tunneling._install_tailscale_linux()
+                return result, mock_run
+        finally:
+            os.unlink(tmp_path)
+
+    def test_rejects_truncated_download(self):
+        result, mock_run = self._run_with_script(b'short')
+        self.assertFalse(result)
+        mock_run.assert_not_called()
+
+    def test_runs_install_and_logs_sha256_for_a_normal_script(self):
+        with self.assertLogs(level='INFO') as logs:
+            result, mock_run = self._run_with_script(b'#!/bin/sh\n' + b'x' * 2000)
+        self.assertTrue(result)
+        mock_run.assert_called_once()
+        self.assertTrue(any('SHA256' in m for m in logs.output))
+
+
+if __name__ == '__main__':
+    unittest.main()

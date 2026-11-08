@@ -1,0 +1,597 @@
+#  _  __
+# | |/ /___ ___ _ __  ___ _ _ ®
+# | ' </ -_) -_) '_ \/ -_) '_|
+# |_|\_\___\___| .__/\___|_|
+#              |_|
+#
+# Keeper Commander
+# Copyright 2025 Keeper Security Inc.
+# Contact: ops@keepersecurity.com
+#
+
+"""
+Nested Share Folder — display / inspection commands.
+
+Single Responsibility: every class here is read-only — it queries data and
+presents it; no mutations.
+"""
+
+import json
+import logging
+
+from ..base import Command
+from ..record import RecordGetUidCommand
+from ...error import CommandError
+from ... import nested_share_folder as _nsf
+from ... import vault
+from ...nested_share_folder.folder_api import FolderIdentifierAmbiguousError
+from .helpers import (
+    RECORD_PERM_LABELS, FOLDER_PERM_LABELS,
+    get_access_role_label, format_role_display,
+    format_timestamp, load_record_metadata, command_error_handler,
+    ensure_nested_share_record, collect_records_in_folder, resolve_record_uid,
+    ROOT_FOLDER_UID,
+)
+from .parsers import (
+    nested_share_record_get_details_parser,
+    nested_share_get_parser,
+)
+logger = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# nsf-record-details
+# ══════════════════════════════════════════════════════════════════════════
+
+class NestedShareRecordGetDetailsCommand(Command):
+    """Get record metadata details."""
+
+    def get_parser(self):
+        return nested_share_record_get_details_parser
+
+    def execute(self, params, **kwargs):
+        identifiers = kwargs.get('record_uids', [])
+        output_format = kwargs.get('format', 'table')
+
+        if not identifiers:
+            raise CommandError('nsf-record-details', 'At least one record UID or title is required')
+
+        record_uids = []
+        for ident in identifiers:
+            uid = resolve_record_uid(params, ident, 'nsf-record-details') or ident
+            ensure_nested_share_record(params, uid, 'nsf-record-details',
+                                       identifier=ident)
+            record_uids.append(uid)
+
+        with command_error_handler('nsf-record-details'):
+            result = _nsf.get_record_details_v3(params, record_uids)
+            if output_format == 'json':
+                print(json.dumps(result, indent=2))
+            else:
+                for record in result.get('data', []):
+                    logging.info("Record UID: %s", record['record_uid'])
+                    logging.info("  Title: %s", record['title'])
+                    logging.info("  Type: %s", record.get('type', 'Unknown'))
+                    logging.info("  Version: %s", record.get('version', 0))
+                    logging.info("  Revision: %s", record.get('revision', 0))
+                    logging.info("")
+                if result.get('forbidden_records'):
+                    logging.warning("Forbidden records: %d", len(result['forbidden_records']))
+                    for uid in result['forbidden_records']:
+                        logging.warning("  %s", uid)
+                logging.info("Total records retrieved: %d", len(result.get('data', [])))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# nsf-get  (composite — inspects both records and folders)
+# ══════════════════════════════════════════════════════════════════════════
+
+class NestedShareGetCommand(Command):
+    """Show details of a Nested Share Record or folder."""
+
+    _MASKED_TYPES = frozenset({
+        'password', 'secret', 'pinCode', 'pin_code', 'oneTimeCode', 'otp',
+        'note', 'json',
+    })
+
+    def get_parser(self):
+        return nested_share_get_parser
+
+    def execute(self, params, **kwargs):
+        uid            = (kwargs.get('uid') or '').strip()
+        fmt            = kwargs.get('format') or 'detail'
+        verbose        = kwargs.get('verbose', False)
+        unmask         = kwargs.get('unmask', False)
+        include_dag    = kwargs.get('include_dag', False)
+        show_inherited = kwargs.get('show_inherited', False)
+        show_denied    = kwargs.get('show_denied', False)
+
+        if not uid:
+            raise CommandError('nsf-get', 'UID parameter is required')
+
+        try:
+            resolved = self._resolve_as_folder(params, uid)
+        except FolderIdentifierAmbiguousError as e:
+            raise CommandError('nsf-get', str(e)) from e
+        if resolved:
+            (self._folder_json if fmt == 'json' else self._folder_detail)(params, resolved, verbose)
+            return
+
+        resolved = self._resolve_as_record(params, uid)
+        if resolved:
+            # Audit hint (UID only — never log unmasked field values). The
+            # rendered values are emitted via ``print`` directly to stdout so
+            # they don't flow through Python's logging handlers / log files.
+            if unmask:
+                logger.warning(
+                    "nsf-get: --unmask was requested for record %s; "
+                    "sensitive field values will be displayed on stdout only.",
+                    resolved,
+                )
+            if fmt == 'json':
+                self._record_json(params, resolved, verbose, unmask, include_dag=include_dag,
+                                   show_inherited=show_inherited, show_denied=show_denied)
+            else:
+                self._record_detail(params, resolved, verbose, unmask,
+                                     show_inherited=show_inherited, show_denied=show_denied)
+            return
+
+        raise CommandError(
+            'nsf-get',
+            f'Cannot resolve "{uid}" by name. Use the object UID; run nsf-list '
+            'to find folder UIDs. Shared-in and ambiguous folder names require UID lookup.')
+
+    # ── Resolution ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _resolve_as_folder(params, uid):
+        resolved = _nsf.resolve_folder_identifier(
+            params, uid, raise_on_ambiguous=True)
+        return resolved if resolved in getattr(params, 'nested_share_folders', {}) else None
+
+    @staticmethod
+    def _resolve_as_record(params, uid):
+        resolved = resolve_record_uid(params, uid, 'nsf-get')
+        return resolved if resolved in getattr(params, 'nested_share_records', {}) else None
+
+    # ── Record display ────────────────────────────────────────────────
+
+    def _record_detail(self, params, record_uid, verbose, unmask,
+                        show_inherited=False, show_denied=False):
+        # SECURITY: this method MUST only emit field values through ``print``
+        # (stdout). Never pass unmasked record content to ``logging.*`` —
+        # operators frequently configure file/syslog handlers that would
+        # persist secrets to disk. ``--unmask`` is user-controlled and should
+        # affect what the terminal sees, not what gets archived.
+        meta = load_record_metadata(params, record_uid)
+
+        print('')
+        print('{0:>20s}: {1:<20s}'.format('UID', record_uid))
+        print('{0:>20s}: {1:<20s}'.format('Type', meta['type'] or ''))
+        if meta['title']:
+            print('{0:>20s}: {1:<20s}'.format('Title', meta['title']))
+
+        login_val = self._extract_field_value(meta['fields'], 'login')
+        if login_val:
+            print('{0:>20s}: {1:<20s}'.format('Login', login_val))
+
+        password_val = self._extract_field_value(meta['fields'], 'password')
+        if password_val:
+            display_pw = password_val if unmask else '********'
+            print('{0:>20s}: {1:<20s}'.format('Password', display_pw))
+
+        url_val = self._extract_field_value(meta['fields'], 'url')
+        if url_val:
+            print('{0:>20s}: {1:<20s}'.format('URL', url_val))
+
+        self._print_typed_fields(meta['fields'], unmask, skip_types={'login', 'password', 'url'})
+        self._print_typed_fields(meta.get('custom') or [], unmask)
+
+        if meta['notes']:
+            for i, line in enumerate(meta['notes'].split('\n')):
+                print('{0:>21s} {1}'.format('Notes:' if i == 0 else '', line.strip()))
+
+        self._print_record_permissions(params, record_uid, verbose,
+                                        show_inherited=show_inherited, show_denied=show_denied)
+
+    def _print_typed_fields(self, fields, unmask, skip_types=()):
+        for f in fields or []:
+            ftype = f.get('type', '')
+            if ftype in skip_types:
+                continue
+            label = f.get('label') or ftype.replace('_', ' ').title()
+            values = f.get('value', [])
+            if not isinstance(values, list):
+                values = [values]
+            for val in values:
+                if not val and val != 0:
+                    continue
+                if ftype in self._MASKED_TYPES:
+                    dval = str(val) if unmask else '********'
+                elif isinstance(val, dict):
+                    dval = ', '.join(f'{k}: {v}' for k, v in val.items() if v)
+                else:
+                    dval = str(val)
+                print('{0:>20s}: {1:<s}'.format(label, dval))
+
+    @staticmethod
+    def _extract_field_value(fields, field_type):
+        """Extract the first non-empty value for a given field type."""
+        for f in fields:
+            if f.get('type', '') == field_type:
+                values = f.get('value', [])
+                if not isinstance(values, list):
+                    values = [values]
+                for val in values:
+                    if val:
+                        return str(val) if not isinstance(val, dict) else \
+                            ', '.join(f'{k}: {v}' for k, v in val.items() if v)
+        return ''
+
+    def _record_json(self, params, record_uid, verbose, _unmask=False, include_dag=False,
+                      show_inherited=False, show_denied=False):
+        meta = load_record_metadata(params, record_uid)
+        ro = {
+            'record_uid': record_uid, 'title': meta['title'],
+            'type': meta['type'], 'version': meta['version'],
+            'revision': meta['revision'],
+        }
+        if meta['folder_location']:
+            ro['folder'] = meta['folder_location']
+        if meta['fields']:
+            ro['fields'] = meta['fields']
+        if meta.get('custom'):
+            ro['custom'] = meta['custom']
+        if meta['notes']:
+            ro['notes'] = meta['notes']
+
+        try:
+            accesses = _nsf.get_record_accesses_v3(
+                params, [record_uid]).get('record_accesses', [])
+            accesses = _nsf.filter_record_accesses(
+                accesses, show_inherited=show_inherited, show_denied=show_denied)
+            if accesses:
+                user_perms = []
+                for a in accesses:
+                    accessor = a.get('accessor_name') or a.get('access_type_uid', '')
+                    role = get_access_role_label(a)
+                    entry = {
+                        'username':  accessor,
+                        'owner':     a.get('owner', False),
+                        'shareable': a.get('can_approve_access', False) or a.get('can_update_access', False),
+                        'editable':  a.get('can_edit', False),
+                        'role':      role,
+                    }
+                    if verbose:
+                        for flag, _ in RECORD_PERM_LABELS:
+                            entry[flag] = a.get(flag, False)
+                    user_perms.append(entry)
+                if user_perms:
+                    ro['user_permissions'] = user_perms
+        except Exception as e:
+            logger.debug('Could not retrieve record access: %s', e)
+
+        try:
+            from ... import api
+            share_admins = api.get_share_admins_for_record(params, record_uid) or []
+            if share_admins:
+                ro['share_admins'] = share_admins
+        except Exception as e:
+            logger.error('Could not retrieve share admins: %s', e)
+
+        if include_dag:
+            try:
+                r = vault.KeeperRecord.load(params, record_uid)
+                if r:
+                    RecordGetUidCommand().include_dag(params, ro, r)
+            except Exception as e:
+                logger.error('Could not retrieve DAG info for record %s: %s', record_uid, e)
+
+        print(json.dumps(ro, indent=2))
+
+    @staticmethod
+    def _print_record_permissions(params, record_uid, verbose,
+                                   show_inherited=False, show_denied=False):
+        """Display record permissions in a format similar to the legacy get command."""
+        try:
+            accesses = _nsf.get_record_accesses_v3(
+                params, [record_uid]).get('record_accesses', [])
+            accesses = _nsf.filter_record_accesses(
+                accesses, show_inherited=show_inherited, show_denied=show_denied)
+            if not accesses:
+                return
+
+            print('')
+            print('User Permissions:')
+            for a in accesses:
+                accessor = a.get('accessor_name') or a.get('access_type_uid', '')
+                is_owner = a.get('owner', False)
+                can_edit = a.get('can_edit', False)
+                can_share = a.get('can_approve_access', False) or a.get('can_update_access', False)
+                role = get_access_role_label(a)
+
+                print('')
+                print('  User: ' + accessor)
+                if is_owner:
+                    print('  Owner: Yes')
+                else:
+                    # Owners always have full control over the record, so
+                    # surfacing a role for them is redundant noise. Show
+                    # the role only for non-owner accessors.
+                    print('  Role: ' + role)
+                print('  Shareable: ' + ('Yes' if can_share else 'No'))
+                print('  Read-Only: ' + ('Yes' if not can_edit else 'No'))
+
+                if verbose:
+                    print(f'  {"Permission":<20}  Value')
+                    print(f'  {"-"*20}  -----')
+                    for flag, lbl in RECORD_PERM_LABELS:
+                        print(f'  {lbl:<20}  {"Y" if a.get(flag) else "N"}')
+
+            # Share admins are sourced from the enterprise sharing-admins API
+            # so the list matches the legacy ``get`` command (every user
+            # designated as a Share Admin for this record at the enterprise
+            # level), not just the users currently holding full-manager
+            # access.
+            share_admins = []
+            try:
+                from ... import api
+                share_admins = api.get_share_admins_for_record(params, record_uid) or []
+            except Exception as e:
+                logger.debug('Could not retrieve share admins: %s', e)
+
+            if share_admins:
+                print('')
+                total = len(share_admins)
+                max_shown = 10
+                if total <= max_shown:
+                    print(f'Share Admins ({total}):')
+                    for admin in share_admins:
+                        print(f'  {admin}')
+                else:
+                    print(f'Share Admins ({total}, showing first {max_shown}):')
+                    for admin in share_admins[:max_shown]:
+                        print(f'  {admin}')
+                    print(f'  ... and {total - max_shown} more')
+        except Exception as e:
+            logger.debug('Could not retrieve record access: %s', e)
+
+    # ── Folder display ────────────────────────────────────────────────
+
+    @staticmethod
+    def _folder_permission_summary(accessor):
+        """Return the Nested Share Folder role label for a folder accessor.
+
+        Uses the server-supplied ``role`` (an ``AccessRoleType`` enum name) and
+        renders it as a canonical Nested Share Folder role label (e.g. ``full-manager``,
+        ``share-manager``, ``viewer``). Falls back to permission-flag based
+        inference for legacy access rows that omit ``role``.
+        """
+        if not isinstance(accessor, dict):
+            return ''
+        role_name = accessor.get('role')
+        if role_name:
+            return format_role_display(role_name)
+        perms = accessor.get('permissions') or {}
+        if not perms:
+            return ''
+        return get_access_role_label({
+            'can_change_ownership': perms.get('can_change_ownership', False),
+            'can_delete':           perms.get('can_delete', False),
+            'can_update_access':    perms.get('can_update_access', False),
+            'can_approve_access':   perms.get('can_approve_access', False),
+            'can_edit':             perms.get('can_edit_records', False),
+            'can_view':             perms.get('can_view_records', False),
+            'can_list_access':      perms.get('can_list_access', False),
+            'can_view_title':       perms.get('can_view_records', False),
+        })
+
+    @staticmethod
+    def _folder_detail(params, folder_uid, verbose):
+        fobj = getattr(params, 'nested_share_folders', {}).get(folder_uid, {})
+        name = fobj.get('name', folder_uid)
+
+        print('')
+        print('{0:>25s}: {1:<20s}'.format('Nested Share Folder UID', folder_uid))
+        print('{0:>25s}: {1}'.format('Name', name))
+
+        NestedShareGetCommand._print_folder_permissions(params, folder_uid, verbose)
+
+    @staticmethod
+    def _folder_json(params, folder_uid, verbose):
+        fobj = getattr(params, 'nested_share_folders', {}).get(folder_uid, {})
+        name = fobj.get('name', folder_uid)
+        owner_username = fobj.get('owner_username')
+        owner_account_uid = fobj.get('owner_account_uid')
+
+        nsf_folders = getattr(params, 'nested_share_folders', {})
+        raw_parent = fobj.get('parent_uid') or ''
+        # Treat the parent as root if it is absent, a known root sentinel, or not
+        # a real NSF folder entry (some vaults use server-specific root UIDs).
+        is_root_parent = not raw_parent or raw_parent == ROOT_FOLDER_UID or raw_parent not in nsf_folders
+        parent_uid = None if is_root_parent else raw_parent
+
+        def _nsf_folder_path(uid):
+            """Build display path for an NSF folder by walking up the hierarchy."""
+            parts = []
+            cur = uid
+            while cur and cur in nsf_folders:
+                obj = nsf_folders[cur]
+                parts.append(obj.get('name', cur))
+                p = obj.get('parent_uid') or ''
+                cur = None if (not p or p not in nsf_folders) else p
+            return '/'.join(reversed(parts))
+
+        fo = {
+            'folder_uid': folder_uid,
+            'type': 'nested_share_folder',
+            'name': name,
+            'parent_uid': parent_uid,
+            'folder': {
+                'uid': parent_uid,
+                'path': _nsf_folder_path(parent_uid) if parent_uid else '/'
+            }
+        }
+        if owner_username:
+            fo['owner'] = owner_username
+
+        try:
+            result = _nsf.get_folder_access_v3(params, folder_uids=[folder_uid])
+            for fr in result.get('results', []):
+                if not fr.get('success'):
+                    continue
+                accessors = [
+                    a for a in fr.get('accessors', [])
+                    if not a.get('denied_access')
+                ]
+                if not accessors:
+                    continue
+                user_perms = []
+                team_perms = []
+                share_admins = []
+                for a in accessors:
+                    accessor = a.get('username') or a.get('accessor_uid', '')
+                    at = a.get('access_type', '')
+                    perms = a.get('permissions', {})
+                    is_owner = NestedShareGetCommand._is_folder_owner(a, owner_username, owner_account_uid)
+                    role_label_display = ('owner' if is_owner
+                                          else NestedShareGetCommand._folder_permission_summary(a))
+                    entry = {
+                        'accessor':    accessor,
+                        'access_type': at,
+                        'role':        role_label_display,
+                        'inherited':   a.get('inherited', False),
+                    }
+                    if verbose and perms:
+                        entry['permission_flags'] = perms
+                    if at == 'AT_TEAM':
+                        team_perms.append(entry)
+                    else:
+                        user_perms.append(entry)
+                    if a.get('role', '') == 'MANAGER':
+                        share_admins.append(accessor)
+                if user_perms:
+                    fo['user_permissions'] = user_perms
+                if team_perms:
+                    fo['team_permissions'] = team_perms
+                if share_admins:
+                    fo['share_admins'] = share_admins
+        except Exception as e:
+            logger.debug('Could not retrieve folder access: %s', e)
+
+        try:
+            record_uids = collect_records_in_folder(params, folder_uid, recursive=False)
+            records_list = []
+            for r_uid in record_uids:
+                entry = {'record_uid': r_uid}
+                rec = vault.KeeperRecord.load(params, r_uid)
+                if rec:
+                    entry['record_name'] = rec.title
+                records_list.append(entry)
+            fo['records'] = records_list
+        except Exception as e:
+            logger.debug('Could not retrieve records for NSF folder %s: %s', folder_uid, e)
+
+        print(json.dumps(fo, indent=2))
+
+    @staticmethod
+    def _is_folder_owner(accessor, owner_username, owner_account_uid):
+        """Return True if *accessor* matches the folder ownerInfo from sync-down."""
+        if not accessor:
+            return False
+        if owner_username:
+            au = (accessor.get('username') or '').lower()
+            if au and au == owner_username.lower():
+                return True
+        if owner_account_uid:
+            uid = accessor.get('accessor_uid') or ''
+            if uid and uid == owner_account_uid:
+                return True
+        return False
+
+    @staticmethod
+    def _print_folder_permissions(params, folder_uid, verbose):
+        """Display folder permissions in a format similar to the legacy get command."""
+        try:
+            fobj = getattr(params, 'nested_share_folders', {}).get(folder_uid, {}) or {}
+            owner_username = fobj.get('owner_username')
+            owner_account_uid = fobj.get('owner_account_uid')
+
+            result = _nsf.get_folder_access_v3(params, folder_uids=[folder_uid])
+            for fr in result.get('results', []):
+                if not fr.get('success'):
+                    err = fr.get('error', {})
+                    logging.warning("  Access error: %s — %s",
+                                    err.get('status'), err.get('message'))
+                    continue
+                accessors = [
+                    a for a in fr.get('accessors', [])
+                    if not a.get('denied_access')
+                ]
+                if not accessors:
+                    continue
+
+                users = []
+                teams = []
+                share_admins = []
+                for a in accessors:
+                    at = a.get('access_type', '')
+                    if at == 'AT_TEAM':
+                        teams.append(a)
+                    else:
+                        users.append(a)
+                    if a.get('role', '') == 'MANAGER':
+                        name = a.get('username') or a.get('accessor_uid', '')
+                        share_admins.append((name, a))
+
+                if users:
+                    print('')
+                    print('{0:>25s}:'.format('User Permissions'))
+                    for a in users:
+                        label = a.get('username') or a.get('accessor_uid', '')
+                        perms = a.get('permissions', {})
+                        if NestedShareGetCommand._is_folder_owner(a, owner_username, owner_account_uid):
+                            role_str = 'owner'
+                        else:
+                            role_str = NestedShareGetCommand._folder_permission_summary(a)
+                        print('{0:>25s}: {1}'.format(label, role_str))
+                        if verbose:
+                            if a.get('date_created'):
+                                print('{0:>25s}  Created: {1}'.format('', format_timestamp(a['date_created'])))
+                            if a.get('last_modified'):
+                                print('{0:>25s}  Modified: {1}'.format('', format_timestamp(a['last_modified'])))
+                            if perms:
+                                print('{0:>25s}  {1:<26}  {2}'.format('', 'Permission', 'Value'))
+                                print('{0:>25s}  {1:<26}  {2}'.format('', '-' * 26, '-----'))
+                                for flag, lbl in FOLDER_PERM_LABELS:
+                                    print('{0:>25s}  {1:<26}  {2}'.format(
+                                        '', lbl, 'Y' if perms.get(flag) else 'N'))
+
+                if teams:
+                    print('')
+                    print('{0:>25s}:'.format('Team Permissions'))
+                    for a in teams:
+                        label = a.get('username') or a.get('accessor_uid', '')
+                        perms = a.get('permissions', {})
+                        role_str = NestedShareGetCommand._folder_permission_summary(a)
+                        print('{0:>25s}: {1}'.format(label, role_str))
+                        if verbose and perms:
+                            print('{0:>25s}  {1:<26}  {2}'.format('', 'Permission', 'Value'))
+                            print('{0:>25s}  {1:<26}  {2}'.format('', '-' * 26, '-----'))
+                            for flag, lbl in FOLDER_PERM_LABELS:
+                                print('{0:>25s}  {1:<26}  {2}'.format(
+                                    '', lbl, 'Y' if perms.get(flag) else 'N'))
+
+                if share_admins:
+                    print('')
+                    print('{0:>25s}:'.format('Share Administrators'))
+                    for admin_name, admin_accessor in share_admins:
+                        if NestedShareGetCommand._is_folder_owner(admin_accessor, owner_username, owner_account_uid):
+                            admin_role = 'owner'
+                        else:
+                            admin_role = 'full-manager'
+                        print('{0:>25s}: {1}'.format(admin_name, admin_role))
+
+                print('')
+        except Exception as e:
+            logger.debug('Could not retrieve folder access: %s', e)

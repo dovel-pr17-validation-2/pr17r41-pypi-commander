@@ -1,0 +1,291 @@
+from unittest import TestCase
+import json
+from keepercommander.service.util.parse_keeper_response import KeeperResponseParser, ensure_record_add_json_format
+
+class TestKeeperResponseParser(TestCase):
+    def test_ensure_record_add_json_format(self):
+        self.assertEqual(
+            ensure_record_add_json_format('record-add -t test -rt login'),
+            'record-add -t test -rt login --format=json',
+        )
+        self.assertEqual(
+            ensure_record_add_json_format('record-add -t test --format=json'),
+            'record-add -t test --format=json',
+        )
+        self.assertEqual(
+            ensure_record_add_json_format('ls'),
+            'ls',
+        )
+
+    def test_parse_ls_command(self):
+        """Test parsing of 'ls' command output"""
+        sample_output = """# Folder UID                           Title                                                   Flags
+  1   b4pBzT1WowoUXHk_US0SCg   Root                                                    RS
+# Record UID                           Type           Title                                      Description   
+  1   dGJ3xbH8CXhNF00FBX0wMA            login          My Login                                   Important"""
+          
+        result = KeeperResponseParser._parse_ls_command(sample_output)
+          
+        self.assertEqual(result['status'], 'success')
+        self.assertEqual(result['command'], 'ls')
+        self.assertEqual(len(result['data']['folders']), 1)
+        self.assertEqual(len(result['data']['records']), 1)
+          
+        folder = result['data']['folders'][0]
+        self.assertEqual(folder['number'], 1)
+        self.assertEqual(folder['name'], 'Root')
+          
+        record = result['data']['records'][0]
+        self.assertEqual(record['number'], 1)
+        self.assertEqual(record['title'], 'My Login')
+        self.assertEqual(record['description'], 'Important')
+
+    def test_parse_tree_command(self):
+        """Test parsing of 'tree' command output"""
+        sample_output = """Root
+Folder1
+  SubFolder1
+Folder2"""
+          
+        result = KeeperResponseParser._parse_tree_command(sample_output)
+          
+        self.assertEqual(result['status'], 'success')
+        self.assertEqual(result['command'], 'tree')
+        self.assertEqual(len(result['data']['tree']), 4)  # Updated: now returns dict with 'tree' key
+          
+        self.assertEqual(result['data']['tree'][0]['level'], 0)
+        self.assertEqual(result['data']['tree'][0]['name'], 'Root')
+        self.assertEqual(result['data']['tree'][0]['path'], 'Root')
+          
+        self.assertEqual(result['data']['tree'][1]['level'], 0)
+        self.assertEqual(result['data']['tree'][1]['name'], 'Folder1')
+        self.assertEqual(result['data']['tree'][1]['path'], 'Folder1')
+
+    def test_parse_tree_command_share_permissions_structured(self):
+        """tree -s -v: share_permissions uses default only (all abbrevs), plus users list"""
+        sample_output = """Share Permissions Key:
+======================
+RO = Read-Only
+MU = Can Manage Users
+======================
+My Vault
+ └── Shared Folder (abc123) [SHARED] (default:CE; users:[a@x.com:RO],[b@y.com:MU,MR])
+"""
+        result = KeeperResponseParser._parse_tree_command(sample_output)
+        self.assertEqual(result['data']['share_permissions_key'][:2], ['RO = Read-Only', 'MU = Can Manage Users'])
+        entry = result['data']['tree'][0]
+        self.assertTrue(entry['shared'])
+        sp = entry['share_permissions']
+        self.assertEqual(sp['default'], 'CE')
+        self.assertNotIn('user', sp)
+        self.assertEqual(len(sp['users']), 2)
+        self.assertEqual(sp['users'][0]['username'], 'a@x.com')
+        self.assertEqual(sp['users'][0]['permissions'], 'RO')
+        self.assertEqual(sp['users'][1]['username'], 'b@y.com')
+        self.assertEqual(sp['users'][1]['permissions'], 'MU,MR')
+
+    def test_parse_tree_share_permissions_ignores_legacy_user_segment(self):
+        """Legacy user: segment is ignored; only default is kept."""
+        line = 'Shared Folder [SHARED] (default:MU,CE; user:MU,CE; users:[a@x.com:RO])'
+        sp = KeeperResponseParser._parse_tree_share_permissions(line)
+        self.assertEqual(sp['default'], 'MU,CE')
+        self.assertNotIn('user', sp)
+        self.assertEqual(sp['users'][0]['username'], 'a@x.com')
+
+    def test_parse_tree_does_not_treat_share_suffix_as_uid(self):
+        sample = (
+            'My Vault\n'
+            ' └── Folder (abcUID12345678901234) [SHARED] '
+            '(default:RO; users:[a@x.com:RO])\n'
+            ' └── Rec [login] [Nested Record] (users:[me@x.com:OW])\n'
+        )
+        result = KeeperResponseParser._parse_tree_command(sample)
+        folder = result['data']['tree'][0]
+        self.assertEqual(folder['name'], 'Folder')
+        self.assertEqual(folder['uid'], 'abcUID12345678901234')
+        self.assertEqual(folder['share_permissions']['default'], 'RO')
+        rec = result['data']['tree'][1]
+        self.assertEqual(rec['name'], 'Rec')
+        self.assertEqual(rec['type'], 'record')
+        self.assertNotIn('uid', rec)
+
+    def test_tree_format_json_uses_native_json_parser(self):
+        """tree --format=json must not use the ASCII tree parser."""
+        self.assertEqual(
+            KeeperResponseParser._find_parser_method('tree --format=json'),
+            '_parse_json_format_command',
+        )
+        self.assertEqual(
+            KeeperResponseParser._find_parser_method('tree'),
+            '_parse_tree_command',
+        )
+        native = '{"tree": {"name": "My Vault", "kind": "folder", "children": []}}'
+        result = KeeperResponseParser._parse_json_format_command(
+            'tree --format=json', native
+        )
+        self.assertEqual(result['status'], 'success')
+        self.assertEqual(result['data']['tree']['kind'], 'folder')
+        self.assertNotIn('level', result['data']['tree'])
+
+    def test_nsf_convert_permanent_notice_does_not_fail_successful_command(self):
+        command = 'nsf-convert record_uid --force'
+        output = (
+            'Warning: Conversion is permanent; Classic folder membership is not retained.\n'
+            'Record: Example Login (record_uid)\n'
+            'Destination: Vault (root)'
+        )
+
+        result = KeeperResponseParser.parse_response(command, output)
+        self.assertEqual(result['status'], 'success')
+        self.assertNotIn('status_code', result)
+        self.assertEqual(result['message'], output.splitlines())
+
+    def test_nsf_convert_permanent_notice_from_logs_does_not_fail(self):
+        output = (
+            'Warning: Conversion is permanent; Classic folder membership is not retained.\n'
+            'Destination: Vault (root)'
+        )
+
+        result = KeeperResponseParser.parse_response(
+            'nsf-convert record_uid --force', '', log_output=output
+        )
+
+        self.assertEqual(result['status'], 'success')
+        self.assertEqual(result['message'], output.splitlines())
+
+    def test_nsf_convert_does_not_ignore_errors_in_logs(self):
+        output = 'Warning: Conversion is permanent.'
+        result = KeeperResponseParser.parse_response(
+            'nsf-convert record_uid --force',
+            output,
+            log_output='Conversion failed: Invalid owner key.',
+        )
+
+        self.assertEqual(result['status'], 'error')
+        self.assertEqual(result['status_code'], 400)
+
+    def test_nsf_convert_success_in_logs_is_http_success(self):
+        result = KeeperResponseParser.parse_response(
+            'nsf-convert record_uid --force',
+            'Warning: Conversion is permanent.\nDestination: Vault (root)',
+            log_output=(
+                'Classic record "record_uid" converted to a Nested Share Record.\n'
+                'Conversion complete: 1 of 1 Classic record(s) converted.'
+            ),
+        )
+
+        self.assertEqual(result['status'], 'success')
+        self.assertNotIn('status_code', result)
+
+    def test_nsf_convert_backend_failures_keep_failure_status(self):
+        result = KeeperResponseParser.parse_response(
+            'nsf-convert record_uid --force',
+            'Warning: Conversion is permanent.',
+            log_output=(
+                'Classic record "record_uid" was not converted: '
+                'The caller does not own this record.'
+            ),
+        )
+
+        self.assertEqual(result['status'], 'warning')
+        self.assertEqual(result['status_code'], 400)
+
+    def test_nsf_convert_mixed_results_are_partial_success(self):
+        result = KeeperResponseParser.parse_response(
+            'nsf-convert record_uid_1 record_uid_2 --force',
+            'Warning: Conversion is permanent.',
+            log_output=(
+                'Classic record "record_uid_1" converted to a Nested Share Record.\n'
+                'Classic record "record_uid_2" was not converted: '
+                'The caller does not own this record.'
+            ),
+        )
+
+        self.assertEqual(result['status'], 'partial_success')
+        self.assertEqual(result['status_code'], 207)
+
+    def test_nsf_convert_other_warnings_remain_warnings(self):
+        result = KeeperResponseParser.parse_response(
+            'nsf-convert record_uid --force',
+            'Warning: Conversion is permanent.\nWarning: Server reported a partial result.',
+        )
+
+        self.assertEqual(result['status'], 'warning')
+        self.assertEqual(result['status_code'], 400)
+
+    def test_nsf_convert_errors_are_not_hidden_by_permanent_notice(self):
+        result = KeeperResponseParser.parse_response(
+            'nsf-convert record_uid --force',
+            'Warning: Conversion is permanent. Conversion failed: Invalid owner key.',
+        )
+
+        self.assertEqual(result['status'], 'error')
+        self.assertEqual(result['status_code'], 400)
+
+    def test_parse_mkdir_command(self):
+        """Test parsing of 'mkdir' command output"""
+
+        result = KeeperResponseParser._parse_mkdir_command('b4pBzT1WowoUXHk_US0SCg')
+        self.assertEqual(result['data']['folder_uid'], 'b4pBzT1WowoUXHk_US0SCg')
+          
+        result = KeeperResponseParser._parse_mkdir_command('Created folder with folder_uid=b4pBzT1WowoUXHk_US0SCg')
+        self.assertEqual(result['data']['folder_uid'], 'b4pBzT1WowoUXHk_US0SCg')
+
+    def test_parse_record_add_command_two_line_output(self):
+        """record-add --self-destruct returns record_uid on line 1 and share_url on line 2"""
+        record_uid = 'riK9X5/XcxGPWRYM2Be1Ow=='
+        share_url = 'https://keepersecurity.com/vault/share#abc123'
+        response = f'{record_uid}\n{share_url}'
+
+        result = KeeperResponseParser._parse_record_add_command(response)
+        self.assertEqual(result['data']['record_uid'], record_uid)
+        self.assertEqual(result['data']['share_url'], share_url)
+
+    def test_parse_record_add_command_json_format(self):
+        """record-add --format=json is parsed as structured JSON"""
+        record_uid = 'riK9X5/XcxGPWRYM2Be1Ow=='
+        share_url = 'https://keepersecurity.com/vault/share#abc123'
+        response = json.dumps({'record_uid': record_uid, 'share_url': share_url})
+
+        result = KeeperResponseParser.parse_response(
+            'record-add --self-destruct 2mi --format=json',
+            response,
+        )
+        self.assertEqual(result['status'], 'success')
+        self.assertEqual(result['data']['record_uid'], record_uid)
+        self.assertEqual(result['data']['share_url'], share_url)
+
+    def test_parse_record_add_command_uid_only(self):
+        """Normal record-add returns bare record_uid"""
+        record_uid = 'riK9X5/XcxGPWRYM2Be1Ow=='
+        result = KeeperResponseParser._parse_record_add_command(record_uid)
+        self.assertEqual(result['data']['record_uid'], record_uid)
+
+    def test_parse_get_command(self):
+        """Test parsing of 'get' command output"""
+        sample_output = """Title: Test Record
+Username: testuser
+Password: testpass
+URL: https://example.com"""
+          
+        result = KeeperResponseParser._parse_get_command(sample_output)
+          
+        self.assertEqual(result['status'], 'success')
+        self.assertEqual(result['command'], 'get')
+        self.assertEqual(result['data']['title'], 'Test Record')
+        self.assertEqual(result['data']['username'], 'testuser')
+        self.assertEqual(result['data']['password'], 'testpass')
+        self.assertEqual(result['data']['url'], 'https://example.com')
+
+    def test_parse_pam_project_export_returns_json_data(self):
+        """'pam project export' output is parsed into structured data, including aliases"""
+        payload = {"pam_configuration": {"title": "cfg"}, "pam_data": {"resources": [{"host": "db"}]}}
+        for command in ('pam project export -p UID', 'pam p export --project-uid UID'):
+            result = KeeperResponseParser.parse_response(command, json.dumps(payload, indent=2))
+            self.assertEqual(result['status'], 'success')
+            self.assertEqual(result['command'], 'pam project export')
+            self.assertEqual(result['data'], payload)
+
+    def test_parse_pam_project_export_non_json(self):
+        result = KeeperResponseParser.parse_response('pam project export -p UID', 'not json')
+        self.assertEqual(result['status'], 'error')

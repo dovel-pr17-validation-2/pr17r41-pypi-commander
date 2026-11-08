@@ -1,0 +1,1455 @@
+#  _  __
+# | |/ /___ ___ _ __  ___ _ _ ®
+# | ' </ -_) -_) '_ \/ -_) '_|
+# |_|\_\___\___| .__/\___|_|
+#              |_|
+#
+# Keeper Commander
+# Copyright 2024 Keeper Security Inc.
+# Contact: ops@keepersecurity.com
+#
+
+from typing import Any, Dict, List, Optional, Tuple
+import re, json
+
+from .throttle import RESULT_THROTTLED, clean_throttle_message, is_throttle_text
+
+class KeeperResponseParser:
+    @staticmethod
+    def _clean_ansi_codes(text: str) -> str:
+        """Remove ANSI escape codes from text."""
+        if not text:
+            return text
+        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        return ansi_escape.sub('', text)
+    
+    @staticmethod
+    def _format_multiline_message(text: str) -> str:
+        """Format multi-line text for better JSON readability."""
+        if not text:
+            return text
+        
+        # Check if the text has multiple lines
+        if '\n' in text:
+            # Split into lines and return as array for better structure
+            lines = [line.strip() for line in text.split('\n') if line.strip()]
+            return lines
+        
+        return text
+    
+    @staticmethod
+    def _preprocess_response(response: Any, log_output: str = None) -> Tuple[str, bool]:
+        """Preprocess response by cleaning ANSI codes and determining source.
+        
+        Returns:
+            tuple: (cleaned_response_str, is_from_log_output)
+        """
+        # Priority: use log_output if no regular response OR if response is empty/whitespace
+        if isinstance(response, dict):
+            response_str = json.dumps(response)
+        else:
+            response_str = str(response).strip() if response else ""
+        log_str = log_output.strip() if log_output else ""
+        
+        # Use log_output if response is empty/whitespace but log_output has content
+        if (not response_str and log_str):
+            response_str = log_str
+            is_from_log = True
+        elif response_str:
+            is_from_log = False
+        else:
+            return "", False
+            
+        # Clean ANSI codes once
+        cleaned_response = KeeperResponseParser._clean_ansi_codes(response_str)
+        return cleaned_response, is_from_log
+    
+    @staticmethod
+    def _find_parser_method(command: str) -> str:
+        """Find the appropriate parser method for a command.
+        
+        Returns:
+            str: Method name to call for parsing
+        """
+        if KeeperResponseParser._is_pam_project_export(command):
+            return '_parse_pam_project_export_command'
+
+        # Check for JSON format first (highest priority)
+        if '--format=json' in command or '--format json' in command:
+            return '_parse_json_format_command'
+
+        # Check for other substring matches
+        substring_patterns = {
+            'pam project import': '_parse_pam_project_import_command',
+            'enterprise-push': '_parse_enterprise_push_command',
+            'search record': '_parse_search_record_command',
+            'search folder': '_parse_search_folder_command',
+            'policy add': '_parse_epm_policy_add_command',
+        }
+        
+        for pattern, method_name in substring_patterns.items():
+            if pattern in command:
+                return method_name
+
+        if command.split(maxsplit=1)[:1] == ['nsf-convert']:
+            return '_parse_nsf_convert_command'
+        
+        # Check for exact command start matches
+        exact_patterns = {
+            'generate': '_parse_generate_command',
+            'ls': '_parse_ls_command',
+            'tree': '_parse_tree_command',
+            'whoami': '_parse_whoami_command',
+            'this-device': '_parse_this_device_command',
+            'mkdir': '_parse_mkdir_command',
+            'record-add': '_parse_record_add_command',
+            'get': '_parse_get_command',
+            'download': '_parse_get_command',
+            'nsf-mkdir': '_parse_nsf_mkdir_command',
+            'nsf-rmdir': '_parse_nsf_rmdir_command',
+            'nsf-rndir': '_parse_nsf_rndir_command',
+        }
+
+        for pattern, method_name in exact_patterns.items():
+            if command.startswith(pattern):
+                return method_name
+        
+        # Default to logging-based parsing
+        return '_parse_logging_based_command'
+    
+    @staticmethod
+    def parse_response(command: str, response: Any, log_output: str = None) -> Dict[str, Any]:
+        """
+        Main parser that routes to specific command parsers based on the command type.
+
+        Args:
+            command (str): The executed command
+            response (Any): Response from the keeper commander
+            log_output (str, optional): Captured log output from command execution
+
+        Returns:
+            Dict[str, Any]: Structured JSON response
+        """
+        if isinstance(response, dict) and 'status' not in response:
+            base_cmd = ' '.join(command.split()[:2]) if len(command.split()) >= 2 else command.split()[0]
+            return {
+                "status": "success",
+                "command": base_cmd,
+                "data": response,
+            }
+        # Preprocess response once
+        response_str, is_from_log = KeeperResponseParser._preprocess_response(response, log_output)
+
+        # Handle completely empty responses
+        if not response_str:
+            return KeeperResponseParser._handle_empty_response(command)
+
+        # Find the appropriate parser method (used for both log and non-log paths)
+        parser_method_name = KeeperResponseParser._find_parser_method(command)
+
+        if parser_method_name == '_parse_nsf_convert_command':
+            return KeeperResponseParser._parse_nsf_convert_command(
+                command, response_str, None if is_from_log else log_output
+            )
+
+        parser_method = getattr(KeeperResponseParser, parser_method_name)
+
+        # Call the parser method with appropriate arguments
+        if parser_method_name in ['_parse_generate_command', '_parse_json_format_command',
+                                '_parse_pam_project_import_command', '_parse_pam_project_export_command',
+                                '_parse_enterprise_push_command', '_parse_epm_policy_add_command']:
+            return parser_method(command, response_str)
+        elif parser_method_name in ['_parse_nsf_mkdir_command', '_parse_nsf_rmdir_command', '_parse_nsf_rndir_command']:
+            return parser_method(response_str, parser_method_name.replace('_parse_', '').replace('_command', ''))
+        else:
+            return parser_method(response_str) if parser_method_name != '_parse_logging_based_command' else parser_method(command, response_str)
+
+    @staticmethod
+    def _parse_ls_command(response: str) -> Dict[str, Any]:
+        """Parse 'ls' command output into structured format."""
+        result = {
+            "status": "success",
+            "command": "ls",
+            "data": {
+                "folders": [],
+                "records": []
+            }
+        }
+
+        if "# Folder UID" in response or "# Record UID" in response:
+            sections = re.split(r'(?=#\s+(?:Folder|Record))', response)
+            
+            for section in sections:
+                if not section.strip():
+                    continue
+                    
+                lines = section.strip().split("\n")
+                
+                if "Folder UID" in lines[0]:
+                    data_lines = [line for line in lines if re.match(r'\s*\d+\s+', line)]
+                    for line in data_lines:
+                        match = re.match(r'\s*(\d+)\s+(\S+)\s+(.+?)\s+(\S+)\s*$', line)
+                        if match:
+                            result["data"]["folders"].append({
+                                "number": int(match.group(1)),
+                                "name": match.group(3).strip(),
+                            })
+                
+                elif "Record UID" in lines[0]:
+                    data_lines = [line for line in lines if re.match(r'\s*\d+\s+', line)]
+                    for line in data_lines:
+                        match = re.match(r'\s*(\d+)\s+(\S+)\s+(\S*)\s+([^@]+?)(?:\s{2,}(.+))?$', line)
+                        if match:
+                            record = {
+                                "number": int(match.group(1)),
+                                "title": match.group(4).strip()
+                            }
+                            if match.group(5):
+                                record["description"] = match.group(5).strip()
+                            result["data"]["records"].append(record)
+        else:
+            # Handle simple format (just names)
+            lines = response.strip().split('\n')
+            folder_count = 0
+            record_count = 0
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                if line.endswith('/'):
+                    folder_count += 1
+                    result["data"]["folders"].append({
+                        "number": folder_count,
+                        "name": line[:-1],  # Remove trailing slash
+                    })
+                else:
+                    record_count += 1
+                    result["data"]["records"].append({
+                        "number": record_count,
+                        "title": line
+                    })
+
+        return result
+
+    @staticmethod
+    def _parse_share_bracket_list(
+        bracket_blob: str, target_key: str = "username"
+    ) -> List[Dict[str, Any]]:
+        """Parse comma-separated [target:perm1,perm2] segments from tree share lines."""
+        entries: List[Dict[str, Any]] = []
+        if not bracket_blob or not bracket_blob.strip():
+            return entries
+        for target, perms_str in re.findall(r'\[([^:]+):([^\]]+)\]', bracket_blob):
+            codes = [p.strip() for p in perms_str.split(',') if p.strip()]
+            entries.append({
+                target_key: target.strip(),
+                "permissions": ",".join(codes),
+            })
+        return entries
+
+    @staticmethod
+    def _parse_tree_share_permissions(name: str) -> Optional[Dict[str, Any]]:
+        """
+        Parse shared-folder permission suffix from ASCII tree (service ``tree``).
+
+        Emits ``{"default": "...", "teams"?: ..., "users"?: ...}`` — no ``user``
+        field. ``tree --format=json`` uses ``_parse_json_format_command`` instead.
+        """
+        m = re.search(
+            r'\(default:([^;]+)(?:; user:([^;]+))?(?:; teams:([^;]+))?(?:; users:([^)]+))?\)',
+            name,
+        )
+        if not m:
+            return None
+
+        default_val = m.group(1).strip()
+        teams_seg = (m.group(3) or "").strip()
+        users_seg = (m.group(4) or "").strip()
+
+        share_permissions: Dict[str, Any] = {
+            "default": default_val,
+        }
+        if teams_seg:
+            share_permissions["teams"] = KeeperResponseParser._parse_share_bracket_list(
+                teams_seg, target_key="name"
+            )
+        if users_seg:
+            share_permissions["users"] = KeeperResponseParser._parse_share_bracket_list(
+                users_seg, target_key="username"
+            )
+        return share_permissions
+
+    @staticmethod
+    def _extract_tree_uid(name: str) -> Optional[str]:
+        """Return verbose-mode UID paren; ignore share-permission suffixes."""
+        share_prefixes = (
+            'default:', 'user:', 'users:', 'teams:', 'folders:',
+            'applications:', 'shared:',
+        )
+        for m in re.finditer(r'\(([^)]+)\)', name):
+            inner = m.group(1).strip()
+            if any(inner.startswith(p) for p in share_prefixes):
+                continue
+            return inner
+        return None
+
+    @staticmethod
+    def _parse_tree_command(response: str) -> Dict[str, Any]:
+        """Parse ASCII ``tree`` into the legacy service-mode flat structure.
+
+        Distinct from ``tree --format=json`` (``_parse_json_format_command``).
+        """
+        result = {
+            "status": "success",
+            "command": "tree",
+            "data": {
+                "tree": [],
+                "share_permissions_key": None
+            }
+        }
+        
+        lines = response.strip().split("\n")
+        current_path = []
+        
+        # Check if this has share permissions key
+        if "Share Permissions Key:" in response:
+            # Extract share permissions key
+            key_lines = []
+            tree_start_idx = 0
+            
+            for i, line in enumerate(lines):
+                if "Share Permissions Key:" in line:
+                    # Find the key section
+                    j = i
+                    while j < len(lines) and not (line.strip() and " ├── " in lines[j] or " └── " in lines[j] or lines[j].strip() == "My Vault"):
+                        if lines[j].strip() and not lines[j].startswith("="):
+                            if "=" in lines[j] and lines[j].strip() != "Share Permissions Key:":
+                                key_lines.append(lines[j].strip())
+                        j += 1
+                    tree_start_idx = j
+                    break
+            
+            if key_lines:
+                result["data"]["share_permissions_key"] = key_lines
+            
+            # Use only the tree part
+            lines = lines[tree_start_idx:]
+        
+        for line in lines:
+            if not line.strip():
+                continue
+            
+            # Skip the root "My Vault" line
+            if line.strip() == "My Vault":
+                continue
+            
+            # Skip share permission lines
+            if any(perm in line for perm in ["Share Permissions Key:", "=======", "RO =", "MU =", "MR =", "CE =", "CS ="]):
+                continue
+                
+            # Calculate level based on tree characters
+            cleaned_line = line
+            level = 0
+            
+            # Count tree depth by looking for tree characters
+            while True:
+                if cleaned_line.startswith(" │   "):
+                    level += 1
+                    cleaned_line = cleaned_line[4:]
+                elif cleaned_line.startswith(" ├── "):
+                    cleaned_line = cleaned_line[5:]
+                    break
+                elif cleaned_line.startswith(" └── "):
+                    cleaned_line = cleaned_line[5:]
+                    break
+                elif cleaned_line.startswith("    "):
+                    level += 1
+                    cleaned_line = cleaned_line[4:]
+                else:
+                    break
+            
+            # Parse the cleaned line
+            name = cleaned_line.strip()
+            if not name:
+                continue
+                
+            is_record = '[Record]' in name or '[Nested Record]' in name
+            is_shared = '[SHARED]' in name
+            
+            uid = KeeperResponseParser._extract_tree_uid(name)
+            
+            # Extract share permissions if present (for -s flag)
+            share_permissions = (
+                KeeperResponseParser._parse_tree_share_permissions(name) if is_shared else None
+            )
+            
+            # Clean the name from indicators / share suffixes / record type tags
+            clean_name = name
+            clean_name = re.sub(
+                r' \((?:default|user|users|teams|folders|applications|shared):[^)]*\)',
+                '',
+                clean_name,
+            )
+            clean_name = re.sub(r' \([^)]*\) \[SHARED\]', '', clean_name)
+            clean_name = re.sub(r' \([^)]*\)(?= \[)', '', clean_name)  # UID before [tag]
+            clean_name = re.sub(r' \([^)]+\)$', '', clean_name)  # trailing UID
+            for tag in (
+                ' [Nested Share Folder]', ' [Nested Record]', ' [Record]', ' [SHARED]',
+            ):
+                clean_name = clean_name.replace(tag, '')
+            clean_name = re.sub(r' \[[A-Za-z0-9_]+\]', '', clean_name)  # [login], etc.
+            clean_name = clean_name.strip()
+            
+            # Determine type
+            item_type = "record" if is_record else "folder"
+            
+            # Build path
+            while len(current_path) > level:
+                current_path.pop()
+            
+            if len(current_path) == level:
+                current_path.append(clean_name)
+            else:
+                current_path = current_path[:level] + [clean_name]
+            
+            # Create item structure
+            item = {
+                "name": clean_name,
+                "type": item_type,
+                "level": level,
+                "path": "/".join(current_path),
+                "shared": is_shared
+            }
+            
+            # Add optional fields
+            if uid:
+                item["uid"] = uid
+            if share_permissions:
+                item["share_permissions"] = share_permissions
+            
+            result["data"]["tree"].append(item)
+        
+        return result
+
+    @staticmethod
+    def _parse_whoami_command(response: str) -> Dict[str, Any]:
+        """Parse 'whoami' command output into structured format."""
+        result = {
+            "status": "success",
+            "command": "whoami",
+            "data": {}
+        }
+        
+        if "Not logged in" in response:
+            result["data"]["logged_in"] = False
+            result["data"]["message"] = "Not logged in"
+            return result
+        
+        result["data"]["logged_in"] = True
+        
+        # Parse each line of the whoami output
+        for line in response.strip().split("\n"):
+            line = line.strip()
+            if not line or line == "":
+                continue
+                
+            if ":" in line:
+                # Split on first colon only
+                key, value = line.split(":", 1)
+                key = key.strip()
+                value = value.strip()
+                
+                # Convert key to snake_case and normalize
+                key_normalized = key.lower().replace(" ", "_").replace("&", "and")
+                
+                # Handle special cases
+                if key_normalized == "user":
+                    result["data"]["user"] = value
+                elif key_normalized == "server":
+                    result["data"]["server"] = value
+                elif key_normalized == "data_center":
+                    result["data"]["data_center"] = value
+                elif key_normalized == "environment":
+                    result["data"]["environment"] = value
+                elif key_normalized == "admin":
+                    result["data"]["admin"] = value.lower() == "yes"
+                elif key_normalized == "account_type":
+                    result["data"]["account_type"] = value
+                elif key_normalized == "renewal_date":
+                    result["data"]["renewal_date"] = value
+                elif key_normalized == "storage_capacity":
+                    result["data"]["storage_capacity"] = value
+                elif key_normalized == "usage":
+                    result["data"]["storage_usage"] = value
+                elif key_normalized == "storage_renewal_date":
+                    result["data"]["storage_renewal_date"] = value
+                elif key_normalized == "breachwatch":
+                    result["data"]["breachwatch"] = value.lower() == "yes"
+                elif key_normalized == "reporting_and_alerts":
+                    result["data"]["reporting_and_alerts"] = value.lower() == "yes"
+                elif key_normalized == "records":
+                    try:
+                        result["data"]["records_count"] = int(value)
+                    except ValueError:
+                        result["data"]["records_count"] = value
+                elif key_normalized == "shared_folders":
+                    try:
+                        result["data"]["shared_folders_count"] = int(value)
+                    except ValueError:
+                        result["data"]["shared_folders_count"] = value
+                elif key_normalized == "teams":
+                    try:
+                        result["data"]["teams_count"] = int(value)
+                    except ValueError:
+                        result["data"]["teams_count"] = value
+                elif key_normalized == "base_plan":
+                    result["data"]["base_plan"] = value
+                elif key_normalized == "expires":
+                    result["data"]["license_expires"] = value
+                elif key_normalized == "user_licenses":
+                    result["data"]["user_licenses"] = value
+                elif key_normalized == "secure_file_storage":
+                    result["data"]["secure_file_storage"] = value
+                elif "secure_add_ons" in key_normalized or key_normalized == "":
+                    # Handle add-ons (multiple lines with same key or empty key)
+                    if "add_ons" not in result["data"]:
+                        result["data"]["add_ons"] = []
+                    if value:  # Only add non-empty values
+                        result["data"]["add_ons"].append(value)
+                else:
+                    # Generic handling for other fields
+                    result["data"][key_normalized] = value
+        
+        return result
+
+    @staticmethod
+    def _parse_this_device_command(response: str) -> Dict[str, Any]:
+        """Parse 'this-device' command output into structured format."""
+        result = {
+            "status": "success",
+            "command": "this-device",
+            "data": {}
+        }
+        
+        # Parse each line of the this-device output
+        for line in response.strip().split("\n"):
+            line = line.strip()
+            if not line or line == "":
+                continue
+                
+            if ":" in line:
+                # Split on first colon only
+                key, value = line.split(":", 1)
+                key = key.strip()
+                value = value.strip()
+                
+                # Convert key to snake_case and normalize
+                key_normalized = key.lower().replace(" ", "_").replace("-", "_")
+                
+                # Handle special cases and convert values
+                if key_normalized == "device_name":
+                    result["data"]["device_name"] = value
+                elif key_normalized == "data_key_present":
+                    result["data"]["data_key_present"] = value.upper() == "YES"
+                elif key_normalized == "ip_auto_approve":
+                    result["data"]["ip_auto_approve"] = value.upper() == "ON"
+                elif key_normalized == "persistent_login":
+                    result["data"]["persistent_login"] = value.upper() == "ON"
+                elif key_normalized == "security_key_no_pin":
+                    result["data"]["security_key_no_pin"] = value.upper() == "ON"
+                elif key_normalized == "device_logout_timeout":
+                    result["data"]["device_logout_timeout"] = value
+                elif key_normalized == "is_sso_user":
+                    result["data"]["is_sso_user"] = value.lower() == "true"
+                else:
+                    # Generic handling for other fields
+                    result["data"][key_normalized] = value
+            elif "Available sub-commands:" in line:
+                # Extract sub-commands
+                sub_commands = line.split("Available sub-commands:")[1].strip()
+                if sub_commands:
+                    result["data"]["available_sub_commands"] = [cmd.strip() for cmd in sub_commands.split(",")]
+        
+        return result
+
+    @staticmethod
+    def _parse_nsf_mkdir_command(response: str, command_name: str) -> Dict[str, Any]:
+        """Parse nsf-mkdir command output."""
+        return KeeperResponseParser._parse_nsf_folder_command(response, 'nsf-mkdir')
+
+    @staticmethod
+    def _parse_nsf_rmdir_command(response: str, command_name: str) -> Dict[str, Any]:
+        """Parse nsf-rmdir command output."""
+        return KeeperResponseParser._parse_nsf_folder_command(response, 'nsf-rmdir')
+
+    @staticmethod
+    def _parse_nsf_rndir_command(response: str, command_name: str) -> Dict[str, Any]:
+        """Parse nsf-rndir command output."""
+        return KeeperResponseParser._parse_nsf_folder_command(response, 'nsf-rndir')
+
+    @staticmethod
+    def _parse_nsf_folder_command(response: str, command_name: str) -> Dict[str, Any]:
+        """Parse NSF folder commands (nsf-mkdir, nsf-rmdir, nsf-rndir) to extract folder UID.
+
+        NSF commands return the folder UID directly from the API result, immune to concurrent log noise.
+        Extract UID directly and populate both data.folder_uid and top-level message field.
+        """
+        response_str = response.strip()
+        lines = [ln.strip() for ln in response_str.split('\n') if ln.strip()]
+
+        result = {
+            "status": "success",
+            "command": command_name,
+            "data": None
+        }
+
+        for line in lines:
+            try:
+                data = json.loads(line)
+                if isinstance(data, dict) and 'folder_uid' in data:
+                    folder_uid = data["folder_uid"]
+                    result["data"] = {
+                        "folder_uid": folder_uid,
+                        "path": data.get("path"),
+                        "name": data.get("name")
+                    }
+                    result["message"] = folder_uid
+                    return result
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        last_line = lines[-1] if lines else response_str
+        if re.match(r'^[a-zA-Z0-9_+/=-]+$', last_line):
+            result["data"] = {
+                "folder_uid": last_line
+            }
+            result["message"] = last_line
+        else:
+            uid_match = re.search(r'folder_uid=([a-zA-Z0-9_+/=-]+)', last_line)
+            if uid_match:
+                folder_uid = uid_match.group(1)
+                result["data"] = {
+                    "folder_uid": folder_uid
+                }
+                result["message"] = folder_uid
+
+        return result
+
+    @staticmethod
+    def _parse_mkdir_command(response: str) -> Dict[str, Any]:
+        """Parse 'mkdir' command output to extract folder UID, path, and name."""
+        response_str = response.strip()
+        lines = [ln.strip() for ln in response_str.split('\n') if ln.strip()]
+
+        result = {
+            "status": "success",
+            "command": "mkdir",
+            "data": None
+        }
+
+        for line in lines:
+            try:
+                data = json.loads(line)
+                if isinstance(data, dict) and 'folder_uid' in data:
+                    folder_uid = data["folder_uid"]
+                    result["data"] = {
+                        "folder_uid": folder_uid,
+                        "path": data.get("path"),
+                        "name": data.get("name")
+                    }
+                    result["message"] = folder_uid
+                    return result
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        last_line = lines[-1] if lines else response_str
+        if re.match(r'^[a-zA-Z0-9_+/=-]+$', last_line):
+            result["data"] = {
+                "folder_uid": last_line
+            }
+            result["message"] = last_line
+        else:
+            uid_match = re.search(r'folder_uid=([a-zA-Z0-9_+/=-]+)', last_line)
+            if uid_match:
+                folder_uid = uid_match.group(1)
+                result["data"] = {
+                    "folder_uid": folder_uid
+                }
+                result["message"] = folder_uid
+
+        return result
+
+    @staticmethod
+    def _parse_record_add_command(response: str) -> Dict[str, Any]:
+        """Parse 'record-add' command output to extract record UID, share URL, or handle errors."""
+        response_str = response.strip()
+        
+        # Check for error messages first
+        response_lower = response_str.lower()
+        error_patterns = ["error", "failed", "invalid", "unrecognized"]
+        warning_patterns = ["already exists"]
+        
+        if any(pattern in response_lower for pattern in error_patterns):
+            return {
+                "status": "error",
+                "command": "record-add",
+                "error": response_str
+            }
+        elif any(pattern in response_lower for pattern in warning_patterns):
+            return {
+                "status": "warning",
+                "command": "record-add",
+                "message": response_str,
+                "data": None
+            }
+        
+        # Success case - check if it's a share URL (from --self-destruct)
+        result = {
+            "status": "success",
+            "command": "record-add",
+            "data": None
+        }
+
+        lines = [line.strip() for line in response_str.splitlines() if line.strip()]
+        if (len(lines) == 2 and lines[1].startswith('https://')
+                and '/vault/share' in lines[1]):
+            result["data"] = {
+                "record_uid": lines[0],
+                "share_url": lines[1]
+            }
+        # Check if response is a share URL only (legacy single-line output)
+        elif response_str.startswith('https://') and '/vault/share' in response_str:
+            result["data"] = {
+                "share_url": response_str
+            }
+        elif re.match(r'^[A-Za-z0-9_+/=-]+$', response_str):
+            result["data"] = {
+                "record_uid": response_str
+            }
+        else:
+            uid_match = re.search(r'record_uid=([a-zA-Z0-9_-]+)', response_str)
+            if uid_match:
+                result["data"] = {
+                    "record_uid": uid_match.group(1)
+                }
+        
+        return result
+
+    @staticmethod
+    def _parse_search_record_command(response: str) -> Dict[str, Any]:
+        """Parse 'search record' command output."""
+        result = {
+            "status": "success",
+            "command": "search record",
+            "data": []
+        }
+        
+        lines = response.strip().split("\n")
+        
+        data_lines = [line for line in lines[2:] if line.strip() and not line.startswith('---')]
+        
+        for line in data_lines:
+            match = re.match(r'\s*(\d+)\s+(\S+)\s+(\S*)\s+(.+?)\s{2,}(.+)?$', line)
+            if match:
+                record = {
+                    "number": int(match.group(1)),
+                    "uid": match.group(2),
+                    "type": match.group(3),
+                    "title": match.group(4).strip()
+                }
+                if match.group(5):
+                    record["description"] = match.group(5).strip()
+                result["data"].append(record)
+        
+        return result
+
+    @staticmethod
+    def _parse_search_folder_command(response: str) -> Dict[str, Any]:
+        """Parse 'search folder' command output."""
+        result = {
+            "status": "success",
+            "command": "search folder",
+            "data": []
+        }
+        
+        lines = response.strip().split("\n")
+        
+        data_lines = [line for line in lines[2:] if line.strip() and not line.startswith('---')]
+        
+        for line in data_lines:
+            match = re.match(r'\s*(\d+)\s+(\S+)\s+(.+)$', line)
+            if match:
+                folder = {
+                    "number": int(match.group(1)),
+                    "uid": match.group(2),
+                    "name": match.group(3).strip()
+                }
+                result["data"].append(folder)
+        
+        return result
+
+    @staticmethod
+    def _parse_get_command(response: str) -> Dict[str, Any]:
+        """Parse 'get' command output."""
+        result = {
+            "status": "success",
+            "command": "get",
+            "data": {}
+        }
+        
+        response_lines = response.strip().split("\n")
+        
+        # Handle special case for --format password (single line with just the password)
+        if len(response_lines) == 1 and ":" not in response_lines[0]:
+            # This is likely a password from --format password
+            password_line = response_lines[0].strip()
+            if password_line:
+                result["data"]["password"] = password_line
+                return result
+        
+        # Handle regular get command output with key-value pairs
+        for line in response_lines:
+            if ":" in line:
+                key, value = line.split(":", 1)
+                result["data"][key.strip().lower().replace(" ", "_")] = value.strip()
+                
+        return result
+    
+    @staticmethod
+    def _parse_pam_project_import_command(command: str, response: str) -> Dict[str, Any]:
+        """Parse 'pam project import' command output."""
+        result = {
+            "status": "success",
+            "command": "pam project import",
+            "data": {
+                "dry_run": "--dry-run" in command,
+                "messages": [],
+                "access_token": None,
+                "device_uid": None,
+                "shared_folder_resources_uid": None,
+                "shared_folder_users_uid": None,
+                "note": None,
+                "documentation_url": None
+            }
+        }
+        
+        lines = response.strip().split('\n')
+        
+        # Check if this is a dry run
+        if "[DRY RUN]" in response:
+            result["data"]["dry_run"] = True
+            # Extract dry run messages
+            for line in lines:
+                if line.strip() and not line.startswith('[DRY RUN COMPLETE]'):
+                    if line.startswith('[DRY RUN]'):
+                        result["data"]["messages"].append(line.strip())
+                    elif line.startswith('Will '):
+                        result["data"]["messages"].append(line.strip())
+                    elif 'Started parsing import data' in line or 'Will import file data here' in line:
+                        result["data"]["messages"].append(line.strip())
+        else:
+            # Parse actual execution output
+            json_start = -1
+            for i, line in enumerate(lines):
+                # Look for JSON output (starts with {)
+                if line.strip().startswith('{'):
+                    json_start = i
+                    break
+                elif line.strip():
+                    result["data"]["messages"].append(line.strip())
+            
+            # Extract JSON data if found
+            if json_start >= 0:
+                json_lines = []
+                brace_count = 0
+                for line in lines[json_start:]:
+                    json_lines.append(line)
+                    brace_count += line.count('{') - line.count('}')
+                    if brace_count == 0 and line.strip().endswith('}'):
+                        break
+                
+                json_text = '\n'.join(json_lines)
+                try:
+                    json_data = json.loads(json_text)
+                    result["data"]["access_token"] = json_data.get("access_token")
+                    result["data"]["device_uid"] = json_data.get("device_uid")
+                    result["data"]["shared_folder_resources_uid"] = json_data.get("shared_folder_resources_uid")
+                    result["data"]["shared_folder_users_uid"] = json_data.get("shared_folder_users_uid")
+                    result["data"]["note"] = json_data.get("note")
+                except json.JSONDecodeError:
+                    # If JSON parsing fails, add it as a message
+                    result["data"]["messages"].append(json_text)
+            
+            # Extract documentation URL
+            for line in lines:
+                if "https://docs.keeper.io" in line:
+                    result["data"]["documentation_url"] = line.split("https://docs.keeper.io")[1].strip()
+                    result["data"]["documentation_url"] = "https://docs.keeper.io" + result["data"]["documentation_url"]
+                    break
+        
+        return result
+    
+    @staticmethod
+    def _is_pam_project_export(command: str) -> bool:
+        """Whether command is 'pam project export' (alias-aware)."""
+        from .verified_command import Verifycommand
+        try:
+            tokens = Verifycommand.tokenize_service_command(command)
+        except ValueError:
+            return False
+        return Verifycommand._is_pam_project_export(tokens)
+
+    @staticmethod
+    def _parse_pam_project_export_command(command: str, response: str) -> Dict[str, Any]:
+        """Parse 'pam project export' output; the project JSON is returned in 'data'."""
+        result = {
+            "status": "success",
+            "command": "pam project export",
+            "data": None,
+        }
+        try:
+            result["data"] = json.loads(response)
+        except (TypeError, json.JSONDecodeError):
+            result["status"] = "error"
+            result["error"] = response.strip() or "Invalid JSON response"
+        return result
+
+    @staticmethod
+    def _parse_json_format_command(command: str, response: str) -> Dict[str, Any]:
+        """
+        Parse commands with --format=json flag into structured format.
+        
+        Args:
+            command (str): The executed command (e.g., 'audit-report --format=json')
+            response (str): JSON response string from the keeper commander
+            
+        Returns:
+            Dict[str, Any]: Structured response with standard format
+        """
+        # Export may have safe selector flags before the format flag
+        # (e.g. `export --owned-only --format=json`); keep its command name
+        # stable instead of returning the preceding options as the command.
+        from .command_util import is_pam_debug_dump_command
+        command_parts = command.split()
+        command_name = command_parts[:1]
+        if command_name and command_name[0].lower() == 'export':
+            base_command = 'export'
+        elif is_pam_debug_dump_command(command_parts):
+            base_command = 'pam action debug dump'
+        # Extract base command by removing --format=json or --format json
+        elif ' --format=json' in command:
+            base_command = command.split(' --format=json')[0]
+        elif ' --format json' in command:
+            base_command = command.split(' --format json')[0]
+        else:
+            base_command = command.split()[0] if command.split() else command
+        result = {
+            "status": "success",
+            "command": base_command,
+            "data": None
+        }
+
+        try:
+            parsed_data = json.loads(response)
+            result["data"] = parsed_data
+        
+        except TypeError:
+            result["data"] = response
+            
+        except json.JSONDecodeError:
+            result["status"] = "error"
+            result["error"] = "Invalid JSON response"
+            
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+            
+        finally:
+            return result
+
+    @staticmethod
+    def _parse_generate_command(command: str, response_str: str) -> Dict[str, Any]:
+        """Parse generate command output to extract password(s) and metadata."""
+        if not response_str:
+            return {
+                "status": "error",
+                "command": "generate",
+                "error": "Generate command produced no output"
+            }
+        
+        try:
+            # Check if it's JSON format output
+            if '--format=json' in command:
+                try:
+                    json_data = json.loads(response_str)
+                    return {
+                        "status": "success",
+                        "command": "generate",
+                        "message": "Password generated successfully",
+                        "data": json_data
+                    }
+                except json.JSONDecodeError:
+                    pass
+            
+            # Check if it's quiet mode (password only)
+            if '--quiet' in command or '--password-list' in command:
+                passwords = [line.strip() for line in response_str.split('\n') if line.strip()]
+                return {
+                    "status": "success",
+                    "command": "generate",
+                    "message": "Password generated successfully",
+                    "data": {
+                        "passwords": passwords,
+                        "count": len(passwords)
+                    }
+                }
+            
+            # Parse table format (default)
+            lines = response_str.split('\n')
+            passwords = []
+            
+            for line in lines:
+                line = line.strip()
+                if not line or 'Strength(%)' in line or 'BreachWatch' in line or 'Password' in line:
+                    continue
+                
+                # Parse table row: "1    100          Passed       Cr?i+RRaKeDjil8xe}tD"
+                parts = line.split()
+                if len(parts) >= 3:
+                    # Extract password (last part)
+                    password = parts[-1]
+                    
+                    # Extract strength (second part)
+                    try:
+                        strength = int(parts[1])
+                    except (ValueError, IndexError):
+                        strength = None
+                    
+                    # Extract breach watch status (third part if exists)
+                    breach_watch = None
+                    if len(parts) >= 4:
+                        breach_watch = parts[2] if parts[2] in ['Passed', 'Failed'] else None
+                    
+                    passwords.append({
+                        "password": password,
+                        "strength": strength,
+                        "breach_watch": breach_watch
+                    })
+            
+            if passwords:
+                return {
+                    "status": "success",
+                    "command": "generate",
+                    "message": "Password generated successfully",
+                    "data": {
+                        "passwords": passwords,
+                        "count": len(passwords)
+                    }
+                }
+            else:
+                # Fallback: return the raw response as the password
+                return {
+                    "status": "success",
+                    "command": "generate", 
+                    "message": "Password generated successfully",
+                    "data": {
+                        "passwords": [{"password": response_str.strip()}],
+                        "count": 1
+                    }
+                }
+                
+        except Exception as e:
+            # If parsing fails, return raw response
+            return {
+                "status": "success",
+                "command": "generate",
+                "message": "Password generated successfully",
+                "data": {
+                    "passwords": [{"password": response_str.strip()}],
+                    "count": 1,
+                    "raw_output": response_str
+                }
+            }
+
+    @staticmethod
+    def _handle_empty_response(command: str) -> Dict[str, Any]:
+        """Handle commands that produce no output but are successful."""
+        # These commands truly produce no output (no logs, no stdout) and should be treated as silent success
+        silent_success_commands = [
+            "sync-down", "logout", "keep-alive", "set", "record-update", "append-notes", "mv", "ln",
+            "nsf-rmdir"
+        ]
+
+        if any(cmd in command for cmd in silent_success_commands):
+            # Command-specific success messages for truly silent commands
+            if "sync-down" in command:
+                message = "Vault synchronized successfully"
+            elif "logout" in command:
+                message = "Logged out successfully"
+            elif "keep-alive" in command:
+                message = "Session kept alive successfully"
+            elif "set" in command:
+                message = "Configuration updated successfully"
+            elif "record-update" in command:
+                message = "Record updated successfully"
+            elif "append-notes" in command:
+                message = "Notes appended successfully"
+            elif "mv" in command:
+                message = "Item moved successfully"
+            elif "ln" in command:
+                message = "Link created successfully"
+            elif "nsf-rmdir" in command:
+                message = "Folder removed successfully"
+            else:
+                message = "Command executed successfully"
+
+            return {
+                "status": "success",
+                "command": command.split()[0] if command.split() else command,
+                "message": message,
+                "data": None
+            }
+        else:
+            return {
+                "status": "success",
+                "command": command.split()[0] if command.split() else command,
+                "message": "Command executed successfully but produced no output",
+                "data": None
+            }
+
+    @staticmethod
+    def _parse_epm_policy_add_command(command: str, response_str: str) -> Dict[str, Any]:
+        """Parse 'epm policy add' command output to extract policy ID and name."""
+        response_str = KeeperResponseParser._filter_login_messages(response_str.strip())
+
+        result = {
+            "status": "success",
+            "command": "epm policy add",
+            "message": response_str,
+            "data": {}
+        }
+
+        policy_match = re.search(
+            r'Successfully created policy "([^"]*)" with Policy ID:\s*(\S+)',
+            response_str
+        )
+        if policy_match:
+            result["data"]["policy_name"] = policy_match.group(1)
+            result["data"]["policy_id"] = policy_match.group(2)
+        else:
+            response_lower = response_str.lower()
+            if any(kw in response_lower for kw in ["error", "failed", "not supported"]):
+                result["status"] = "error"
+                result["error"] = response_str
+                del result["data"]
+                del result["message"]
+
+        return result
+
+    @staticmethod
+    def _parse_enterprise_push_command(command: str, response_str: str) -> Dict[str, Any]:
+        """Parse enterprise-push command responses."""
+
+        if "Pushed" in response_str and "record(s)" in response_str:
+            # Extract the actual push message
+            lines = response_str.split('\n')
+            for line in lines:
+                if "Pushed" in line and "record(s)" in line:
+                    return {
+                        "status": "success",
+                        "command": "enterprise-push",
+                        "message": line.strip(),
+                        "data": None
+                    }
+        
+        # Fallback for other enterprise-push responses
+        return {
+            "status": "success",
+            "command": "enterprise-push", 
+            "message": response_str if response_str else "Records pushed successfully to specified users",
+            "data": None
+        }
+
+
+    @staticmethod
+    def _parse_logging_based_command(command: str, response_str: str) -> Dict[str, Any]:
+        """Parse commands that primarily use logging.info() for output."""
+        response_str = response_str.strip()
+        
+        # Filter out biometric and persistent login messages for cleaner API responses
+        response_str = KeeperResponseParser._filter_login_messages(response_str)
+        
+        # Determine status and status_code based on patterns
+        status = "success"
+        status_code = None  
+        
+        response_lower = response_str.lower()
+        
+        success_indicators = [
+            "created", "added", "removed", "updated", "deleted", 
+            "successfully", "completed", "done"
+        ]
+        
+        has_success_indicator = any(indicator in response_lower for indicator in success_indicators)
+
+        if is_throttle_text(response_str):
+            return {
+                "status": "error",
+                "status_code": 429,
+                "command": command.split()[0] if command.split() else command,
+                "error": clean_throttle_message(response_str),
+                "result_code": RESULT_THROTTLED,
+            }
+
+        forbidden_patterns = [
+            "not an msp administrator",
+            "permission denied",
+            "access denied",
+            "unauthorized access",
+            "forbidden",
+            "must be a root admin",
+            "admin privileges required",
+            "admin account required",
+            "insufficient privileges",
+            "not authorized",
+            "is restricted to",
+            "command is restricted"
+        ]
+        
+        conflict_patterns = [
+            "already a member",
+            "already exists",
+            "already in",
+            "already accepted",
+            "duplicate"
+        ]
+        
+        not_found_patterns = [
+            "could not be resolved",
+            "is not found",
+            "not found",
+            "does not exist",
+            "not a member of",
+            "cannot be found",
+            "cannot find"
+        ]
+        
+        bad_request_patterns = [
+            "invalid",
+            "not valid",
+            "not allowed",
+            "not unique",
+            "unrecognized",
+            "reserved",
+            "character",
+            "empty",
+            "cannot be",
+            "cannot assign",
+            "cannot move",
+            "cannot get",
+            "not integer",
+            "expects"
+        ]
+        
+        error_patterns = [
+            "error", "failed", "failure"
+        ]
+        
+        warning_patterns = ["warning:", "skipping"]
+        
+        has_forbidden = any(pattern in response_lower for pattern in forbidden_patterns)
+        has_not_found = any(pattern in response_lower for pattern in not_found_patterns)
+        has_conflict = any(pattern in response_lower for pattern in conflict_patterns)
+        has_bad_request = any(pattern in response_lower for pattern in bad_request_patterns)
+        has_error = any(pattern in response_lower for pattern in error_patterns)
+        has_warning = any(pattern in response_lower for pattern in warning_patterns)
+
+        # First-time share invite is success. Mixed multi-recipient output is
+        # only partially represented: throttle (above) and forbidden keep
+        # precedence over this short-circuit.
+        has_invitation = 'share invitation has been sent to' in response_lower
+        if has_invitation and not has_forbidden:
+            formatted_message = KeeperResponseParser._format_multiline_message(response_str)
+            return {
+                "status": "success",
+                "command": command.split()[0] if command.split() else command,
+                "message": formatted_message,
+                "data": None,
+            }
+        
+        if has_success_indicator and (has_not_found or has_bad_request or has_error):
+            return {
+                "status": "partial_success",
+                "status_code": 207,
+                "command": command.split()[0] if command.split() else command,
+                "message": response_str,
+                "data": None
+            }
+        
+        if has_forbidden:
+            return {
+                "status": "error",
+                "status_code": 403,
+                "command": command.split()[0] if command.split() else command,
+                "error": response_str
+            }
+        elif has_not_found:
+            return {
+                "status": "error",
+                "status_code": 500,
+                "command": command.split()[0] if command.split() else command,
+                "error": response_str
+            }
+        elif has_conflict:
+            return {
+                "status": "warning",
+                "status_code": 409,
+                "command": command.split()[0] if command.split() else command,
+                "message": response_str,
+                "data": None
+            }
+        elif has_bad_request:
+            return {
+                "status": "error",
+                "status_code": 400,
+                "command": command.split()[0] if command.split() else command,
+                "error": response_str
+            }
+        elif has_error:
+            return {
+                "status": "error",
+                "status_code": 500,
+                "command": command.split()[0] if command.split() else command,
+                "error": response_str
+            }
+        elif has_warning:
+            status = "warning"
+            status_code = 400  
+        
+        # Return the actual log message with proper formatting
+        if response_str:
+            formatted_message = KeeperResponseParser._format_multiline_message(response_str)
+            result = {
+                "status": status,
+                "command": command.split()[0] if command.split() else command,
+                "message": formatted_message,
+                "data": None
+            }
+            if status_code:
+                result["status_code"] = status_code
+            return result
+        else:
+            # No output after cleaning - use existing empty response handler
+            return KeeperResponseParser._handle_empty_response(command)
+
+    @staticmethod
+    def _parse_nsf_convert_command(
+        command: str, response_str: str, log_output: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Treat the permanent-conversion notice as informational, not a command failure."""
+        combined_response = response_str
+        if log_output:
+            cleaned_logs = KeeperResponseParser._clean_ansi_codes(log_output.strip())
+            if cleaned_logs and cleaned_logs not in combined_response:
+                combined_response = '\n'.join(filter(None, (combined_response, cleaned_logs)))
+
+        classification_response = re.sub(
+            r'(?im)^([ \t]*)warning:([ \t]*conversion is permanent)',
+            r'\1Notice:\2',
+            combined_response,
+        )
+        lowered_response = classification_response.lower()
+        has_conversion_failure = any(
+            phrase in lowered_response
+            for phrase in (
+                'was not converted',
+                'no conversion result was returned',
+                'no conversion results were returned',
+                'conversion result for classic record',
+                'conversion endpoint returned',
+            )
+        )
+        has_conversion_success = 'converted to a nested share record' in lowered_response
+        if has_conversion_failure:
+            return {
+                'status': 'partial_success' if has_conversion_success else 'warning',
+                'status_code': 207 if has_conversion_success else 400,
+                'command': command.split()[0] if command.split() else command,
+                'message': KeeperResponseParser._format_multiline_message(combined_response),
+                'data': None,
+            }
+
+        result = KeeperResponseParser._parse_logging_based_command(
+            command, classification_response
+        )
+
+        if result.get('status') == 'success':
+            result['message'] = KeeperResponseParser._format_multiline_message(combined_response)
+        elif 'error' in result:
+            result['error'] = combined_response
+        elif 'message' in result:
+            result['message'] = KeeperResponseParser._format_multiline_message(combined_response)
+
+        return result
+    
+    @staticmethod
+    def _filter_login_messages(response_str: str) -> str:
+        """Filter out biometric and persistent login messages from response."""
+        if not response_str:
+            return response_str
+        
+        # Common login messages to filter out
+        login_patterns = [
+            "Logging in to Keeper Commander",
+            "Successfully authenticated with Persistent Login",
+            "Successfully authenticated with Biometric Login",
+            "Attempting biometric authentication...",
+            "Press Ctrl+C to skip biometric and use default login method",
+            "Syncing...",
+            "Decrypted [",
+            "records that are affected by breaches",
+            "Use \"breachwatch list\" command"
+        ]
+        
+        lines = response_str.split('\n')
+        filtered_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Skip login-related lines
+            if any(pattern in line for pattern in login_patterns):
+                continue
+                
+            filtered_lines.append(line)
+        
+        return '\n'.join(filtered_lines)
+
+
+
+def ensure_record_add_json_format(command: str) -> str:
+    """Append ``--format=json`` for record-add when missing. Not applied to tree."""
+    if not command.strip().startswith('record-add'):
+        return command
+    if '--format=json' in command or '--format json' in command:
+        return command
+    return f'{command} --format=json'
+
+
+def parse_keeper_response(command: str, response: Any, log_output: str = None) -> Dict[str, Any]:
+    """
+    Main entry point for parsing Keeper Commander responses.
+    
+    Args:
+        command (str): The executed command
+        response (Any): Response from the keeper commander
+        log_output (str, optional): Captured log output from command execution
+        
+    Returns:
+        Dict[str, Any]: Structured JSON response
+    """
+    return KeeperResponseParser.parse_response(command, response, log_output)

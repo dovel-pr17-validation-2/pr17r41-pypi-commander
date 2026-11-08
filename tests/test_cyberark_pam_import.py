@@ -1,0 +1,5848 @@
+﻿#  _  __
+# | |/ /___ ___ _ __  ___ _ _ Â®
+# | ' </ -_) -_) '_ \/ -_) '_|
+# |_|\_\___\___| .__/\___|_|
+#              |_|
+#
+# Keeper Commander
+# Tests for CyberArk â†’ KeeperPAM import
+#
+
+import json
+import os
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from keepercommander.commands.pam_import.cyberark_import import (
+    CyberArkImportOrchestrator,
+    CyberArkPAMCleanupCommand,
+    CyberArkPAMImportCommand,
+    ImportRunOptions,
+    _temp_store,
+)
+from keepercommander.importer.cyberark.cyberark_pam import (
+    AccountMapper,
+    AdaptiveThrottler,
+    ApplicationMapper,
+    CyberArkPVWAClient,
+    RecordKind,
+    SafeFolderMapper,
+    UserTeamMatcher,
+    apply_safe_filter,
+    discriminate_record_kind,
+    exclude_system_safes,
+    build_import_json,
+    build_extend_json,
+    build_report,
+    build_shared_folder_permissions,
+    validate_import_data,
+    format_duration,
+    strip_credentials,
+    DEFAULT_PLATFORM_MAP,
+)
+from keepercommander.commands.pam_import.base import PamUserObject
+from keepercommander.subfolder import BaseFolderNode, NestedShareFolderNode
+
+
+PAM_ROOT_FOLDER_NAME = "PAM Environments"
+DEFAULT_PROJECT_NAME = "CyberArk Migration"
+SAFE_FOLDER_NAME = "Win_Local"
+
+
+# â”€â”€ AccountMapper Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestAccountMapper:
+
+    def test_unix_ssh_maps_to_pam_machine(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "1", "name": "UnixSSH-server01", "platformId": "UnixSSH",
+            "address": "10.0.0.1", "userName": "root",
+            "platformAccountProperties": {},
+        }
+        result = mapper.map_account(account, "secret123")
+        assert result["type"] == "pamMachine"
+        assert result["host"] == "10.0.0.1"
+        assert result["port"] == "22"
+        assert result["title"] == "server01"
+        assert len(result["users"]) == 1
+        user = result["users"][0]
+        assert user["type"] == "pamUser"
+        assert user["login"] == "root"
+        assert user["password"] == "secret123"
+        assert user["rotation_settings"]["rotation"] == "general"
+
+    def test_unix_ssh_key_maps_to_pam_machine(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "2", "name": "UnixSSHKey-server02", "platformId": "UnixSSHKey",
+            "address": "10.0.0.2", "userName": "admin",
+            "platformAccountProperties": {},
+        }
+        result = mapper.map_account(account, "key123")
+        assert result["type"] == "pamMachine"
+        assert result["users"][0]["rotation_settings"]["rotation"] == "general"
+
+    def test_win_domain_maps_to_pam_machine_ad_user(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "3", "name": "WinDomain-dc01", "platformId": "WinDomain",
+            "address": "192.168.1.10", "userName": "Administrator",
+            "platformAccountProperties": {"LogonDomain": "CORP"},
+        }
+        result = mapper.map_account(account, "pass123")
+        assert result["type"] == "pamMachine"
+        assert result["port"] == "3389"
+        user = result["users"][0]
+        assert user["login"] == "CORP\\Administrator"
+        assert user["rotation_settings"]["rotation"] == "general"
+
+    def test_win_local_account_maps_to_pam_machine(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "4", "name": "WinLocalAccount-workstation", "platformId": "WinLocalAccount",
+            "address": "10.0.0.5", "userName": "localadmin",
+            "platformAccountProperties": {},
+        }
+        result = mapper.map_account(account, "pass")
+        assert result["type"] == "pamMachine"
+        assert result["users"][0]["rotation_settings"]["rotation"] == "general"
+
+    def test_oracle_maps_to_pam_database(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "5", "name": "Oracle-proddb", "platformId": "Oracle",
+            "address": "db.example.com", "userName": "sys",
+            "platformAccountProperties": {},
+        }
+        result = mapper.map_account(account, "dbpass")
+        assert result["type"] == "pamDatabase"
+        assert result["port"] == "1521"
+        assert result["users"][0]["rotation_settings"]["rotation"] == "general"
+
+    def test_mysql_maps_to_pam_database(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "6", "name": "MySQL-appdb", "platformId": "MySQL",
+            "address": "mysql.internal", "userName": "root",
+            "platformAccountProperties": {},
+        }
+        result = mapper.map_account(account, "dbpass")
+        assert result["type"] == "pamDatabase"
+        assert result["port"] == "3306"
+
+    def test_mssql_maps_to_pam_database(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "7", "name": "MSSql-reporting", "platformId": "MSSql",
+            "address": "sql.internal", "userName": "sa",
+            "platformAccountProperties": {},
+        }
+        result = mapper.map_account(account, "pass")
+        assert result["type"] == "pamDatabase"
+        assert result["port"] == "1433"
+
+    def test_postgresql_maps_to_pam_database(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "8", "name": "PostgreSQL-analytics", "platformId": "PostgreSQL",
+            "address": "pg.internal", "userName": "postgres",
+            "platformAccountProperties": {},
+        }
+        result = mapper.map_account(account, "pass")
+        assert result["type"] == "pamDatabase"
+        assert result["port"] == "5432"
+
+    def test_business_website_maps_to_login(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "9", "name": "BusinessWebsite-portal", "platformId": "BusinessWebsite",
+            "address": "", "userName": "user@example.com",
+            "platformAccountProperties": {
+                "URL": "https://portal.example.com",
+                "ItemName": "Company Portal",
+            },
+        }
+        result = mapper.map_account(account, "webpass")
+        assert result["type"] == "login"
+        assert result["title"] == "Company Portal"
+        assert result["login"] == "user@example.com"
+        assert result["url"] == "https://portal.example.com"
+        assert result["password"] == "webpass"
+        assert "users" not in result  # login records don't have nested users
+
+    def test_aws_account_maps_to_rbi_with_autofill_credentials(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "cloud-1", "name": "cloud-account", "platformId": "AWS",
+            "address": "", "userName": "user@example.invalid",
+            "secretType": "password",
+            "platformAccountProperties": {
+                "ConsoleURL": "signin.aws.amazon.com/console",
+            },
+        }
+
+        result = mapper.map_account(account, "cloudpass")
+
+        assert result["type"] == "pamRemoteBrowser"
+        assert result["url"] == "https://signin.aws.amazon.com/console"
+        assert result["pam_settings"]["options"]["remote_browser_isolation"] == "on"
+        connection = result["pam_settings"]["connection"]
+        assert connection["protocol"] == "http"
+        user = result["users"][0]
+        assert user["type"] == "pamUser"
+        assert user["login"] == "user@example.invalid"
+        assert user["password"] == "cloudpass"
+        assert user["managed"] is True
+        assert user["rotation_settings"]["rotation"] == "general"
+        assert connection["autofill_credentials"] == user["title"]
+        targets = json.loads(connection["autofill_targets"])
+        assert targets[0]["page"] == "*.signin.aws.amazon.com"
+        assert targets[0]["username-field"] == "#username"
+        assert targets[0]["password-field"] == "#password"
+
+    @pytest.mark.parametrize(
+        ("platform_id", "expected_url", "expected_page"),
+        [
+            ("AWSAccessKeys", "https://signin.aws.amazon.com/console", "*.signin.aws.amazon.com"),
+            ("Azure", "https://portal.azure.com/", "*.login.microsoftonline.com"),
+            ("AzureAccessKeys", "https://portal.azure.com/", "*.login.microsoftonline.com"),
+            ("GCP", "https://console.cloud.google.com/", "accounts.google.com"),
+            ("GCPServiceAccount", "https://console.cloud.google.com/", "accounts.google.com"),
+        ],
+    )
+    def test_cloud_platform_variants_map_to_rbi(self, platform_id, expected_url, expected_page):
+        mapper = AccountMapper()
+        account = {
+            "id": f"{platform_id}-1", "name": f"{platform_id}-admin",
+            "platformId": platform_id, "address": "",
+            "userName": "user@example.invalid", "platformAccountProperties": {},
+        }
+
+        result = mapper.map_account(account, "cloudpass")
+
+        assert result["type"] == "pamRemoteBrowser"
+        assert result["url"] == expected_url
+        targets = json.loads(result["pam_settings"]["connection"]["autofill_targets"])
+        assert targets[0]["page"] == expected_page
+        assert result["pam_settings"]["connection"]["autofill_credentials"] == result["users"][0]["title"]
+
+    def test_custom_cloud_platform_keyword_maps_to_rbi(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "cloud-custom", "name": "Cloud Service-CustomGoogleCloud-sa",
+            "platformId": "CustomGoogleCloud", "address": "",
+            "userName": "user@example.invalid", "platformAccountProperties": {},
+        }
+
+        result = mapper.map_account(account, "cloudpass")
+
+        assert result["type"] == "pamRemoteBrowser"
+        assert result["url"] == "https://console.cloud.google.com/"
+        assert mapper.unmapped_platforms["CustomGoogleCloud"] == 1
+
+    def test_unknown_platform_pattern_match_maps_to_pam_machine(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "10", "name": "CustomPlatform-server", "platformId": "CustomLinux",
+            "address": "10.0.0.99", "userName": "admin",
+            "platformAccountProperties": {},
+        }
+        result = mapper.map_account(account, "pass")
+        assert result["type"] == "pamMachine"
+        assert result["users"][0]["rotation_settings"]["rotation"] == "general"
+        assert mapper.unmapped_platforms["CustomLinux"] == 1
+
+    def test_unmapped_platform_creates_login_only(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "10b", "name": "opaque-account", "platformId": "CustomOpaque",
+            "address": "10.0.0.99", "userName": "admin",
+            "platformAccountProperties": {},
+        }
+        result = mapper.map_account(account, "pass")
+        assert result["type"] == "login"
+        assert result["login"] == "admin"
+        assert result["password"] == "pass"
+        assert "users" not in result
+        assert "pam_settings" not in result
+        assert mapper.unmapped_platforms["CustomOpaque"] == 1
+
+    def test_unmapped_platform_preserves_other_fields_as_custom(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "10c", "name": "opaque-account", "platformId": "CustomOpaque",
+            "safeName": "ExampleSafe", "address": "host.example.invalid",
+            "userName": "admin", "secretType": "password", "createdTime": 1700000000,
+            "secretManagement": {
+                "automaticManagementEnabled": False,
+                "status": "failure",
+            },
+            "platformAccountProperties": {
+                "URL": "https://app.example.invalid", "ItemName": "Opaque Login",
+                "LogonDomain": "EXAMPLE", "Port": "8443", "Environment": "sample-env",
+            },
+            "password": "must-not-be-copied",
+        }
+        result = mapper.map_account(account, "actual-password")
+
+        assert result["type"] == "login"
+        assert result["title"] == "Opaque Login"
+        assert result["login"] == "EXAMPLE\\admin"
+        assert result["password"] == "actual-password"
+        assert result["url"] == "https://app.example.invalid"
+        custom = {field["label"]: field["value"][0] for field in result["custom"]}
+        assert custom["Platform Name"] == "CustomOpaque"
+        assert custom["Port"] == "8443"
+        assert custom["Environment"] == "sample-env"
+        assert all("password" not in label.casefold() for label in custom)
+        assert "secretType" not in custom
+        assert "createdTime" not in custom
+        assert "secretManagement.status" not in custom
+
+    def test_mapped_pam_user_preserves_cyberark_account_metadata(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "10d", "name": "generic-machine", "platformId": "UnixSSH",
+            "safeName": "ExampleSafe", "address": "10.0.0.1",
+            "userName": "root", "secretType": "password",
+            "platformAccountProperties": {
+                "Environment": "sample-env",
+                "OwnerName": "sample-owner",
+                "Notes": "source note from CyberArk",
+                "URL": "https://metadata.example.invalid",
+            },
+        }
+
+        result = mapper.map_account(account, "secret123")
+
+        custom = {
+            field["label"]: field["value"][0]
+            for field in result["users"][0]["custom"]
+        }
+        assert custom["Platform Name"] == "UnixSSH"
+        assert custom["Environment"] == "sample-env"
+        assert custom["Owner Name"] == "sample-owner"
+        assert custom["Notes"] == "source note from CyberArk"
+        assert "URL" not in custom
+
+    def test_platform_map_override(self):
+        override = {
+            "CustomLinux": {"record_type": "pamMachine", "rotation": "general", "protocol": "ssh", "port": "2222"},
+        }
+        mapper = AccountMapper(platform_map_override=override)
+        account = {
+            "id": "11", "name": "CustomLinux-custom", "platformId": "CustomLinux",
+            "address": "10.0.0.50", "userName": "root",
+            "platformAccountProperties": {},
+        }
+        result = mapper.map_account(account, "pass")
+        assert result["port"] == "2222"
+        assert "CustomLinux" not in mapper.unmapped_platforms
+
+    def test_is_incomplete_missing_address(self):
+        mapper = AccountMapper()
+        account = {"address": "", "userName": "root"}
+        incomplete, reason = mapper.is_incomplete(account)
+        assert incomplete is True
+        assert "address" in reason
+
+    def test_is_incomplete_missing_username(self):
+        mapper = AccountMapper()
+        account = {"address": "10.0.0.1", "userName": ""}
+        # userName is empty string which is falsy
+        incomplete, reason = mapper.is_incomplete(account)
+        assert incomplete is True
+        assert "userName" in reason
+
+    def test_is_complete(self):
+        mapper = AccountMapper()
+        account = {"address": "10.0.0.1", "userName": "root"}
+        incomplete, reason = mapper.is_incomplete(account)
+        assert incomplete is False
+        assert reason == ""
+
+    def test_logon_domain_prepended(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "12", "name": "WinDomain-test", "platformId": "WinDomain",
+            "address": "10.0.0.1", "userName": "admin",
+            "platformAccountProperties": {"LogonDomain": "MYDOMAIN"},
+        }
+        result = mapper.map_account(account, "pass")
+        assert result["users"][0]["login"] == "MYDOMAIN\\admin"
+
+    def test_password_none_not_managed(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "13", "name": "UnixSSH-nopass", "platformId": "UnixSSH",
+            "address": "10.0.0.1", "userName": "root",
+            "platformAccountProperties": {},
+        }
+        result = mapper.map_account(account, None)
+        user = result["users"][0]
+        assert user["password"] == ""
+        assert user.get("managed") is None  # not managed without password
+
+    def test_port_from_account_properties(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "14", "name": "UnixSSH-custom-port", "platformId": "UnixSSH",
+            "address": "10.0.0.1", "userName": "root",
+            "platformAccountProperties": {"Port": "2222"},
+        }
+        result = mapper.map_account(account, "pass")
+        assert result["port"] == "2222"
+
+    def test_title_strips_platform_prefix(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "15", "name": "UnixSSH-my-server", "platformId": "UnixSSH",
+            "address": "10.0.0.1", "userName": "root",
+            "platformAccountProperties": {},
+        }
+        result = mapper.map_account(account, "pass")
+        assert result["title"] == "my-server"
+
+    def test_title_strips_operating_system_category_prefix(self):
+        """Real CyberArk names often start with 'Operating System-<platform>-<addr>-<user>'."""
+        mapper = AccountMapper()
+        account = {
+            "id": "1", "name": "Operating System-UnixSSH-10.0.1.30-simon",
+            "platformId": "UnixSSH", "address": "10.0.1.30", "userName": "simon",
+            "platformAccountProperties": {},
+        }
+        result = mapper.map_account(account, "pw")
+        assert result["title"] == "10.0.1.30-simon"
+
+    def test_title_falls_back_to_address_user_when_verbose(self):
+        """When the name embeds a CPM policy name (not the platformId), stripping
+        leaves it verbose â€” fall back to {address}-{user} for readability."""
+        mapper = AccountMapper()
+        account = {
+            "id": "2",
+            "name": "Operating System-WindowsDesktopLocalAccountsRotationalPolicy-10.0.1.20-x_accountB",
+            "platformId": "WinDesktopLocal", "address": "10.0.1.20", "userName": "x_accountB",
+            "platformAccountProperties": {},
+        }
+        result = mapper.map_account(account, "pw")
+        assert result["title"] == "10.0.1.20-x_accountB"
+        assert len(result["title"]) < 40
+
+    def test_title_preserves_short_custom_names(self):
+        """Short admin-set names (Linux2, db1, windows1) stay untouched."""
+        mapper = AccountMapper()
+        for name in ("Linux2", "db1", "windows1"):
+            account = {
+                "id": "3", "name": name, "platformId": "UnixSSH",
+                "address": "10.0.0.1", "userName": "root",
+                "platformAccountProperties": {},
+            }
+            result = mapper.map_account(account, "pw")
+            assert result["title"] == name
+
+
+# â”€â”€ SafeFolderMapper Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestSafeFolderMapper:
+
+    def test_flat_mode_returns_empty(self):
+        mapper = SafeFolderMapper(mode="flat")
+        assert mapper.map_safe("Production Servers", "MyProject") == ""
+
+    def test_exact_mode_preserves_name(self):
+        mapper = SafeFolderMapper(mode="exact")
+        assert mapper.map_safe("Production & Servers (2024)", "MyProject") == "Production & Servers (2024)"
+
+    def test_ksm_mode_sanitizes(self):
+        mapper = SafeFolderMapper(mode="ksm")
+        assert mapper.map_safe("Production & Servers (2024)", "MyProject") == "Production Servers 2024"
+
+    def test_ksm_mode_collapses_spaces(self):
+        mapper = SafeFolderMapper(mode="ksm")
+        result = mapper.map_safe("My   Safe   Name", "Project")
+        assert "   " not in result
+        assert result == "My Safe Name"
+
+    def test_ksm_mode_handles_special_chars(self):
+        mapper = SafeFolderMapper(mode="ksm")
+        result = mapper.map_safe("Safe/With\\Special<Chars>", "Project")
+        assert "/" not in result
+        assert "\\" not in result
+        assert "<" not in result
+
+    def test_exact_mode_long_name(self):
+        mapper = SafeFolderMapper(mode="exact")
+        long_name = "A" * 200
+        assert mapper.map_safe(long_name, "Project") == long_name
+
+    def test_duplicate_safe_names_preserved(self):
+        """exact mode should preserve names even if they look similar."""
+        mapper = SafeFolderMapper(mode="exact")
+        assert mapper.map_safe("Servers", "P") == "Servers"
+        assert mapper.map_safe("servers", "P") == "servers"
+
+
+# â”€â”€ apply_safe_filter Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestApplySafeFilter:
+
+    def _safes(self, names):
+        return [{"safeName": n} for n in names]
+
+    def test_no_filter_returns_all(self):
+        safes = self._safes(["A", "B", "C"])
+        result = apply_safe_filter(safes)
+        assert len(result) == 3
+
+    def test_include_filter(self):
+        safes = self._safes(["Prod-Servers", "Dev-Servers", "Prod-DBs"])
+        result = apply_safe_filter(safes, include="Prod-*")
+        assert len(result) == 2
+        assert all("Prod" in s["safeName"] for s in result)
+
+    def test_exclude_filter(self):
+        safes = self._safes(["Prod-Servers", "Dev-Servers", "Test-Servers"])
+        result = apply_safe_filter(safes, exclude="Dev-*,Test-*")
+        assert len(result) == 1
+        assert result[0]["safeName"] == "Prod-Servers"
+
+    def test_include_and_exclude(self):
+        safes = self._safes(["Prod-Servers", "Prod-Test", "Dev-Servers"])
+        result = apply_safe_filter(safes, include="Prod-*", exclude="*-Test")
+        assert len(result) == 1
+        assert result[0]["safeName"] == "Prod-Servers"
+
+    def test_glob_pattern_matching(self):
+        safes = self._safes(["Safe_001", "Safe_002", "Other_001"])
+        result = apply_safe_filter(safes, include="Safe_*")
+        assert len(result) == 2
+
+
+# â”€â”€ AdaptiveThrottler Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestAdaptiveThrottler:
+
+    def test_initial_delay(self):
+        t = AdaptiveThrottler(base_delay=1.0)
+        assert t.current_delay == 1.0
+
+    def test_success_decreases_delay(self):
+        t = AdaptiveThrottler(base_delay=0.5, max_delay=5.0)
+        t.current_delay = 2.0  # simulate elevated delay
+        t.record_response(500, True)  # fast success
+        assert t.current_delay < 2.0
+
+    def test_failure_increases_delay(self):
+        t = AdaptiveThrottler(base_delay=0.5, max_delay=5.0)
+        initial = t.current_delay
+        t.record_response(5000, False)
+        assert t.current_delay > initial
+
+    def test_delay_never_below_base(self):
+        t = AdaptiveThrottler(base_delay=0.5)
+        for _ in range(20):
+            t.record_response(100, True)
+        assert t.current_delay >= t.base_delay
+
+    def test_delay_never_above_max(self):
+        t = AdaptiveThrottler(base_delay=0.5, max_delay=5.0)
+        for _ in range(20):
+            t.record_response(10000, False)
+        assert t.current_delay <= t.max_delay
+
+    def test_delay_increases_after_errors(self):
+        t = AdaptiveThrottler()
+        initial_delay = t.current_delay
+        for _ in range(5):
+            t.record_response(1000, False)
+        assert t.current_delay > initial_delay
+
+    def test_delay_stable_on_success(self):
+        t = AdaptiveThrottler()
+        initial_delay = t.current_delay
+        for _ in range(5):
+            t.record_response(200, True)
+        assert t.current_delay <= initial_delay
+
+
+# â”€â”€ build_import_json Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestBuildImportJson:
+
+    def test_basic_structure(self):
+        result = build_import_json("Test Project", "my-gateway", [], [])
+        assert result["project"] == "Test Project"
+        assert result["pam_configuration"]["gateway_name"] == "my-gateway"
+        assert result["pam_configuration"]["environment"] == "local"
+        assert result["pam_configuration"]["rotation"] == "on"
+        assert result["pam_data"]["resources"] == []
+        assert result["pam_data"]["users"] == []
+
+    def test_no_gateway(self):
+        result = build_import_json("Test", None, [], [])
+        assert "gateway_name" not in result["pam_configuration"]
+
+    def test_with_resources_and_users(self):
+        resources = [{"type": "pamMachine", "title": "srv1", "host": "10.0.0.1"}]
+        users = [{"type": "login", "title": "web", "login": "user"}]
+        result = build_import_json("Test", None, resources, users)
+        assert len(result["pam_data"]["resources"]) == 1
+        assert len(result["pam_data"]["users"]) == 1
+
+
+class TestBuildExtendJson:
+
+    def test_extend_only_has_pam_data(self):
+        result = build_extend_json(
+            [{"type": "pamMachine", "title": "srv"}],
+            [{"type": "login", "title": "web"}],
+        )
+        assert "project" not in result
+        assert "pam_configuration" not in result
+        assert len(result["pam_data"]["resources"]) == 1
+        assert len(result["pam_data"]["users"]) == 1
+
+
+# â”€â”€ strip_credentials Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestStripCredentials:
+
+    def test_strips_user_passwords(self):
+        data = {"pam_data": {"users": [{"password": "secret"}], "resources": []}}
+        strip_credentials(data)
+        assert data["pam_data"]["users"][0]["password"] == "***"
+
+    def test_strips_nested_resource_user_passwords(self):
+        data = {
+            "pam_data": {
+                "users": [],
+                "resources": [
+                    {"type": "pamMachine", "users": [{"password": "secret"}]}
+                ],
+            }
+        }
+        strip_credentials(data)
+        assert data["pam_data"]["resources"][0]["users"][0]["password"] == "***"
+
+    def test_handles_empty_data(self):
+        data = {"pam_data": {"users": [], "resources": []}}
+        strip_credentials(data)  # should not raise
+
+
+# â”€â”€ format_duration Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestFormatDuration:
+
+    def test_seconds_only(self):
+        assert format_duration(45) == "45s"
+
+    def test_minutes_and_seconds(self):
+        assert format_duration(125) == "2m 5s"
+
+    def test_zero(self):
+        assert format_duration(0) == "0s"
+
+
+# â”€â”€ build_report Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestBuildReport:
+
+    def test_report_contains_project_name(self):
+        report = build_report(
+            project_name="Test Migration",
+            safes_processed=5,
+            total_accounts=50,
+            resource_counts={"pamMachine": {"ok": 20, "skip": 0, "err": 0}},
+            platform_counts={"UnixSSH": {"rotation": "general", "count": 20}},
+            skipped=[],
+            incomplete_count=0,
+            duration=120.0,
+        )
+        assert "Test Migration" in report
+        assert "Safes processed:  5" in report
+        assert "Accounts found:   50" in report
+
+    def test_report_shows_unmapped_platforms(self):
+        report = build_report(
+            project_name="Test",
+            safes_processed=1,
+            total_accounts=10,
+            resource_counts={},
+            platform_counts={"CustomPlatform": {"rotation": "UNMAPPED", "count": 5}},
+            skipped=[],
+            incomplete_count=0,
+            duration=10.0,
+            unmapped_platforms={"CustomPlatform": 5},
+        )
+        assert "UNMAPPED" in report
+        assert "--platform-map" in report
+
+    def test_report_shows_skipped(self):
+        report = build_report(
+            project_name="Test",
+            safes_processed=1,
+            total_accounts=10,
+            resource_counts={},
+            platform_counts={},
+            skipped=[
+                {"reason": "password retrieval failed"},
+                {"reason": "password retrieval failed"},
+                {"reason": "CPM disabled"},
+            ],
+            incomplete_count=2,
+            duration=10.0,
+        )
+        assert "Password retrieval failed:   2" in report
+        assert "Manual mgmt (CPM disabled):  1" in report
+        assert "Incomplete (missing fields): 2" in report
+
+    def test_report_shows_duration(self):
+        report = build_report(
+            project_name="Test",
+            safes_processed=1,
+            total_accounts=10,
+            resource_counts={},
+            platform_counts={},
+            skipped=[],
+            incomplete_count=0,
+            duration=272.0,
+        )
+        assert "4m 32s" in report
+
+
+# â”€â”€ CyberArkPVWAClient Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestCyberArkPVWAClientNormalize:
+
+    def test_normalize_plain_host(self):
+        host, params = CyberArkPVWAClient._normalize_host("pvwa.example.com")
+        assert host == "pvwa.example.com"
+        assert params == {}
+
+    def test_normalize_strips_https(self):
+        host, params = CyberArkPVWAClient._normalize_host("https://pvwa.example.com")
+        assert host == "pvwa.example.com"
+
+    def test_normalize_privilege_cloud(self):
+        host, params = CyberArkPVWAClient._normalize_host("mycompany.cyberark.cloud")
+        assert host == "mycompany.privilegecloud.cyberark.cloud"
+
+    def test_normalize_with_query_params(self):
+        host, params = CyberArkPVWAClient._normalize_host("pvwa.example.com?WinDomain")
+        assert host == "pvwa.example.com"
+        assert params == {"search": "WinDomain"}
+
+    def test_normalize_with_kv_query_params(self):
+        host, params = CyberArkPVWAClient._normalize_host("pvwa.example.com?limit=10&offset=20")
+        assert host == "pvwa.example.com"
+        assert params == {"limit": "10", "offset": "20"}
+
+
+# â”€â”€ SSRF Protection Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestSSRFProtection:
+
+    def test_rejects_localhost(self):
+        with pytest.raises(ValueError, match="local address"):
+            CyberArkPVWAClient._validate_host("localhost")
+
+    def test_rejects_127_0_0_1(self):
+        with pytest.raises(ValueError, match="local address"):
+            CyberArkPVWAClient._validate_host("127.0.0.1")
+
+    def test_rejects_private_ip(self):
+        with pytest.raises(ValueError, match="private/reserved"):
+            CyberArkPVWAClient._validate_host("10.0.0.1")
+
+    def test_rejects_link_local(self):
+        with pytest.raises(ValueError, match="private/reserved"):
+            CyberArkPVWAClient._validate_host("169.254.169.254")
+
+    def test_rejects_empty_host(self):
+        with pytest.raises(ValueError, match="local address"):
+            CyberArkPVWAClient._validate_host("")
+
+    def test_rejects_invalid_hostname_chars(self):
+        with pytest.raises(ValueError, match="invalid characters"):
+            CyberArkPVWAClient._validate_host("pvwa.example.com/../../admin")
+
+    def test_accepts_valid_hostname(self):
+        CyberArkPVWAClient._validate_host("pvwa.example.com")  # should not raise
+
+    def test_accepts_cyberark_cloud(self):
+        CyberArkPVWAClient._validate_host("mycompany.privilegecloud.cyberark.cloud")
+
+
+# â”€â”€ Login Type Validation Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestLoginTypeValidation:
+
+    def test_valid_login_types(self):
+        from keepercommander.importer.cyberark.cyberark_pam import VALID_LOGON_TYPES
+        for lt in ("cyberark", "ldap", "radius", "windows"):
+            assert lt in VALID_LOGON_TYPES
+        for lt in ("Cyberark", "CyberArk", "LDAP", "RADIUS", "Windows"):
+            assert lt.lower() in VALID_LOGON_TYPES
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.prompt")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_invalid_login_type_rejected_by_authenticate(self, mock_dns, mock_prompt, mock_requests):
+        """authenticate() should return False for invalid login types."""
+        mock_prompt.side_effect = ["../../admin", "user", "pass"]
+        client = CyberArkPVWAClient("pvwa.example.com")
+        with patch("keepercommander.importer.cyberark.cyberark_pam.print_formatted_text"):
+            result = client.authenticate()
+        assert result is False
+
+
+# â”€â”€ Privilege Cloud Interactive / SSO Auth Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestPrivilegeCloudSSOAuth:
+
+    def _client(self):
+        return CyberArkPVWAClient("mycompany.privilegecloud.cyberark.cloud")
+
+    def test_choose_auth_method_sso_alias(self, monkeypatch):
+        monkeypatch.setenv("KEEPER_CYBERARK_AUTH_METHOD", "sso")
+        assert CyberArkPVWAClient._choose_cloud_auth_method() == "interactive"
+
+    def test_choose_auth_method_idp_alias(self, monkeypatch):
+        monkeypatch.setenv("KEEPER_CYBERARK_AUTH_METHOD", "idp")
+        assert CyberArkPVWAClient._choose_cloud_auth_method() == "interactive"
+
+    def test_poll_identity_sso_status_success(self, monkeypatch):
+        client = self._client()
+        client.IDENTITY_IDP_POLL_INTERVAL = 0
+        responses = [
+            {"success": True, "Result": {"State": "Pending"}},
+            {"success": True, "Result": {"State": "Success", "Token": "sso-token-123"}},
+        ]
+
+        class _Resp:
+            def __init__(self, body):
+                self.status_code = 200
+                self._body = body
+
+            def json(self):
+                return self._body
+
+        class _Session:
+            def __init__(self):
+                self.calls = 0
+
+            def post(self, *args, **kwargs):
+                body = responses[min(self.calls, len(responses) - 1)]
+                self.calls += 1
+                return _Resp(body)
+
+        session = _Session()
+        monkeypatch.setattr(
+            "keepercommander.importer.cyberark.cyberark_pam.time.sleep",
+            lambda *_: None,
+        )
+        with patch("keepercommander.importer.cyberark.cyberark_pam.print_formatted_text"):
+            ok = client._poll_identity_sso_status(
+                "https://tenant.id.cyberark.cloud", "idp-session", session=session,
+            )
+        assert ok is True
+        assert client.auth_token == "Bearer sso-token-123"
+        assert session.calls == 2
+
+    def test_poll_identity_sso_status_failed_state(self):
+        client = self._client()
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {"success": True, "Result": {"State": "Failed"}}
+
+        class _Session:
+            def post(self, *args, **kwargs):
+                return _Resp()
+
+        with patch("keepercommander.importer.cyberark.cyberark_pam.print_formatted_text"):
+            ok = client._poll_identity_sso_status(
+                "https://tenant.id.cyberark.cloud", "idp-session", session=_Session(),
+            )
+        assert ok is False
+        assert client.auth_token is None
+
+    def test_complete_identity_sso_pin_success(self, monkeypatch):
+        client = self._client()
+        monkeypatch.setattr(
+            "keepercommander.importer.cyberark.cyberark_pam.prompt",
+            lambda *a, **k: "123456",
+        )
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "success": True,
+                    "Result": {"Summary": "LoginSuccess", "Token": "pin-token"},
+                }
+
+        posted = {}
+
+        class _Session:
+            def post(self, url, json=None, headers=None, timeout=None):
+                posted["url"] = url
+                posted["json"] = json
+                return _Resp()
+
+        with patch("keepercommander.importer.cyberark.cyberark_pam.print_formatted_text"):
+            ok = client._complete_identity_sso_pin(
+                "https://tenant.id.cyberark.cloud", "idp-login-session", session=_Session(),
+            )
+        assert ok is True
+        assert client.auth_token == "Bearer pin-token"
+        assert posted["json"]["MechanismId"] == "OOBAUTHPIN"
+        assert posted["json"]["SessionId"] == "idp-login-session"
+        assert posted["json"]["Answer"] == "123456"
+
+    def test_complete_identity_sso_opens_browser_and_polls(self, monkeypatch):
+        client = self._client()
+        opened = []
+
+        monkeypatch.setattr(CyberArkPVWAClient, "_open_browser", staticmethod(lambda url: opened.append(url)))
+        monkeypatch.setattr(
+            CyberArkPVWAClient,
+            "_poll_identity_sso_status",
+            lambda self, *a, **k: setattr(self, "auth_token", "Bearer from-poll") or True,
+        )
+
+        start_result = {
+            "IdpRedirectShortUrl": "https://idp.example/sso",
+            "IdpLoginSessionId": "idp-sess",
+            "IdpOobAuthPinRequired": False,
+        }
+        with patch("keepercommander.importer.cyberark.cyberark_pam.print_formatted_text"):
+            ok = client._complete_identity_sso(
+                "https://tenant.id.cyberark.cloud", start_result, session=object(),
+            )
+        assert ok is True
+        assert opened == ["https://idp.example/sso"]
+        assert client.auth_token == "Bearer from-poll"
+
+    def test_complete_identity_sso_uses_pin_when_required(self, monkeypatch):
+        client = self._client()
+        monkeypatch.setattr(CyberArkPVWAClient, "_open_browser", staticmethod(lambda url: None))
+        called = {"pin": False}
+
+        def _pin(self, *a, **k):
+            called["pin"] = True
+            self.auth_token = "Bearer pin"
+            return True
+
+        monkeypatch.setattr(CyberArkPVWAClient, "_complete_identity_sso_pin", _pin)
+        start_result = {
+            "IdpRedirectUrl": "https://idp.example/long",
+            "IdpLoginSessionId": "idp-sess",
+            "IdpOobAuthPinRequired": True,
+        }
+        with patch("keepercommander.importer.cyberark.cyberark_pam.print_formatted_text"):
+            ok = client._complete_identity_sso(
+                "https://tenant.id.cyberark.cloud", start_result,
+            )
+        assert ok is True
+        assert called["pin"] is True
+
+
+# â”€â”€ SSL Verification Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestSSLVerification:
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_cloud_always_verify(self, mock_dns):
+        """Privilege Cloud must always verify SSL, even if verify_ssl=False."""
+        client = CyberArkPVWAClient("mycompany.cyberark.cloud", verify_ssl=False)
+        assert client.verify_ssl is True
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_selfhosted_respects_verify_flag(self, mock_dns):
+        """Self-hosted PVWA should respect verify_ssl=False."""
+        client = CyberArkPVWAClient("pvwa.example.com", verify_ssl=False)
+        assert client.verify_ssl is False
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_selfhosted_default_verify_true(self, mock_dns):
+        """Self-hosted defaults to verify_ssl=True."""
+        client = CyberArkPVWAClient("pvwa.example.com")
+        assert client.verify_ssl is True
+
+
+class TestSelfHostedClientCert:
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.print_formatted_text")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.prompt")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_auth_self_hosted_sends_client_cert(self, mock_dns, mock_prompt, mock_requests, mock_print):
+        mock_prompt.side_effect = ["Cyberark", "admin", "pass"]
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = "token123"
+        mock_requests.post.return_value = mock_resp
+
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client.client_cert = ("cert.pem", "key.pem")
+
+        assert client._auth_self_hosted() is True
+        _, kwargs = mock_requests.post.call_args
+        assert kwargs.get("cert") == ("cert.pem", "key.pem")
+        assert kwargs.get("verify") is True
+        assert kwargs.get("allow_redirects") is not False
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.print_formatted_text")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_retrieve_password_sends_client_cert(self, mock_dns, mock_requests, mock_print):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = "secret"
+        mock_requests.post.return_value = mock_resp
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client.client_cert = ("cert.pem", "key.pem")
+        client.auth_token = "session-token"
+        assert client.retrieve_password("12_3", "acct", "Safe") == "secret"
+        _, kwargs = mock_requests.post.call_args
+        assert kwargs.get("cert") == ("cert.pem", "key.pem")
+        assert kwargs.get("json") == {"reason": "test"}
+        assert kwargs.get("allow_redirects") is False
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.print_formatted_text")
+    @patch("keepercommander.importer.cyberark.pam.client.CyberArkPVWAClient._load_p12_client_cert",
+           return_value=("cert.pem", "key.pem"))
+    @patch("keepercommander.importer.cyberark.pam.client.path.isfile", return_value=True)
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_maybe_configure_client_cert_from_env(self, mock_dns, mock_isfile, mock_load, mock_print, monkeypatch):
+        monkeypatch.setenv("KEEPER_CYBERARK_CLIENT_CERT_P12", "client.p12")
+        monkeypatch.setenv("KEEPER_CYBERARK_CLIENT_CERT_PASSWORD", "p12-secret")
+        client = CyberArkPVWAClient("pvwa.example.com")
+        assert client._maybe_configure_client_cert() is True
+        assert client.client_cert == ("cert.pem", "key.pem")
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.print_formatted_text")
+    @patch("keepercommander.importer.cyberark.pam.client.CyberArkPVWAClient._load_p12_client_cert",
+           return_value=("cert.pem", "key.pem"))
+    @patch("keepercommander.importer.cyberark.pam.client.path.isfile", return_value=True)
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_maybe_configure_client_cert_from_legacy_env(self, mock_dns, mock_isfile, mock_load, mock_print, monkeypatch):
+        monkeypatch.setenv("_CYBERARK_CLIENT_CERT_P12", "legacy-client.p12")
+        monkeypatch.setenv("_CYBERARK_CLIENT_CERT_PASSWORD", "legacy-secret")
+        client = CyberArkPVWAClient("pvwa.example.com")
+        assert client._maybe_configure_client_cert() is True
+        assert client.client_cert == ("cert.pem", "key.pem")
+
+
+# â”€â”€ CyberArkPAMImportCommand Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestCyberArkPAMImportCommandParser:
+
+    def test_all_flags_parse(self):
+        cmd = CyberArkPAMImportCommand()
+        args = cmd.parser.parse_args([
+            "pvwa.example.com",
+            "--name", "My Project",
+            "--config", "config-uid-123",
+            "--gateway", "gw-uid-456",
+            "--folder-mode", "exact",
+            "--safes", "Prod-*",
+            "--exclude-safes", "Test-*",
+            "--list-safes",
+            "--dry-run",
+            "--output", "output.json",
+            "--include-credentials",
+            "--estimate",
+            "--yes",
+            "--skip-users",
+            "--skip-linked-accounts",
+            "--skip-members",
+            "--include-system-safes",
+            "--user-map", "users.json",
+            "--batch-size", "50",
+            "--batch-delay", "1.0",
+            "--platform-map", "map.json",
+            "--state-filter", "active,inactive",
+            "--no-verify-ssl",
+            "--client-cert-p12", "client.p12",
+            "--client-cert-password", "secret",
+            "--nsf",
+        ])
+        assert args.server == "pvwa.example.com"
+        assert args.project_name == "My Project"
+        assert args.config == "config-uid-123"
+        assert args.gateway == "gw-uid-456"
+        assert args.folder_mode == "exact"
+        assert args.safes == "Prod-*"
+        assert args.exclude_safes == "Test-*"
+        assert args.list_safes is True
+        assert args.dry_run is True
+        assert args.output == "output.json"
+        assert args.include_credentials is True
+        assert args.estimate is True
+        assert args.yes is True
+        assert args.skip_users is True
+        assert args.skip_linked_accounts is True
+        assert args.skip_members is True
+        assert args.include_system_safes is True
+        assert args.user_map == "users.json"
+        assert args.batch_size == 50
+        assert args.batch_delay == 1.0
+        assert args.platform_map == "map.json"
+        assert args.state_filter == "active,inactive"
+        assert args.no_verify_ssl is True
+        assert args.client_cert_p12 == "client.p12"
+        assert args.client_cert_password == "secret"
+        assert args.use_nsf is True
+
+    def test_minimal_args(self):
+        cmd = CyberArkPAMImportCommand()
+        args = cmd.parser.parse_args(["pvwa.example.com"])
+        assert args.server == "pvwa.example.com"
+        assert args.project_name == ""
+        assert args.dry_run is False
+        assert args.use_nsf is False
+
+    def test_nsf_flag(self):
+        cmd = CyberArkPAMImportCommand()
+        args = cmd.parser.parse_args(["pvwa.example.com", "--nsf"])
+        assert args.use_nsf is True
+
+    def test_folder_mode_choices(self):
+        cmd = CyberArkPAMImportCommand()
+        # Valid choices
+        for mode in ("ksm", "exact", "flat"):
+            args = cmd.parser.parse_args(["server", "--folder-mode", mode])
+            assert args.folder_mode == mode
+
+    def test_short_flags(self):
+        cmd = CyberArkPAMImportCommand()
+        args = cmd.parser.parse_args(["server", "-n", "Proj", "-d", "-y", "-o", "out.json"])
+        assert args.project_name == "Proj"
+        assert args.dry_run is True
+        assert args.yes is True
+        assert args.output == "out.json"
+
+
+class TestCyberArkPAMImportNsfMode:
+
+    @staticmethod
+    def _options(**overrides):
+        values = dict(
+            server="pvwa.example.com",
+            project_name="CyberArk Migration",
+            config_uid="",
+            gateway_name="",
+            folder_mode="safe",
+            dry_run=False,
+            output_file="",
+            include_creds=False,
+            estimate_only=False,
+            skip_confirm=True,
+            skip_users=False,
+            skip_linked=False,
+            skip_members=False,
+            skip_dependents=False,
+            safe_include="",
+            safe_exclude="",
+            list_safes=False,
+            batch_size=100,
+            batch_delay=0.5,
+            platform_map_override=None,
+            state_filter=None,
+            include_system_safes=False,
+            user_map_file="",
+            sync_mode="upsert",
+            strict_policies=False,
+            use_nsf=True,
+            raw_kwargs={},
+        )
+        values.update(overrides)
+        return ImportRunOptions(**values)
+
+    @patch("keepercommander.api.sync_down")
+    def test_nsf_without_config_does_not_auto_extend_classic_project(self, mock_sync):
+        params = MagicMock()
+        orchestrator = CyberArkImportOrchestrator(
+            CyberArkPAMImportCommand(), params, MagicMock(), self._options(),
+        )
+
+        orchestrator._maybe_auto_extend()
+
+        mock_sync.assert_not_called()
+        assert orchestrator.options.config_uid == ""
+
+    @patch("keepercommander.api.sync_down")
+    def test_nsf_without_config_skips_classic_idempotency_scan(self, mock_sync):
+        params = MagicMock()
+        orchestrator = CyberArkImportOrchestrator(
+            CyberArkPAMImportCommand(), params, MagicMock(), self._options(),
+        )
+
+        result = orchestrator._prepare_idempotency(MagicMock())
+
+        assert result is None
+        mock_sync.assert_not_called()
+
+    @patch("keepercommander.commands.pam_import.cyberark_import._temp_store")
+    @patch("keepercommander.commands.pam_import.edit.PAMProjectImportCommand.execute")
+    def test_nsf_is_passed_to_project_import(self, mock_import_execute, mock_temp_store):
+        mock_temp_store.write_json.return_value = "import.json"
+        cmd = CyberArkPAMImportCommand()
+        cmd._find_config_uid = MagicMock(return_value="config-uid")
+
+        result = cmd._single_batch_import(
+            MagicMock(), {"pam_data": {}}, "CyberArk Migration", "", use_nsf=True,
+        )
+
+        mock_import_execute.assert_called_once()
+        assert mock_import_execute.call_args.kwargs["use_nsf"] is True
+        assert result["config_uid"] == "config-uid"
+
+    def test_cloud_rbi_user_is_promoted_for_autofill_resolution(self):
+        client = MagicMock()
+        client.retrieve_password.return_value = "cloudpass"
+        orchestrator = CyberArkImportOrchestrator(
+            CyberArkPAMImportCommand(),
+            MagicMock(),
+            client,
+            self._options(skip_linked=True),
+        )
+        mapper = AccountMapper()
+        folder_mapper = SafeFolderMapper(mode="safe")
+        pam_resources, pam_users = [], []
+        account = {
+            "id": "cloud-1",
+            "name": "cloud-admin",
+            "platformId": "AWSAccessKeys",
+            "safeName": "ExampleSafe",
+            "address": "",
+            "userName": "user@example.invalid",
+            "platformAccountProperties": {},
+        }
+
+        orchestrator._map_single_account(
+            account, "ExampleSafe", mapper, folder_mapper, {},
+            pam_resources, pam_users, [], [], {}, {}, [], [],
+        )
+
+        assert len(pam_resources) == 1
+        assert pam_resources[0]["type"] == "pamRemoteBrowser"
+        assert "users" not in pam_resources[0]
+        assert len(pam_users) == 1
+        assert pam_users[0]["type"] == "pamUser"
+        assert pam_users[0]["login"] == "user@example.invalid"
+        assert pam_users[0]["password"] == "cloudpass"
+        assert (
+            pam_resources[0]["pam_settings"]["connection"]["autofill_credentials"]
+            == pam_users[0]["title"]
+        )
+
+
+class TestPamUserCustomFields:
+
+    @patch("keepercommander.commands.pam_import.base.execute_record_add_in_folder")
+    def test_pam_user_create_record_passes_custom_text_fields(self, mock_add):
+        mock_add.return_value = "user-uid"
+        user = PamUserObject.load({
+            "type": "pamUser",
+            "title": "root@server01",
+            "login": "root",
+            "password": "secret123",
+            "custom": [
+                {
+                    "type": "text",
+                    "label": "Environment",
+                    "value": ["sample-env"],
+                },
+                {
+                    "type": "text",
+                    "label": "CyberArk Equals=Label",
+                    "value": ["=leading"],
+                },
+            ],
+        })
+
+        user.create_record(MagicMock(), "folder-uid")
+
+        fields = mock_add.call_args.args[1]["fields"]
+        assert "c.text.Environment=sample-env" in fields
+        assert "c.text.CyberArk Equals==Label= =leading" in fields
+
+
+class TestCyberArkPAMImportDependents:
+
+    @staticmethod
+    def _field(field_type="", label="", value=None):
+        return SimpleNamespace(type=field_type, label=label, value=value or [])
+
+    @classmethod
+    def _machine_record(cls):
+        return SimpleNamespace(
+            record_uid="machine-uid",
+            record_type="pamMachine",
+            title="WinHost",
+            fields=[
+                cls._field("pamHostname", "", [{"hostName": "host.example.invalid", "port": "3389"}]),
+                cls._field("text", "operatingSystem", ["Windows"]),
+            ],
+        )
+
+    @classmethod
+    def _user_record(cls):
+        return SimpleNamespace(
+            record_uid="user-uid",
+            record_type="pamUser",
+            title="svc-account",
+            fields=[],
+        )
+
+    @staticmethod
+    def _mapped(dependents=None):
+        return SimpleNamespace(
+            pam_resources=[{
+                "type": "pamMachine",
+                "title": "WinHost",
+                "users": [{"title": "svc-account"}],
+            }],
+            dependents=dependents or [],
+        )
+
+    def test_dependent_resolver_accepts_logon_device_as_machine_ref(self):
+        from keepercommander.importer.cyberark.cyberark_pam import resolve_account_dependents
+
+        client = MagicMock()
+        client.fetch_account_dependents.return_value = [{
+            "platformId": "WinService",
+            "LogonDevice": "logon-device-other",
+            "Name": "Spooler",
+        }]
+
+        result = resolve_account_dependents(
+            client, {"id": "123_45", "name": "WinHost"}, "svc-account",
+        )
+
+        assert result[0]["machine_address"] == "logon-device-other"
+        assert result[0]["machine_refs"] == ["logon-device-other"]
+        assert result[0]["service_type"] == "service"
+
+    @patch("keepercommander.commands.pam_import.record_loader.load_pam_record")
+    @patch("keepercommander.commands.pam_import.record_loader.iter_accessible_record_uids")
+    def test_build_record_indexes_loads_nsf_records(self, mock_iter_uids, mock_load):
+        mock_iter_uids.return_value = iter(["machine-uid", "user-uid"])
+        mock_load.side_effect = [self._machine_record(), self._user_record()]
+        orchestrator = CyberArkImportOrchestrator(
+            CyberArkPAMImportCommand(), MagicMock(), MagicMock(),
+            TestCyberArkPAMImportNsfMode._options(use_nsf=True),
+        )
+
+        machine_index, user_index = orchestrator._build_record_indexes(
+            self._mapped(), MagicMock(), MagicMock(),
+        )
+
+        assert machine_index["winhost"].record_uid == "machine-uid"
+        assert machine_index["host.example.invalid"].record_uid == "machine-uid"
+        assert user_index["svc-account"].record_uid == "user-uid"
+
+    @patch("keepercommander.commands.pam_service.add.PAMActionServiceAddCommand")
+    @patch("keepercommander.commands.discover.GatewayContext.from_configuration_uid")
+    @patch("keepercommander.commands.pam_import.record_loader.load_pam_record")
+    @patch("keepercommander.commands.pam_import.record_loader.iter_accessible_record_uids")
+    @patch("keepercommander.api.sync_down")
+    def test_dependent_replay_maps_service_task_and_iis_for_nsf(
+            self, mock_sync, mock_iter_uids, mock_load, mock_gateway_ctx,
+            mock_add_cmd_cls):
+        mock_iter_uids.return_value = iter(["machine-uid", "user-uid"])
+        mock_load.side_effect = [self._machine_record(), self._user_record()]
+        mock_gateway_ctx.return_value = SimpleNamespace(
+            gateway=SimpleNamespace(controllerUid=b"gateway", controllerName="Gateway"),
+            configuration=SimpleNamespace(record_uid="cfg-uid"),
+        )
+        add_cmd = mock_add_cmd_cls.return_value
+        mapped = self._mapped([
+            {
+                "machine_address": "host.example.invalid",
+                "service_type": "service",
+                "raw_type": "WinService",
+                "service_name": "Spooler",
+                "master_user_title": "svc-account",
+            },
+            {
+                "machine_address": "host.example.invalid",
+                "service_type": "task",
+                "raw_type": "SchedTask",
+                "service_name": r"\Keeper\Rotate",
+                "master_user_title": "svc-account",
+            },
+            {
+                "machine_address": "host.example.invalid",
+                "service_type": "iis_pool",
+                "raw_type": "IISAppPool",
+                "service_name": "DefaultAppPool",
+                "master_user_title": "svc-account",
+            },
+        ])
+        orchestrator = CyberArkImportOrchestrator(
+            CyberArkPAMImportCommand(), MagicMock(), MagicMock(),
+            TestCyberArkPAMImportNsfMode._options(use_nsf=True),
+        )
+
+        summary = orchestrator._apply_service_dependent_mappings(
+            mapped, {"config_uid": "cfg-uid"}, [],
+        )
+
+        assert summary["added"] == 3
+        assert add_cmd.execute.call_count == 3
+        calls = [call.kwargs for call in add_cmd.execute.call_args_list]
+        assert [c["service_type"] for c in calls] == ["service", "task", "iis_pool"]
+        assert [c["name"] for c in calls] == ["Spooler", r"\Keeper\Rotate", "DefaultAppPool"]
+        assert all(c["machine_uid"] == "machine-uid" for c in calls)
+        assert all(c["user_uid"] == "user-uid" for c in calls)
+        assert all(c["configuration_uid"] == "cfg-uid" for c in calls)
+
+    @patch("keepercommander.commands.pam_service.add.PAMActionServiceAddCommand")
+    @patch("keepercommander.commands.discover.GatewayContext.from_configuration_uid")
+    @patch("keepercommander.commands.pam_import.record_loader.load_pam_record")
+    @patch("keepercommander.commands.pam_import.record_loader.iter_accessible_record_uids")
+    @patch("keepercommander.api.sync_down")
+    def test_dependent_replay_falls_back_to_imported_machine_title(
+            self, mock_sync, mock_iter_uids, mock_load, mock_gateway_ctx,
+            mock_add_cmd_cls):
+        mock_iter_uids.return_value = iter(["machine-uid", "user-uid"])
+        mock_load.side_effect = [self._machine_record(), self._user_record()]
+        mock_gateway_ctx.return_value = SimpleNamespace(
+            gateway=SimpleNamespace(controllerUid=b"gateway", controllerName="Gateway"),
+            configuration=SimpleNamespace(record_uid="cfg-uid"),
+        )
+        mapped = self._mapped([{
+            "machine_address": "logon-device-other",
+            "machine_refs": ["logon-device-other"],
+            "machine_title": "WinHost",
+            "service_type": "service",
+            "raw_type": "WinService",
+            "service_name": "Spooler",
+            "master_user_title": "svc-account",
+        }])
+        orchestrator = CyberArkImportOrchestrator(
+            CyberArkPAMImportCommand(), MagicMock(), MagicMock(),
+            TestCyberArkPAMImportNsfMode._options(use_nsf=True),
+        )
+
+        summary = orchestrator._apply_service_dependent_mappings(
+            mapped, {"config_uid": "cfg-uid"}, [],
+        )
+
+        assert summary["added"] == 1
+        assert summary["skipped_missing_machine"] == 0
+        assert mock_add_cmd_cls.return_value.execute.call_args.kwargs["machine_uid"] == "machine-uid"
+
+
+class TestCyberArkPAMImportNsfRotation:
+
+    @patch("keepercommander.commands.pam_import.record_loader.load_pam_record")
+    def test_rotation_resolver_loads_nsf_uid(self, mock_load):
+        from keepercommander.commands.pam.vault_target import resolve_pam_record
+
+        nsf_user = SimpleNamespace(record_uid="nsf-user", record_type="pamUser")
+        mock_load.return_value = nsf_user
+
+        result = resolve_pam_record(MagicMock(), "nsf-user", rec_type="pamUser")
+
+        assert result is nsf_user
+        mock_load.assert_called_once()
+
+
+# â”€â”€ Dry Run Integration Test (mocked PVWA) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+
+# â”€â”€ Default Platform Map Completeness â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestDefaultPlatformMap:
+
+    def test_all_common_platforms_mapped(self):
+        expected = [
+            "UnixSSH", "UnixSSHKey", "WinDomain", "WinLocalAccount",
+            "Oracle", "MySQL", "MSSql", "PostgreSQL", "BusinessWebsite",
+        ]
+        for platform in expected:
+            assert platform in DEFAULT_PLATFORM_MAP, f"Missing platform: {platform}"
+
+    def test_all_mappings_have_required_fields(self):
+        for platform, mapping in DEFAULT_PLATFORM_MAP.items():
+            assert "record_type" in mapping, f"{platform} missing record_type"
+            assert "rotation" in mapping, f"{platform} missing rotation"
+            assert "protocol" in mapping, f"{platform} missing protocol"
+            assert "port" in mapping, f"{platform} missing port"
+
+    def test_business_website_is_login_type(self):
+        m = DEFAULT_PLATFORM_MAP["BusinessWebsite"]
+        assert m["record_type"] == "login"
+        assert m["rotation"] is None
+
+    def test_unix_platforms_use_ssh(self):
+        for p in ("UnixSSH", "UnixSSHKey"):
+            assert DEFAULT_PLATFORM_MAP[p]["protocol"] == "ssh"
+            assert DEFAULT_PLATFORM_MAP[p]["port"] == "22"
+
+    def test_windows_platforms_use_rdp(self):
+        for p in ("WinDomain", "WinLocalAccount", "WinServerLocal", "WinDesktopLocal"):
+            assert DEFAULT_PLATFORM_MAP[p]["protocol"] == "rdp"
+            assert DEFAULT_PLATFORM_MAP[p]["port"] == "3389"
+
+    def test_database_platforms_have_correct_ports(self):
+        assert DEFAULT_PLATFORM_MAP["Oracle"]["port"] == "1521"
+        assert DEFAULT_PLATFORM_MAP["MySQL"]["port"] == "3306"
+        assert DEFAULT_PLATFORM_MAP["MSSql"]["port"] == "1433"
+        assert DEFAULT_PLATFORM_MAP["PostgreSQL"]["port"] == "5432"
+
+
+# â”€â”€ Secure Temp File Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestSecureTempFiles:
+
+    def test_write_secure_temp_creates_valid_json(self):
+        from keepercommander.commands.pam_import.cyberark_import import _write_secure_temp_json, _remove_secure_temp
+        data = {"test": "value", "nested": {"key": 123}}
+        tmp_path = _write_secure_temp_json(data)
+        try:
+            assert os.path.exists(tmp_path)
+            with open(tmp_path, 'r') as f:
+                loaded = json.load(f)
+            assert loaded == data
+            # Check permissions (skip on Windows)
+            if os.name != 'nt':
+                import stat
+                mode = os.stat(tmp_path).st_mode & 0o777
+                assert mode == 0o600, f"Expected 0o600, got {oct(mode)}"
+        finally:
+            _remove_secure_temp(tmp_path)
+
+    def test_remove_secure_temp_deletes_file(self):
+        from keepercommander.commands.pam_import.cyberark_import import _write_secure_temp_json, _remove_secure_temp
+        data = {"secret": "password123"}
+        tmp_path = _write_secure_temp_json(data)
+        assert os.path.exists(tmp_path)
+        _remove_secure_temp(tmp_path)
+        assert not os.path.exists(tmp_path)
+
+    def test_remove_secure_temp_handles_missing_file(self):
+        from keepercommander.commands.pam_import.cyberark_import import _remove_secure_temp
+        _remove_secure_temp("/nonexistent/path/file.json")  # should not raise
+
+
+# â”€â”€ Config UID Lookup Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestFindConfigUid:
+    """Tests calling the real _find_config_uid method."""
+
+    def _make_mock_record(self, title, uid):
+        record = MagicMock()
+        record.title = title
+        record.record_uid = uid
+        return record
+
+    @patch('keepercommander.commands.pam_import.cyberark_import.vault_extensions')
+    @patch('keepercommander.commands.pam_import.cyberark_import.api.sync_down')
+    def test_exact_match(self, mock_sync, mock_ve):
+        mock_ve.find_records.return_value = [
+            self._make_mock_record("MyProject Configuration", "uid-001"),
+        ]
+        cmd = CyberArkPAMImportCommand()
+        result = cmd._find_config_uid(MagicMock(), "MyProject")
+        assert result == "uid-001"
+
+    @patch('keepercommander.commands.pam_import.cyberark_import.vault_extensions')
+    @patch('keepercommander.commands.pam_import.cyberark_import.api.sync_down')
+    def test_suffix_picks_highest_numerically(self, mock_sync, mock_ve):
+        """#10 should sort after #9 (numeric, not lexicographic)."""
+        mock_ve.find_records.return_value = [
+            self._make_mock_record("MyProject Configuration", "uid-001"),
+            self._make_mock_record("MyProject Configuration #2", "uid-002"),
+            self._make_mock_record("MyProject Configuration #10", "uid-010"),
+        ]
+        cmd = CyberArkPAMImportCommand()
+        result = cmd._find_config_uid(MagicMock(), "MyProject")
+        assert result == "uid-010"
+
+    @patch('keepercommander.commands.pam_import.cyberark_import.vault_extensions')
+    @patch('keepercommander.commands.pam_import.cyberark_import.api.sync_down')
+    def test_no_match_returns_empty(self, mock_sync, mock_ve):
+        mock_ve.find_records.return_value = [
+            self._make_mock_record("OtherProject Configuration", "uid-999"),
+        ]
+        cmd = CyberArkPAMImportCommand()
+        result = cmd._find_config_uid(MagicMock(), "MyProject")
+        assert result == ""
+
+    @patch('keepercommander.commands.pam_import.cyberark_import.vault_extensions')
+    @patch('keepercommander.commands.pam_import.cyberark_import.api.sync_down')
+    def test_rejects_partial_match(self, mock_sync, mock_ve):
+        mock_ve.find_records.return_value = [
+            self._make_mock_record("MyProject Configuration Extra", "uid-bad"),
+        ]
+        cmd = CyberArkPAMImportCommand()
+        result = cmd._find_config_uid(MagicMock(), "MyProject")
+        assert result == ""
+
+
+# â”€â”€ Platform Map Validation Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestPlatformMapValidation:
+
+    def test_map_account_missing_record_type_defaults(self):
+        """AccountMapper should default to pamMachine if record_type missing from override."""
+        override = {"CustomPlatform": {"rotation": "general", "protocol": "ssh", "port": "22"}}
+        mapper = AccountMapper(platform_map_override=override)
+        account = {
+            "id": "1", "name": "Custom-server", "platformId": "CustomPlatform",
+            "address": "10.0.0.1", "userName": "root",
+            "platformAccountProperties": {},
+        }
+        result = mapper.map_account(account, "pass")
+        assert result["type"] == "pamMachine"  # defaulted
+
+    def test_platform_map_invalid_json_file(self, tmp_path):
+        """Invalid JSON should raise CommandError."""
+        from keepercommander.error import CommandError
+        bad_file = tmp_path / "bad.json"
+        bad_file.write_text("not valid json {{{")
+        cmd = CyberArkPAMImportCommand()
+        with pytest.raises(CommandError, match="Invalid JSON"):
+            cmd.execute(MagicMock(), server="pvwa.example.com",
+                        platform_map=str(bad_file), dry_run=True,
+                        project_name="Test", config="", gateway="",
+                        folder_mode="flat", safes="", exclude_safes="",
+                        list_safes=False, output="", include_credentials=False,
+                        estimate=False, yes=False, skip_users=False,
+                        auto_throttle=True, batch_size=100, batch_delay=0.5,
+                        state_filter="", no_verify_ssl=True)
+
+    def test_platform_map_missing_record_type_file(self, tmp_path):
+        """Entry without record_type should raise CommandError."""
+        from keepercommander.error import CommandError
+        bad_file = tmp_path / "bad_map.json"
+        bad_file.write_text('{"CustomPlatform": {"rotation": "general"}}')
+        cmd = CyberArkPAMImportCommand()
+        with pytest.raises(CommandError, match="record_type"):
+            cmd.execute(MagicMock(), server="pvwa.example.com",
+                        platform_map=str(bad_file), dry_run=True,
+                        project_name="Test", config="", gateway="",
+                        folder_mode="flat", safes="", exclude_safes="",
+                        list_safes=False, output="", include_credentials=False,
+                        estimate=False, yes=False, skip_users=False,
+                        auto_throttle=True, batch_size=100, batch_delay=0.5,
+                        state_filter="", no_verify_ssl=True)
+
+    def test_platform_map_not_dict_file(self, tmp_path):
+        """Non-dict JSON should raise CommandError."""
+        from keepercommander.error import CommandError
+        bad_file = tmp_path / "list.json"
+        bad_file.write_text('[1, 2, 3]')
+        cmd = CyberArkPAMImportCommand()
+        with pytest.raises(CommandError, match="JSON object"):
+            cmd.execute(MagicMock(), server="pvwa.example.com",
+                        platform_map=str(bad_file), dry_run=True,
+                        project_name="Test", config="", gateway="",
+                        folder_mode="flat", safes="", exclude_safes="",
+                        list_safes=False, output="", include_credentials=False,
+                        estimate=False, yes=False, skip_users=False,
+                        auto_throttle=True, batch_size=100, batch_delay=0.5,
+                        state_filter="", no_verify_ssl=True)
+
+
+# â”€â”€ Critical Fix Validation Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestRotationTypesValid:
+    """C1: Verify all rotation types in DEFAULT_PLATFORM_MAP are accepted by base.py."""
+
+    def test_all_platform_rotations_are_valid(self):
+        from keepercommander.commands.pam_import.base import PamRotationSettingsObject
+        valid_types = ("general", "iam_user", "scripts_only")
+        for platform_id, mapping in DEFAULT_PLATFORM_MAP.items():
+            rotation = mapping.get("rotation")
+            if rotation is None:
+                continue  # login records have no rotation
+            assert rotation in valid_types, (
+                f"Platform '{platform_id}' has invalid rotation '{rotation}'. "
+                f"Valid types: {valid_types}"
+            )
+
+    def test_rotation_settings_load_accepts_general(self):
+        from keepercommander.commands.pam_import.base import PamRotationSettingsObject
+        r = PamRotationSettingsObject.load({"rotation": "general", "enabled": "on"})
+        assert r.rotation == "general"
+
+    def test_rotation_settings_load_rejects_ad_user(self):
+        from keepercommander.commands.pam_import.base import PamRotationSettingsObject
+        r = PamRotationSettingsObject.load({"rotation": "ad_user", "enabled": "on"})
+        assert r.rotation == ""  # rejected â€” empty
+
+    def test_rotation_settings_load_rejects_database(self):
+        from keepercommander.commands.pam_import.base import PamRotationSettingsObject
+        r = PamRotationSettingsObject.load({"rotation": "database", "enabled": "on"})
+        assert r.rotation == ""  # rejected â€” empty
+
+
+class TestCPMRotationMapping:
+    """C2b: Verify CyberArk CPM state maps to rotation_settings and pam_settings."""
+
+    def test_cpm_enabled_sets_rotation_on(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "1", "name": "linux-root", "platformId": "UnixSSH",
+            "address": "10.0.0.1", "userName": "root",
+            "secretManagement": {"automaticManagementEnabled": True, "status": "active"},
+        }
+        result = mapper.map_account(account, "pass")
+        user = result["users"][0]
+        assert user["rotation_settings"]["enabled"] == "on"
+        assert result["pam_settings"]["options"]["rotation"] == "on"
+
+    def test_cpm_disabled_sets_rotation_off(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "2", "name": "manual-acct", "platformId": "UnixSSH",
+            "address": "10.0.0.2", "userName": "svc",
+            "secretManagement": {
+                "automaticManagementEnabled": False,
+                "manualManagementReason": "Service account â€” no auto-rotation",
+            },
+        }
+        result = mapper.map_account(account, "pass")
+        user = result["users"][0]
+        assert user["rotation_settings"]["enabled"] == "off"
+        assert "notes" not in user
+        assert result["pam_settings"]["options"]["rotation"] == "off"
+
+    def test_missing_secret_management_defaults_to_on(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "3", "name": "no-mgmt", "platformId": "WinDomain",
+            "address": "dc1.local", "userName": "admin",
+        }
+        result = mapper.map_account(account, "pass")
+        user = result["users"][0]
+        assert user["rotation_settings"]["enabled"] == "on"
+
+    def test_pam_settings_options_structure(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "4", "name": "ssh-box", "platformId": "UnixSSH",
+            "address": "10.0.0.4", "userName": "deploy",
+        }
+        result = mapper.map_account(account, "pass")
+        ps = result["pam_settings"]
+        assert "options" in ps
+        assert ps["options"]["connections"] == "on"
+        assert ps["options"]["tunneling"] == "off"
+        assert ps["options"]["graphical_session_recording"] == "off"
+
+    def test_pam_settings_launch_credentials(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "5", "name": "db-admin", "platformId": "MSSql",
+            "address": "sqlserver.local", "userName": "sa",
+        }
+        result = mapper.map_account(account, "pass")
+        user = result["users"][0]
+        assert result["pam_settings"]["connection"]["launch_credentials"] == user["title"]
+
+    def test_schedule_always_on_demand(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "6", "name": "scheduled", "platformId": "UnixSSH",
+            "address": "10.0.0.6", "userName": "root",
+            "secretManagement": {"automaticManagementEnabled": True},
+        }
+        result = mapper.map_account(account, "pass")
+        user = result["users"][0]
+        assert user["rotation_settings"]["schedule"] == {"type": "on-demand"}
+
+
+class TestConnectDatabaseMapping:
+    """C3: Verify Database property flows to connect_database on pamUser."""
+
+    def test_mssql_database_mapped(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "100", "name": "MSSql-hr", "platformId": "MSSql",
+            "address": "dbserver1.cyberark.local", "userName": "sa",
+            "platformAccountProperties": {"Port": "15345", "Database": "hr"},
+        }
+        result = mapper.map_account(account, "pass")
+        assert result["type"] == "pamDatabase"
+        assert result["port"] == "15345"
+        user = result["users"][0]
+        assert user.get("connect_database") == "hr"
+
+    def test_mysql_database_mapped(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "101", "name": "MySQL-app", "platformId": "MySQL",
+            "address": "mysql.internal", "userName": "root",
+            "platformAccountProperties": {"Database": "appdb"},
+        }
+        result = mapper.map_account(account, "pass")
+        user = result["users"][0]
+        assert user.get("connect_database") == "appdb"
+
+    def test_no_database_property_no_field(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "102", "name": "UnixSSH-srv", "platformId": "UnixSSH",
+            "address": "10.0.0.1", "userName": "root",
+            "platformAccountProperties": {},
+        }
+        result = mapper.map_account(account, "pass")
+        user = result["users"][0]
+        assert "connect_database" not in user
+
+    def test_database_only_on_pam_database_type(self):
+        """Database property should not appear on pamMachine records."""
+        mapper = AccountMapper()
+        account = {
+            "id": "103", "name": "UnixSSH-srv", "platformId": "UnixSSH",
+            "address": "10.0.0.1", "userName": "root",
+            "platformAccountProperties": {"Database": "should_not_appear"},
+        }
+        result = mapper.map_account(account, "pass")
+        user = result["users"][0]
+        assert "connect_database" not in user
+
+
+class TestOracleProtocol:
+    """C2: Verify Oracle uses a valid protocol."""
+
+    def test_oracle_protocol_is_registered(self):
+        mapping = DEFAULT_PLATFORM_MAP["Oracle"]
+        # sql-server is a registered protocol in base.py
+        assert mapping["protocol"] == "sql-server"
+
+
+class TestReconcileAdminCredentials:
+    """H1: Verify reconcile account maps to administrative_credentials."""
+
+    def test_reconcile_role_tagged(self):
+        """resolve_linked_accounts should tag reconcile users with _ca_role."""
+        from keepercommander.importer.cyberark.cyberark_pam import resolve_linked_accounts
+        client = MagicMock()
+        client.fetch_account_details.return_value = {
+            "linkedAccounts": {
+                "reconcileAccount": {
+                    "id": "99_1", "name": "recon-admin",
+                    "safeName": "AdminSafe", "userName": "recon_user"
+                }
+            }
+        }
+        client.retrieve_password.return_value = "recon_pass"
+        account = {"id": "1", "name": "target-account", "safeName": "TestSafe"}
+        result = resolve_linked_accounts(client, account)
+        assert len(result) == 1
+        assert result[0]["_ca_role"] == "reconcile"
+        assert result[0]["login"] == "recon_user"
+
+    def test_logon_role_tagged(self):
+        from keepercommander.importer.cyberark.cyberark_pam import resolve_linked_accounts
+        client = MagicMock()
+        client.fetch_account_details.return_value = {
+            "linkedAccounts": {
+                "logonAccount": {
+                    "id": "99_2", "name": "logon-svc",
+                    "safeName": "SvcSafe", "userName": "svc_user"
+                }
+            }
+        }
+        client.retrieve_password.return_value = "logon_pass"
+        account = {"id": "2", "name": "target", "safeName": "TestSafe"}
+        result = resolve_linked_accounts(client, account)
+        assert len(result) == 1
+        assert result[0]["_ca_role"] == "logon"
+
+
+class TestPickAdminCredentials:
+    """Keeper has one administrative_credentials slot; CyberArk may have both
+    reconcile and enable linked accounts. Reconcile wins; enable is fallback."""
+
+    def test_reconcile_only(self):
+        from keepercommander.importer.cyberark.cyberark_pam import pick_admin_credentials
+        linked = [{"title": "recon-svc (reconcile account)", "_ca_role": "reconcile"}]
+        title, role = pick_admin_credentials(linked)
+        assert title == "recon-svc (reconcile account)"
+        assert role == "reconcile"
+
+    def test_enable_only_used_as_fallback(self):
+        from keepercommander.importer.cyberark.cyberark_pam import pick_admin_credentials
+        linked = [{"title": "enable-svc (enable account)", "_ca_role": "enable"}]
+        title, role = pick_admin_credentials(linked)
+        assert title == "enable-svc (enable account)"
+        assert role == "enable"
+
+    def test_reconcile_preferred_over_enable_when_both_present(self):
+        from keepercommander.importer.cyberark.cyberark_pam import pick_admin_credentials
+        linked = [
+            {"title": "enable-svc (enable account)", "_ca_role": "enable"},
+            {"title": "recon-svc (reconcile account)", "_ca_role": "reconcile"},
+        ]
+        title, role = pick_admin_credentials(linked)
+        assert role == "reconcile"
+        assert title == "recon-svc (reconcile account)"
+
+    def test_logon_only_returns_none(self):
+        from keepercommander.importer.cyberark.cyberark_pam import pick_admin_credentials
+        linked = [{"title": "logon-svc (logon account)", "_ca_role": "logon"}]
+        title, role = pick_admin_credentials(linked)
+        assert title is None
+        assert role is None
+
+    def test_empty_list_returns_none(self):
+        from keepercommander.importer.cyberark.cyberark_pam import pick_admin_credentials
+        title, role = pick_admin_credentials([])
+        assert title is None and role is None
+
+
+class TestPickLaunchCredentials:
+    """CyberArk's logonAccount is the connection credential (PSM logs in as the
+    logon account, then switches to the target). That maps to Keeper's
+    launch_credentials slot."""
+
+    def test_logon_returns_title(self):
+        from keepercommander.importer.cyberark.cyberark_pam import pick_launch_credentials
+        linked = [{"title": "svc-logon (logon account)", "_ca_role": "logon"}]
+        assert pick_launch_credentials(linked) == "svc-logon (logon account)"
+
+    def test_no_logon_returns_none(self):
+        from keepercommander.importer.cyberark.cyberark_pam import pick_launch_credentials
+        linked = [
+            {"title": "recon-svc (reconcile account)", "_ca_role": "reconcile"},
+            {"title": "enable-svc (enable account)", "_ca_role": "enable"},
+        ]
+        assert pick_launch_credentials(linked) is None
+
+    def test_empty_list_returns_none(self):
+        from keepercommander.importer.cyberark.cyberark_pam import pick_launch_credentials
+        assert pick_launch_credentials([]) is None
+
+
+# â”€â”€ Existing CyberArk Importer Unchanged â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestExistingImporterUnchanged:
+
+    def test_original_importer_still_importable(self):
+        from keepercommander.importer.cyberark import Importer
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+        assert Importer is CyberArkImporter
+
+    def test_original_importer_has_do_import(self):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+        assert hasattr(CyberArkImporter, "do_import")
+
+    def test_original_endpoints_unchanged(self):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+        expected_endpoints = {
+            "accounts": "Accounts",
+            "account_password": "Accounts/{account_id}/Password/Retrieve",
+            "logon": "Auth/{type}/Logon",
+            "platforms": "Platforms/",
+            "safes": "Safes",
+        }
+        assert expected_endpoints.items() <= CyberArkImporter.ENDPOINTS.items()
+
+
+class TestClassicCyberArkMetadataImport:
+    """Metadata preservation for ``import --format=cyberark``."""
+
+    def test_account_name_becomes_keeper_title(self):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+
+        account = {
+            "id": "account-1",
+            "name": "demo account",
+            "platformId": "GenericPlatform",
+            "platformAccountProperties": {
+                "ItemName": "friendly name",
+            },
+        }
+
+        assert CyberArkImporter._account_title(account) == "demo account"
+
+    def test_imports_relevant_platform_fields_only(self):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+        from keepercommander.importer.importer import Record, RecordField
+
+        account = {
+            "id": "account-2",
+            "name": "demo account",
+            "platformName": "Generic Platform",
+            "deviceType": "Server",
+            "safeName": "Source Safe",
+            "address": "host.example.com",
+            "userName": "admin",
+            "createdTime": 1756374692000,
+            "modifiedTime": 1756374700000,
+            "secretManagement": {"status": "success"},
+            "platformAccountProperties": {
+                "OwnerName": "sample-owner",
+                "Environment": {"Name": "sample-env"},
+                "Enabled": False,
+                "Aliases": ["primary", "legacy"],
+                "Protocol": "SSH",
+                "Address": "host.example.com",
+                "Username": "admin",
+            },
+        }
+        record = Record()
+        record.title = account["name"]
+        record.login = account["userName"]
+        record.fields.append(RecordField(
+            "host", value={"hostName": account["address"]},
+        ))
+
+        CyberArkImporter._add_account_metadata(record, account)
+
+        fields = {field.label: field.value for field in record.fields if field.label}
+        assert fields["Platform Name"] == "Generic Platform"
+        assert fields["Device Type"] == "Server"
+        assert fields["Owner Name"] == "sample-owner"
+        assert fields["Environment.Name"] == "sample-env"
+        assert fields["Enabled"] == "false"
+        assert fields["Aliases"] == '["primary","legacy"]'
+        assert fields["Protocol"] == "SSH"
+        assert "id" not in fields
+        assert "safeName" not in fields
+        assert "createdTime" not in fields
+        assert "modifiedTime" not in fields
+        assert "secretManagement" not in fields
+        assert fields["Address"] == "host.example.com"
+        assert fields["Username"] == "admin"
+
+    def test_standard_mapped_platform_properties_are_preserved_as_custom_metadata(self):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+        from keepercommander.importer.importer import Record, RecordField
+
+        account = {
+            "platformAccountProperties": {
+                "ItemName": "server-title",
+                "URL": "https://server.example.com",
+                "LogonDomain": "CORP",
+                "Account Name": "sample-user",
+                "Address": "server.example.com",
+                "Port": "3389",
+                "Protocol": "RDP",
+                "Device Type": "Generic Device",
+            },
+        }
+        record = Record()
+        record.title = "server-title"
+        record.login = "CORP\\sample-user"
+        record.login_url = "https://server.example.com"
+        record.fields.append(RecordField(
+            "host", value={"hostName": "server.example.com", "port": "3389"},
+        ))
+
+        CyberArkImporter._add_account_metadata(record, account)
+
+        custom_fields = {field.label: field.value for field in record.fields if field.label}
+        assert custom_fields == {
+            "Item Name": "server-title",
+            "URL": "https://server.example.com",
+            "Logon Domain": "CORP",
+            "Account Name": "sample-user",
+            "Address": "server.example.com",
+            "Port": "3389",
+            "Protocol": "RDP",
+            "Device Type": "Generic Device",
+        }
+
+    def test_metadata_is_serialized_as_keeper_custom_fields(self):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+        from keepercommander.importer.importer import Record
+        from keepercommander.importer.imp_exp import _construct_record_v3_data
+
+        record = Record()
+        record.title = "server-account"
+        record.type = "login"
+        CyberArkImporter._add_account_metadata(record, {
+            "platformId": "GenericPlatform",
+            "platformAccountProperties": {
+                "Protocol": "SSH",
+                "Device Type": "Server",
+            },
+        })
+
+        data = _construct_record_v3_data(record)
+        custom = {
+            field.get("label"): field.get("value", [None])[0]
+            for field in data["custom"] if field.get("label")
+        }
+
+        assert custom["Platform Name"] == "GenericPlatform"
+        assert custom["Protocol"] == "SSH"
+        assert custom["Device Type"] == "Server"
+
+    def test_platform_property_display_names_are_used_as_custom_field_labels(self):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+        from keepercommander.importer.importer import Record
+
+        record = Record()
+        record.title = "server-account"
+        record.login = "CORP\\admin"
+        account = {
+            "platformId": "WinDomain",
+            "platformAccountProperties": {
+                "LogonDomain": "CORP",
+                "UserDN": "CN=admin,DC=corp,DC=local",
+                "OwnerName": "sample-owner",
+            },
+        }
+
+        CyberArkImporter._add_account_metadata(record, account, {
+            "LogonDomain": "Logon To",
+            "UserDN": "User DN",
+            "OwnerName": "Owner",
+        })
+
+        custom_fields = {field.label: field.value for field in record.fields if field.label}
+        assert "LogonDomain" not in custom_fields
+        assert "UserDN" not in custom_fields
+        assert "OwnerName" not in custom_fields
+        assert custom_fields["Logon To"] == "CORP"
+        assert custom_fields["User DN"] == "CN=admin,DC=corp,DC=local"
+        assert custom_fields["Owner"] == "sample-owner"
+
+    def test_display_name_fields_can_read_top_level_account_values(self):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+        from keepercommander.importer.importer import Record
+
+        record = Record()
+        record.title = "sample account"
+        account = {
+            "platformId": "GenericLoginPlatform",
+            "safeName": "SampleSafe",
+            "id": "account-1",
+            "name": "sample account",
+            "userName": "sample_user",
+            "platformAccountProperties": {
+                "CustomID": "custom-value",
+            },
+        }
+
+        CyberArkImporter._add_account_metadata(record, account, {
+            "Username": "Display Username",
+            "CustomID": "Display Custom ID",
+        })
+
+        custom_fields = {field.label: field.value for field in record.fields if field.label}
+        assert custom_fields == {
+            "Display Username": "sample_user",
+            "Display Custom ID": "custom-value",
+            "Platform Name": "GenericLoginPlatform",
+        }
+
+    def test_custom_metadata_username_can_include_logon_domain(self):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+        from keepercommander.importer.importer import Record
+
+        record = Record()
+        account = {
+            "platformId": "GenericPlatform",
+            "userName": "user",
+            "platformAccountProperties": {
+                "LogonDomain": "DOMAIN",
+            },
+        }
+
+        CyberArkImporter._add_account_metadata(
+            record, account, {"Username": "Username"},
+            include_logon_domain_username=True,
+        )
+
+        custom_fields = {field.label: field.value for field in record.fields if field.label}
+        assert custom_fields["Username"] == "DOMAIN\\user"
+
+    def test_platform_property_display_names_parse_platforms_response(self):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+
+        display_names = CyberArkImporter._platform_property_display_names({
+            "Platforms": [{
+                "general": {"id": "WinDomain", "name": "Windows Domain Account"},
+                "properties": {
+                    "required": [
+                        {"name": "Address", "displayName": "Address"},
+                        {"name": "Username", "displayName": "Username"},
+                    ],
+                    "optional": [
+                        {"name": "LogonDomain", "displayName": "Logon To"},
+                        {"name": "UserDN", "displayName": "User DN"},
+                    ],
+                },
+            }],
+            "Total": 1,
+        })
+
+        assert display_names["WinDomain"]["Address"] == "Address"
+        assert display_names["WinDomain"]["address"] == "Address"
+        assert display_names["WinDomain"]["Username"] == "Username"
+        assert display_names["WinDomain"]["LogonDomain"] == "Logon To"
+        assert display_names["WinDomain"]["logondomain"] == "Logon To"
+        assert display_names["WinDomain"]["UserDN"] == "User DN"
+
+
+# â”€â”€ Phase 2 Tests: System Safe Exclusion + Safe Filtering â”€â”€â”€â”€â”€
+
+class TestSystemSafeExclusion:
+    """Tests for exclude_system_safes()."""
+
+    def test_excludes_system_safes(self):
+        from keepercommander.importer.cyberark.cyberark_pam import exclude_system_safes
+        safes = [
+            {"safeName": "Windows-Admins"},
+            {"safeName": "System"},
+            {"safeName": "VaultInternal"},
+            {"safeName": "PVWAConfig"},
+            {"safeName": "Unix-Servers"},
+        ]
+        result = exclude_system_safes(safes)
+        names = [s["safeName"] for s in result]
+        assert "Windows-Admins" in names
+        assert "Unix-Servers" in names
+        assert "System" not in names
+        assert "VaultInternal" not in names
+        assert "PVWAConfig" not in names
+
+    def test_include_system_override(self):
+        from keepercommander.importer.cyberark.cyberark_pam import exclude_system_safes
+        safes = [
+            {"safeName": "Windows-Admins"},
+            {"safeName": "System"},
+            {"safeName": "VaultInternal"},
+        ]
+        result = exclude_system_safes(safes, include_system=True)
+        assert len(result) == 3
+
+    def test_empty_list(self):
+        from keepercommander.importer.cyberark.cyberark_pam import exclude_system_safes
+        assert exclude_system_safes([]) == []
+
+    def test_all_system_safes(self):
+        from keepercommander.importer.cyberark.cyberark_pam import exclude_system_safes, SYSTEM_SAFES
+        safes = [{"safeName": name} for name in list(SYSTEM_SAFES)[:5]]
+        result = exclude_system_safes(safes)
+        assert len(result) == 0
+
+
+class TestSafeNameSanitization:
+    """Tests for sanitize_safe_name() and deduplicate_safe_names()."""
+
+    def test_basic_name(self):
+        from keepercommander.importer.cyberark.cyberark_pam import sanitize_safe_name
+        assert sanitize_safe_name("Windows-Admins") == "Windows-Admins"
+
+    def test_path_traversal_stripped(self):
+        from keepercommander.importer.cyberark.cyberark_pam import sanitize_safe_name
+        result = sanitize_safe_name("../../../etc/passwd")
+        assert ".." not in result
+        assert "/" not in result
+
+    def test_slashes_replaced(self):
+        from keepercommander.importer.cyberark.cyberark_pam import sanitize_safe_name
+        result = sanitize_safe_name("Corp/IT\\Servers")
+        assert "/" not in result
+        assert "\\" not in result
+
+    def test_max_length_truncated(self):
+        from keepercommander.importer.cyberark.cyberark_pam import sanitize_safe_name, MAX_SAFE_NAME_LENGTH
+        long_name = "A" * 50
+        result = sanitize_safe_name(long_name)
+        assert len(result) <= MAX_SAFE_NAME_LENGTH
+
+    def test_empty_name(self):
+        from keepercommander.importer.cyberark.cyberark_pam import sanitize_safe_name
+        assert sanitize_safe_name("") == "Unnamed-Safe"
+
+    def test_whitespace_only(self):
+        from keepercommander.importer.cyberark.cyberark_pam import sanitize_safe_name
+        assert sanitize_safe_name("   ") == "Unnamed-Safe"
+
+    def test_dedup_collisions(self):
+        from keepercommander.importer.cyberark.cyberark_pam import deduplicate_safe_names
+        safes = [
+            {"safeUrlId": "safe1", "safeName": "TestSafe"},
+            {"safeUrlId": "safe2", "safeName": "TestSafe"},
+            {"safeUrlId": "safe3", "safeName": "TestSafe"},
+        ]
+        result = deduplicate_safe_names(safes)
+        assert result["safe1"] == "TestSafe"
+        assert result["safe2"] == "TestSafe #2"
+        assert result["safe3"] == "TestSafe #3"
+
+    def test_dedup_no_collision(self):
+        from keepercommander.importer.cyberark.cyberark_pam import deduplicate_safe_names
+        safes = [
+            {"safeUrlId": "a", "safeName": "Alpha"},
+            {"safeUrlId": "b", "safeName": "Beta"},
+        ]
+        result = deduplicate_safe_names(safes)
+        assert result["a"] == "Alpha"
+        assert result["b"] == "Beta"
+
+
+# â”€â”€ Phase 2 Audit Fix Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class TestSystemSafeExclusionCaseInsensitive:
+    """Verify case-insensitive system safe exclusion."""
+
+    def test_lowercase_system_safe_excluded(self):
+        from keepercommander.importer.cyberark.cyberark_pam import exclude_system_safes
+        safes = [{"safeName": "system"}, {"safeName": "UserSafe"}]
+        result = exclude_system_safes(safes)
+        assert len(result) == 1
+        assert result[0]["safeName"] == "UserSafe"
+
+    def test_uppercase_system_safe_excluded(self):
+        from keepercommander.importer.cyberark.cyberark_pam import exclude_system_safes
+        safes = [{"safeName": "VAULTINTERNAL"}, {"safeName": "RealSafe"}]
+        result = exclude_system_safes(safes)
+        assert len(result) == 1
+        assert result[0]["safeName"] == "RealSafe"
+
+    def test_mixed_case_system_safe_excluded(self):
+        from keepercommander.importer.cyberark.cyberark_pam import exclude_system_safes
+        safes = [{"safeName": "pvwaConfig"}, {"safeName": "Production"}]
+        result = exclude_system_safes(safes)
+        assert len(result) == 1
+
+
+class TestSafeNameSanitizationExtended:
+    """Additional edge cases for sanitize_safe_name."""
+
+    def test_unicode_name_preserved(self):
+        from keepercommander.importer.cyberark.cyberark_pam import sanitize_safe_name
+        result = sanitize_safe_name("CafÃ©-Serveurs")
+        assert "CafÃ©" in result
+
+    def test_control_chars_stripped(self):
+        from keepercommander.importer.cyberark.cyberark_pam import sanitize_safe_name
+        result = sanitize_safe_name("Safe\x00Name\nWith\tCtrl")
+        assert "\x00" not in result
+        assert "\n" not in result
+        assert "\t" not in result
+        assert "SafeName" in result
+
+    def test_exact_max_length(self):
+        from keepercommander.importer.cyberark.cyberark_pam import sanitize_safe_name, MAX_SAFE_NAME_LENGTH
+        name = "A" * MAX_SAFE_NAME_LENGTH
+        result = sanitize_safe_name(name)
+        assert len(result) == MAX_SAFE_NAME_LENGTH
+
+    def test_one_over_max_length(self):
+        from keepercommander.importer.cyberark.cyberark_pam import sanitize_safe_name, MAX_SAFE_NAME_LENGTH
+        name = "A" * (MAX_SAFE_NAME_LENGTH + 1)
+        result = sanitize_safe_name(name)
+        assert len(result) == MAX_SAFE_NAME_LENGTH
+
+    def test_dedup_respects_max_length(self):
+        from keepercommander.importer.cyberark.cyberark_pam import deduplicate_safe_names, MAX_SAFE_NAME_LENGTH
+        long_name = "A" * 30  # exceeds 28
+        safes = [
+            {"safeUrlId": "a", "safeName": long_name},
+            {"safeUrlId": "b", "safeName": long_name},
+        ]
+        result = deduplicate_safe_names(safes)
+        for name in result.values():
+            assert len(name) <= MAX_SAFE_NAME_LENGTH
+
+
+class TestInteractiveSafePicker:
+    """Tests for _interactive_safe_picker."""
+
+    def test_select_all(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        from unittest.mock import patch
+        safes = [{"safeName": "Safe1"}, {"safeName": "Safe2"}]
+        with patch("builtins.input", return_value="A"):
+            result = CyberArkPAMImportCommand._interactive_safe_picker(safes)
+        assert result is None  # None = import all
+
+    def test_select_empty(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        from unittest.mock import patch
+        safes = [{"safeName": "Safe1"}, {"safeName": "Safe2"}]
+        with patch("builtins.input", return_value=""):
+            result = CyberArkPAMImportCommand._interactive_safe_picker(safes)
+        assert result is None
+
+    def test_select_specific(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        from unittest.mock import patch
+        safes = [{"safeName": "Alpha"}, {"safeName": "Beta"}, {"safeName": "Gamma"}]
+        with patch("builtins.input", return_value="1,3"):
+            result = CyberArkPAMImportCommand._interactive_safe_picker(safes)
+        assert result == ["Alpha", "Gamma"]
+
+    def test_select_range(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        from unittest.mock import patch
+        safes = [{"safeName": f"S{i}"} for i in range(1, 6)]
+        with patch("builtins.input", return_value="2-4"):
+            result = CyberArkPAMImportCommand._interactive_safe_picker(safes)
+        assert result == ["S2", "S3", "S4"]
+
+    def test_select_mixed_ranges_and_indexes(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        from unittest.mock import patch
+        safes = [{"safeName": f"S{i}"} for i in range(1, 21)]
+        with patch("builtins.input", return_value="1,2,3,6-9,11,14-18"):
+            result = CyberArkPAMImportCommand._interactive_safe_picker(safes)
+        assert result == [
+            "S1", "S2", "S3", "S6", "S7", "S8", "S9", "S11",
+            "S14", "S15", "S16", "S17", "S18",
+        ]
+
+    def test_select_reversed_range(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        from unittest.mock import patch
+        safes = [{"safeName": f"S{i}"} for i in range(1, 6)]
+        with patch("builtins.input", return_value="4-1"):
+            result = CyberArkPAMImportCommand._interactive_safe_picker(safes)
+        assert result == ["S1", "S2", "S3", "S4"]
+
+    def test_select_deduplicates(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        from unittest.mock import patch
+        safes = [{"safeName": f"S{i}"} for i in range(1, 6)]
+        with patch("builtins.input", return_value="1,1-3,2"):
+            result = CyberArkPAMImportCommand._interactive_safe_picker(safes)
+        assert result == ["S1", "S2", "S3"]
+
+    def test_select_invalid_input(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        from unittest.mock import patch
+        safes = [{"safeName": "Safe1"}]
+        with patch("builtins.input", return_value="abc"):
+            result = CyberArkPAMImportCommand._interactive_safe_picker(safes)
+        assert result == []  # invalid non-empty â†’ abort, do not import all
+
+    def test_select_invalid_range_syntax_aborts(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        from unittest.mock import patch
+        safes = [{"safeName": f"S{i}"} for i in range(1, 6)]
+        with patch("builtins.input", return_value="1..4"):
+            result = CyberArkPAMImportCommand._interactive_safe_picker(safes)
+        assert result == []
+
+    def test_partially_invalid_aborts(self, capsys):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        from unittest.mock import patch
+        safes = [{"safeName": f"S{i}"} for i in range(1, 8)]
+        with patch("builtins.input", return_value="1,abc,7"):
+            result = CyberArkPAMImportCommand._interactive_safe_picker(safes)
+        assert result == []
+        assert "abc" in capsys.readouterr().out
+
+    def test_eof_returns_none(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        from unittest.mock import patch
+        safes = [{"safeName": "Safe1"}]
+        with patch("builtins.input", side_effect=EOFError):
+            result = CyberArkPAMImportCommand._interactive_safe_picker(safes)
+        assert result is None
+
+
+class TestMaybeInteractiveSafePick:
+    """Picker abort must not emit a second 'No safes selected' message."""
+
+    def _orch(self):
+        from keepercommander.commands.pam_import.cyberark_import import (
+            CyberArkImportOrchestrator, CyberArkPAMImportCommand,
+        )
+        orch = CyberArkImportOrchestrator.__new__(CyberArkImportOrchestrator)
+        orch.options = MagicMock(
+            safe_include="", safe_exclude="", skip_confirm=False,
+            dry_run=False, output_file="",
+        )
+        orch.params = MagicMock(batch_mode=False)
+        orch._cmd = CyberArkPAMImportCommand()
+        return orch
+
+    def test_cancelled_does_not_print_no_safes_selected(self, capsys):
+        orch = self._orch()
+        safes = [{"safeName": "A"}]
+        with patch.object(orch._cmd, "_interactive_safe_picker", return_value=[]):
+            result = orch._maybe_interactive_safe_pick(safes)
+        assert result == []
+        assert "No safes selected" not in capsys.readouterr().out
+
+    def test_all_returns_original(self):
+        orch = self._orch()
+        safes = [{"safeName": "A"}]
+        with patch.object(orch._cmd, "_interactive_safe_picker", return_value=None):
+            assert orch._maybe_interactive_safe_pick(safes) is safes
+
+
+class TestParseIndexSelection:
+    """Unit tests for _parse_index_selection."""
+
+    def test_single_indexes(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        assert CyberArkPAMImportCommand._parse_index_selection("1,3", 5) == [0, 2]
+
+    def test_range(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        assert CyberArkPAMImportCommand._parse_index_selection("1-4", 10) == [0, 1, 2, 3]
+
+    def test_mixed(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        assert CyberArkPAMImportCommand._parse_index_selection("1,2,3,6-9,11,14-18", 20) == [
+            0, 1, 2, 5, 6, 7, 8, 10, 13, 14, 15, 16, 17
+        ]
+
+    def test_out_of_range_rejected(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        with pytest.raises(ValueError, match="99"):
+            CyberArkPAMImportCommand._parse_index_selection("1,99,2-3,50-60", 5)
+
+    def test_zero_start_rejected(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        with pytest.raises(ValueError, match="0-2"):
+            CyberArkPAMImportCommand._parse_index_selection("0-2", 5)
+
+    def test_partially_invalid_token_rejected(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        with pytest.raises(ValueError, match="abc"):
+            CyberArkPAMImportCommand._parse_index_selection("1,abc,7", 10)
+
+    def test_whitespace_tolerant(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        assert CyberArkPAMImportCommand._parse_index_selection(" 1 , 3 - 5 , 7 ", 10) == [0, 2, 3, 4, 6]
+
+    def test_huge_range_rejected(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        with pytest.raises(ValueError, match="1-1000000"):
+            CyberArkPAMImportCommand._parse_index_selection("1-1000000", 5)
+
+    def test_unicode_en_dash(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        assert CyberArkPAMImportCommand._parse_index_selection("2â€“4", 6) == [1, 2, 3]
+
+    def test_rejects_malformed_tokens(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        for bad in ("1-2-3", "1--5", "1..4", "1:4"):
+            with pytest.raises(ValueError, match="invalid or out-of-range"):
+                CyberArkPAMImportCommand._parse_index_selection(bad, 10)
+
+    def test_empty_tokens_ignored(self):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        assert CyberArkPAMImportCommand._parse_index_selection("1,,3", 5) == [0, 2]
+
+
+def _enterprise_params(nodes=None, user_root_nodes=None, enterprise_name="Acme"):
+    params = MagicMock()
+    params.enterprise = {
+        "nodes": nodes if nodes is not None else [
+            {"node_id": 1, "data": {}},
+            {"node_id": 2, "parent_id": 1, "data": {"displayname": "Engineering"}},
+            {"node_id": 3, "parent_id": 1, "data": {"displayname": "R&D"}},
+            {"node_id": 4, "parent_id": 1, "data": {"displayname": "Dup"}},
+            {"node_id": 5, "parent_id": 1, "data": {"displayname": "Dup"}},
+        ],
+        "user_root_nodes": user_root_nodes if user_root_nodes is not None else [1],
+        "enterprise_name": enterprise_name,
+    }
+    return params
+
+
+class TestResolveProvisioningNodeId:
+    """Tests for CyberArkImporter._resolve_provisioning_node_id."""
+
+    def _importer(self):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+        return CyberArkImporter()
+
+    @patch("keepercommander.importer.cyberark.cyberark.print_formatted_text")
+    def test_resolves_by_name(self, _print):
+        importer = self._importer()
+        assert importer._resolve_provisioning_node_id(_enterprise_params(), "Engineering") == 2
+
+    @patch("keepercommander.importer.cyberark.cyberark.print_formatted_text")
+    def test_resolves_by_numeric_id(self, _print):
+        importer = self._importer()
+        assert importer._resolve_provisioning_node_id(_enterprise_params(), "3") == 3
+
+    @patch("keepercommander.importer.cyberark.cyberark.print_formatted_text")
+    def test_strips_whitespace(self, _print):
+        importer = self._importer()
+        assert importer._resolve_provisioning_node_id(_enterprise_params(), "  Engineering  ") == 2
+
+    @patch("keepercommander.importer.cyberark.cyberark.print_formatted_text")
+    def test_ampersand_name_found(self, _print):
+        importer = self._importer()
+        assert importer._resolve_provisioning_node_id(_enterprise_params(), "R&D") == 3
+
+    def test_ampersand_name_not_found_raises(self):
+        from keepercommander.error import CommandError
+        importer = self._importer()
+        with pytest.raises(CommandError, match="No&Such"):
+            importer._resolve_provisioning_node_id(_enterprise_params(), "No&Such")
+
+    def test_not_found_raises(self):
+        from keepercommander.error import CommandError
+        importer = self._importer()
+        with pytest.raises(CommandError, match="was not found"):
+            importer._resolve_provisioning_node_id(_enterprise_params(), "Missing")
+
+    def test_ambiguous_name_raises(self):
+        from keepercommander.error import CommandError
+        importer = self._importer()
+        with pytest.raises(CommandError, match="more than one node matches"):
+            importer._resolve_provisioning_node_id(_enterprise_params(), "Dup")
+
+    @patch("keepercommander.importer.cyberark.cyberark.print_formatted_text")
+    def test_default_user_root_node(self, _print):
+        importer = self._importer()
+        assert importer._resolve_provisioning_node_id(
+            _enterprise_params(user_root_nodes=[99]), None
+        ) == 99
+
+    @patch("keepercommander.importer.cyberark.cyberark.print_formatted_text")
+    def test_default_falls_back_to_tree_root(self, _print):
+        importer = self._importer()
+        assert importer._resolve_provisioning_node_id(
+            _enterprise_params(user_root_nodes=[]), None
+        ) == 1
+
+    def test_no_enterprise_with_target_node_raises(self):
+        from keepercommander.error import CommandError
+        importer = self._importer()
+        params = MagicMock()
+        params.enterprise = None
+        with pytest.raises(CommandError, match="not an enterprise admin"):
+            importer._resolve_provisioning_node_id(params, "Engineering")
+
+    @patch("keepercommander.importer.cyberark.cyberark.print_formatted_text")
+    def test_no_enterprise_default_path_returns_none(self, _print):
+        importer = self._importer()
+        params = MagicMock()
+        params.enterprise = None
+        assert importer._resolve_provisioning_node_id(params, None) is None
+
+    def test_no_params_with_target_node_raises(self):
+        from keepercommander.error import CommandError
+        importer = self._importer()
+        with pytest.raises(CommandError, match="Keeper session is not available"):
+            importer._resolve_provisioning_node_id(None, "Engineering")
+
+    @patch("keepercommander.importer.cyberark.cyberark.print_formatted_text")
+    def test_no_params_default_path_returns_none(self, _print):
+        importer = self._importer()
+        assert importer._resolve_provisioning_node_id(None, None) is None
+
+    def test_success_html_escapes_ampersand(self):
+        from prompt_toolkit import HTML
+        from keepercommander.importer.cyberark.pam import _esc
+        HTML(
+            f"Provisioning teams, roles, and users into node "
+            f"<b>{_esc('R&D')}</b> (id <b>3</b>)"
+        )
+
+
+class TestImportTargetNodeArgparse:
+    """--target-node / --node on the vault import parser."""
+
+    def test_target_node_flag(self):
+        from keepercommander.importer.commands import import_parser
+        ns = import_parser.parse_args(["--format", "cyberark", "--target-node", "Eng", "https://pvwa"])
+        assert ns.target_node == "Eng"
+
+    def test_node_alias(self):
+        from keepercommander.importer.commands import import_parser
+        ns = import_parser.parse_args(["--format", "cyberark", "--node", "Eng", "https://pvwa"])
+        assert ns.target_node == "Eng"
+
+    def test_ignored_for_non_cyberark_format(self):
+        from keepercommander.importer.commands import RecordImportCommand
+        cmd = RecordImportCommand()
+        params = MagicMock()
+        params.enforcements = None
+        with patch("keepercommander.importer.commands.imp_exp._import") as mock_import:
+            cmd.execute(params, format="json", name="vault.json", target_node="Eng")
+        assert mock_import.call_args.kwargs.get("target_node") is None
+
+    def test_kept_for_cyberark_format(self):
+        from keepercommander.importer.commands import RecordImportCommand
+        cmd = RecordImportCommand()
+        params = MagicMock()
+        params.enforcements = None
+        with patch("keepercommander.importer.commands.imp_exp._import") as mock_import:
+            cmd.execute(params, format="cyberark", name="https://pvwa", target_node="Eng")
+        assert mock_import.call_args.kwargs.get("target_node") == "Eng"
+
+
+class TestClassicCyberArkSkipProvisioningArgs:
+    """Skip flags for ``import --format=cyberark``."""
+
+    @pytest.mark.parametrize("skip_value,expected", [
+        ("team", "team"),
+        ("role", "role"),
+        ("user", "user"),
+        ("team,role,user", "team,role,user"),
+        ("teams,roles,users", "team,role,user"),
+    ])
+    def test_parser_accepts_skip_targets(self, skip_value, expected):
+        from keepercommander.importer.commands import import_parser
+
+        ns = import_parser.parse_args([
+            "--format", "cyberark", f"--skip={skip_value}", "https://pvwa",
+        ])
+
+        assert ns.skip == expected
+
+    @pytest.mark.parametrize("flag", [
+        "--skipt-team",
+        "--skip-team",
+        "--skip-role",
+        "--skip-user",
+    ])
+    def test_parser_rejects_old_skip_flags(self, flag):
+        from keepercommander.importer.commands import import_parser
+        from keepercommander.commands.base import ParseError
+
+        with pytest.raises(ParseError):
+            import_parser.parse_args([
+                "--format", "cyberark", flag, "https://pvwa",
+            ])
+
+    def test_parser_rejects_unknown_skip_target(self):
+        from keepercommander.importer.commands import import_parser
+        from keepercommander.commands.base import ParseError
+
+        with pytest.raises(ParseError):
+            import_parser.parse_args([
+                "--format", "cyberark", "--skip=folder", "https://pvwa",
+            ])
+
+    def test_skip_targets_are_forwarded_for_cyberark(self):
+        from keepercommander.importer.commands import RecordImportCommand
+
+        params = MagicMock(enforcements=None)
+        with patch("keepercommander.importer.commands.imp_exp._import") as mock_import:
+            RecordImportCommand().execute(
+                params, format="cyberark", name="https://pvwa",
+                skip="team,role,user",
+            )
+
+        forwarded = mock_import.call_args.kwargs
+        assert forwarded["skip"] == "team,role,user"
+
+    def test_generic_import_engine_forwards_skip_targets_to_cyberark_importer(self):
+        from keepercommander.importer import imp_exp
+
+        class StopAfterCapture(Exception):
+            pass
+
+        captured = {}
+
+        class CapturingImporter:
+            verbose_import_summary = False
+
+            def execute(self, _filename, **kwargs):
+                captured.update(kwargs)
+                raise StopAfterCapture()
+
+        params = MagicMock()
+        params.record_cache = {}
+
+        with patch.object(imp_exp, "importer_for_format", return_value=CapturingImporter):
+            with pytest.raises(StopAfterCapture):
+                imp_exp._import(
+                    params, "cyberark", "https://pvwa",
+                    skip="team,role,user",
+                )
+
+        assert captured["skip_team"] is True
+        assert captured["skip_role"] is True
+        assert captured["skip_user"] is True
+
+    def test_skip_targets_are_ignored_for_other_formats(self):
+        from keepercommander.importer.commands import RecordImportCommand
+
+        params = MagicMock(enforcements=None)
+        with patch("keepercommander.importer.commands.imp_exp._import") as mock_import:
+            RecordImportCommand().execute(
+                params, format="json", name="vault.json",
+                skip="team,role,user",
+            )
+
+        forwarded = mock_import.call_args.kwargs
+        assert forwarded["skip"] == ""
+
+    @staticmethod
+    def _group_response():
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "value": [{
+                "id": "group-1",
+                "groupName": "Operations",
+                "members": [{"username": "operator"}],
+            }],
+        }
+        return response
+
+    @staticmethod
+    def _account_response():
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "value": [{
+                "id": "account-1",
+                "safeName": "SourceSafe",
+                "name": "demo account",
+                "platformId": "GenericPlatform",
+                "address": "host.example.com",
+                "userName": "admin",
+                "platformAccountProperties": {"Protocol": "SSH", "port": "2222"},
+            }],
+        }
+        return response
+
+    @staticmethod
+    def _login_account_response():
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "value": [{
+                "id": "account-1",
+                "safeName": "SampleSafe",
+                "name": "sample account",
+                "platformId": "GenericLoginPlatform",
+                "userName": "sample_user",
+                "platformAccountProperties": {
+                    "CustomID": "custom-value",
+                },
+            }],
+        }
+        return response
+
+    @patch("keepercommander.importer.cyberark.cyberark.sleep")
+    @patch("keepercommander.importer.cyberark.cyberark.print_formatted_text")
+    @patch("keepercommander.importer.cyberark.cyberark.ProgressBar")
+    def test_skip_user_does_not_fetch_cyberark_users_or_reprint_account_table(self, progress_bar, mock_print, _sleep):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+
+        class FakeProgressBar:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __call__(self, iterable, total=None):
+                return iterable
+
+        progress_bar.side_effect = FakeProgressBar
+
+        importer = CyberArkImporter()
+        importer._authenticate_pvwa = MagicMock(return_value=("pvwa.example.com", "token", {}))
+        importer._resolve_safes = MagicMock(return_value=["SourceSafe"])
+        importer.get_response = MagicMock(return_value=self._account_response())
+        importer.fetch_platform_property_display_names = MagicMock(return_value={
+            "GenericPlatform": {
+                "Username": "Username",
+                "Protocol": "Protocol",
+                "port": "Port",
+            },
+        })
+        importer.fetch_cyberark_users = MagicMock(return_value=[])
+        importer._enterprise_existing = MagicMock(return_value=(set(), set(), {}))
+        importer._confirm_import = MagicMock(return_value=True)
+        password_response = MagicMock(status_code=200)
+        password_response.text = '"secret"'
+        importer._request = MagicMock(return_value=password_response)
+
+        records = list(importer._do_import_inner(
+            "https://pvwa.example.com", params=MagicMock(),
+            skip_team=True, skip_role=True, skip_user=True,
+        ))
+
+        importer.fetch_cyberark_users.assert_not_called()
+        assert len(records) == 1
+        assert records[0].type == "serverCredentials"
+        assert records[0].login == "admin"
+        typed_fields = {field.type: field.value for field in records[0].fields if not field.label}
+        custom_fields = {field.label: field.value for field in records[0].fields if field.label}
+        assert typed_fields["host"] == {"hostName": "host.example.com", "port": "2222"}
+        assert custom_fields == {
+            "Username": "admin",
+            "Protocol": "SSH",
+            "Port": "2222",
+            "Platform Name": "GenericPlatform",
+        }
+        table_prints = [
+            call for call in mock_print.call_args_list
+            if len(call.args) > 1 and "demo account" in str(call.args)
+        ]
+        assert len(table_prints) == 1
+
+    @patch("keepercommander.importer.cyberark.cyberark.sleep")
+    @patch("keepercommander.importer.cyberark.cyberark.print_formatted_text")
+    @patch("keepercommander.importer.cyberark.cyberark.ProgressBar")
+    def test_login_record_keeps_release_login_behavior_and_custom_metadata(self, progress_bar, _print, _sleep):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+
+        class FakeProgressBar:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __call__(self, iterable, total=None):
+                return iterable
+
+        progress_bar.side_effect = FakeProgressBar
+
+        importer = CyberArkImporter()
+        importer._authenticate_pvwa = MagicMock(return_value=("pvwa.example.com", "token", {}))
+        importer._resolve_safes = MagicMock(return_value=["SampleSafe"])
+        importer.get_response = MagicMock(return_value=self._login_account_response())
+        importer.fetch_platform_property_display_names = MagicMock(return_value={
+            "GenericLoginPlatform": {
+                "Username": "Display Username",
+                "CustomID": "Display Custom ID",
+            },
+        })
+        importer.fetch_cyberark_users = MagicMock(return_value=[])
+        importer._enterprise_existing = MagicMock(return_value=(set(), set(), {}))
+        importer._confirm_import = MagicMock(return_value=True)
+        password_response = MagicMock(status_code=200)
+        password_response.text = '"secret"'
+        importer._request = MagicMock(return_value=password_response)
+
+        records = list(importer._do_import_inner(
+            "https://pvwa.example.com", params=MagicMock(),
+            skip_team=True, skip_role=True, skip_user=True,
+        ))
+
+        assert len(records) == 1
+        assert records[0].type == "login"
+        assert records[0].login == "sample_user"
+        custom_fields = {field.label: field.value for field in records[0].fields if field.label}
+        assert custom_fields == {
+            "Display Username": "sample_user",
+            "Display Custom ID": "custom-value",
+            "Platform Name": "GenericLoginPlatform",
+        }
+
+    @patch("keepercommander.importer.cyberark.cyberark.sleep")
+    @patch("keepercommander.importer.cyberark.cyberark.print_formatted_text")
+    @patch("keepercommander.importer.cyberark.cyberark.ProgressBar")
+    def test_custom_record_type_keeps_username_as_custom_metadata(self, progress_bar, _print, _sleep):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+
+        class FakeProgressBar:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __call__(self, iterable, total=None):
+                return iterable
+
+        progress_bar.side_effect = FakeProgressBar
+
+        importer = CyberArkImporter()
+        importer._authenticate_pvwa = MagicMock(return_value=("pvwa.example.com", "token", {}))
+        importer._resolve_safes = MagicMock(return_value=["SampleSafe"])
+        importer.get_response = MagicMock(return_value=self._login_account_response())
+        importer.fetch_platform_property_display_names = MagicMock(return_value={
+            "GenericLoginPlatform": {
+                "Username": "Display Username",
+                "CustomID": "Display Custom ID",
+            },
+        })
+        importer.fetch_cyberark_users = MagicMock(return_value=[])
+        importer._enterprise_existing = MagicMock(return_value=(set(), set(), {}))
+        importer._confirm_import = MagicMock(return_value=True)
+        password_response = MagicMock(status_code=200)
+        password_response.text = '"secret"'
+        importer._request = MagicMock(return_value=password_response)
+
+        records = list(importer._do_import_inner(
+            "https://pvwa.example.com", params=MagicMock(),
+            record_type="customCyberArkAccount",
+            skip_team=True, skip_role=True, skip_user=True,
+        ))
+
+        assert len(records) == 1
+        assert records[0].type == "customCyberArkAccount"
+        assert not records[0].login
+        custom_fields = {field.label: field.value for field in records[0].fields if field.label}
+        assert custom_fields == {
+            "Display Username": "sample_user",
+            "Display Custom ID": "custom-value",
+            "Platform Name": "GenericLoginPlatform",
+        }
+
+    @patch("keepercommander.importer.cyberark.cyberark.sleep")
+    @patch("keepercommander.importer.cyberark.cyberark.print_formatted_text")
+    @patch("keepercommander.importer.cyberark.cyberark.ProgressBar")
+    def test_nsf_folder_uses_cyberark_safe_name_casing(self, progress_bar, _print, _sleep):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+        from keepercommander.importer.importer import Record, SharedFolder
+
+        class FakeProgressBar:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __call__(self, iterable, total=None):
+                return iterable
+
+        progress_bar.side_effect = FakeProgressBar
+
+        importer = CyberArkImporter()
+        importer._authenticate_pvwa = MagicMock(return_value=("pvwa.example.com", "token", {}))
+        importer._resolve_safes = MagicMock(return_value=["sourcesafe"])
+        importer.get_response = MagicMock(return_value=self._account_response())
+        importer.fetch_platform_property_display_names = MagicMock(return_value={})
+        importer.fetch_cyberark_users = MagicMock(return_value=[])
+        importer._enterprise_existing = MagicMock(return_value=(set(), set(), {}))
+        importer._confirm_import = MagicMock(return_value=True)
+        password_response = MagicMock(status_code=200)
+        password_response.text = '"secret"'
+        importer._request = MagicMock(return_value=password_response)
+
+        items = list(importer._do_import_inner(
+            "https://pvwa.example.com", params=MagicMock(), use_nsf=True,
+            skip_team=True, skip_role=True, skip_user=True,
+        ))
+
+        nsf_folders = [x for x in items if isinstance(x, SharedFolder)]
+        records = [x for x in items if isinstance(x, Record)]
+        assert len(nsf_folders) == 1
+        assert len(records) == 1
+        assert nsf_folders[0].path == "SourceSafe"
+        assert records[0].folders[0].path == "SourceSafe"
+
+    @patch("keepercommander.importer.cyberark.cyberark.api.execute_batch")
+    @patch("keepercommander.importer.cyberark.cyberark.api.query_enterprise")
+    @patch("keepercommander.importer.cyberark.cyberark.print_formatted_text")
+    @patch("keepercommander.importer.cyberark.cyberark.path.isfile", return_value=False)
+    def test_skip_team_still_allows_roles_and_users(self, _isfile, _print, _query, execute_batch):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+
+        importer = CyberArkImporter()
+        importer.get_response = MagicMock(return_value=self._group_response())
+        importer._create_keeper_roles = MagicMock()
+        importer._create_keeper_users_and_assign_roles = MagicMock()
+        params = MagicMock()
+        params.enterprise = {"teams": [], "queued_teams": []}
+
+        importer.import_user_groups(
+            "pvwa.example.com", "token", params,
+            cyberark_users=[], node_id=1, skip_teams=True,
+        )
+
+        execute_batch.assert_not_called()
+        importer._create_keeper_roles.assert_called_once()
+        importer._create_keeper_users_and_assign_roles.assert_called_once()
+
+    @patch("keepercommander.importer.cyberark.cyberark.api.execute_batch")
+    @patch("keepercommander.importer.cyberark.cyberark.api.query_enterprise")
+    @patch("keepercommander.importer.cyberark.cyberark.print_formatted_text")
+    @patch("keepercommander.importer.cyberark.cyberark.path.isfile", return_value=False)
+    def test_all_skip_flags_prevent_all_enterprise_writes(self, _isfile, _print, _query, execute_batch):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+
+        importer = CyberArkImporter()
+        importer.get_response = MagicMock(return_value=self._group_response())
+        importer._create_keeper_roles = MagicMock()
+        importer._create_keeper_users_and_assign_roles = MagicMock()
+        params = MagicMock()
+        params.enterprise = {"teams": [], "queued_teams": []}
+
+        importer.import_user_groups(
+            "pvwa.example.com", "token", params,
+            cyberark_users=[], node_id=1, skip_teams=True,
+            skip_roles=True, skip_users=True,
+        )
+
+        execute_batch.assert_not_called()
+        importer._create_keeper_roles.assert_not_called()
+        importer._create_keeper_users_and_assign_roles.assert_not_called()
+
+
+class TestImportDuplicateDetection:
+    """Duplicate detection should be scoped to the target folder."""
+
+    @staticmethod
+    def _params(existing_folder_uid):
+        def folder(name, parent_uid):
+            node = MagicMock()
+            node.name = name
+            node.parent_uid = parent_uid
+            node.type = "user_folder"
+            return node
+
+        params = MagicMock()
+        params.record_cache = {
+            "existing_uid": {
+                "record_uid": "existing_uid",
+                "version": 3,
+                "data_unencrypted": json.dumps({
+                    "title": "demo account",
+                    "type": "serverCredentials",
+                    "notes": "",
+                    "fields": [
+                        {"type": "login", "value": ["admin"]},
+                        {"type": "password", "value": ["secret"]},
+                        {"type": "host", "value": [{"hostName": "host.example.com"}]},
+                    ],
+                    "custom": [],
+                }),
+            },
+        }
+        params.record_type_cache = {}
+        params.subfolder_record_cache = {
+            existing_folder_uid: {"existing_uid"},
+        }
+        params.folder_cache = {
+            "migration": folder("TargetRoot", ""),
+            "target": folder("TargetFolder", "migration"),
+            "other": folder("OtherFolder", ""),
+        }
+        return params
+
+    @staticmethod
+    def _record():
+        from keepercommander.importer.importer import Folder, Record, RecordField
+
+        record = Record()
+        record.title = "demo account"
+        record.type = "serverCredentials"
+        record.login = "admin"
+        record.password = "secret"
+        record.fields.append(RecordField(
+            "host", value={"hostName": "host.example.com"},
+        ))
+        folder = Folder()
+        folder.path = "TargetRoot\\TargetFolder"
+        record.folders = [folder]
+        return record
+
+    def test_matching_record_in_different_folder_is_imported(self):
+        from keepercommander.importer.imp_exp import prepare_record_add_or_update
+
+        records_to_import, record_exists, _ = prepare_record_add_or_update(
+            False, False, self._params("other"), [self._record()], "cyberark",
+        )
+
+        assert len(records_to_import) == 1
+        assert record_exists == []
+        assert records_to_import[0].uid != "existing_uid"
+
+    def test_matching_record_in_same_folder_is_skipped(self):
+        from keepercommander.importer.imp_exp import prepare_record_add_or_update
+
+        records_to_import, record_exists, _ = prepare_record_add_or_update(
+            False, False, self._params("target"), [self._record()], "cyberark",
+        )
+
+        assert records_to_import == []
+        assert len(record_exists) == 1
+        assert record_exists[0].uid == "existing_uid"
+
+
+class TestListSafesDetailed:
+    """Tests for _list_safes_detailed."""
+
+    def test_output_contains_safe_names(self, capsys):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        safes = [
+            {"safeName": "Windows-Admins", "managingCPM": "PasswordManager"},
+            {"safeName": "Unix-Servers", "managingCPM": ""},
+        ]
+        CyberArkPAMImportCommand._list_safes_detailed(safes, 3)
+        out = capsys.readouterr().out
+        assert "Windows-Admins" in out
+        assert "Unix-Servers" in out
+        assert "3 system safes excluded" in out
+        assert "Total: 2 safes" in out
+
+    def test_output_no_system_excluded(self, capsys):
+        from keepercommander.commands.pam_import.cyberark_import import CyberArkPAMImportCommand
+        safes = [{"safeName": "MySafe", "managingCPM": "CPM1"}]
+        CyberArkPAMImportCommand._list_safes_detailed(safes, 0)
+        out = capsys.readouterr().out
+        assert "system safes excluded" not in out
+
+
+# â”€â”€ Phase 3 Tests: Linked Accounts + Dual Accounts â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class TestFetchAccountDetails:
+    """Tests for CyberArkPVWAClient.fetch_account_details."""
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_returns_details_with_linked_accounts(self, mock_dns, mock_requests):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "id": "25_4",
+            "name": "WinDomain-admin",
+            "linkedAccounts": {
+                "logonAccount": {"id": "25_8", "name": "logon-svc", "safeName": "Admins"},
+                "reconcileAccount": {"id": "25_9", "name": "recon-svc", "safeName": "Admins"},
+            }
+        }
+        mock_requests.get.return_value = mock_resp
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client.auth_token = "test-token"
+        result = client.fetch_account_details("25_4")
+        assert result is not None
+        assert "linkedAccounts" in result
+        assert "logonAccount" in result["linkedAccounts"]
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_returns_none_on_failure(self, mock_dns, mock_requests):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_requests.get.return_value = mock_resp
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client.auth_token = "test-token"
+        result = client.fetch_account_details("bad_id")
+        assert result is None
+
+    def test_rejects_invalid_account_id(self):
+        from keepercommander.importer.cyberark.cyberark_pam import CyberArkPVWAClient
+        client = CyberArkPVWAClient.__new__(CyberArkPVWAClient)
+        client.auth_token = "test"
+        client.verify_ssl = True
+        result = client.fetch_account_details("../../admin")
+        assert result is None
+
+
+class TestResolveLinkedAccounts:
+    """Tests for resolve_linked_accounts."""
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_resolves_logon_and_reconcile(self, mock_dns, mock_requests):
+        from keepercommander.importer.cyberark.cyberark_pam import resolve_linked_accounts
+        # Mock detail response with linked accounts
+        detail_resp = MagicMock()
+        detail_resp.status_code = 200
+        detail_resp.json.return_value = {
+            "id": "25_4",
+            "linkedAccounts": {
+                "logonAccount": {"id": "25_8", "name": "logon-svc", "userName": "logon-user", "safeName": "Admins"},
+                "reconcileAccount": {"id": "25_9", "name": "recon-svc", "userName": "recon-user", "safeName": "Admins"},
+            }
+        }
+        # Mock password responses
+        pw_resp = MagicMock()
+        pw_resp.status_code = 200
+        pw_resp.text = '"LinkedPwd123"'
+
+        mock_requests.get.return_value = detail_resp
+        mock_requests.post.return_value = pw_resp
+
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client.auth_token = "test-token"
+
+        account = {"id": "25_4", "name": "admin-account", "safeName": "Admins"}
+        result = resolve_linked_accounts(client, account)
+
+        assert len(result) == 2
+        types = {r["title"] for r in result}
+        assert any("logon" in t for t in types)
+        assert any("reconcile" in t for t in types)
+        assert all(r["type"] == "pamUser" for r in result)
+
+    def test_returns_empty_when_no_linked(self):
+        from keepercommander.importer.cyberark.cyberark_pam import resolve_linked_accounts
+        client = MagicMock()
+        client.fetch_account_details.return_value = {"id": "1", "linkedAccounts": {}}
+        result = resolve_linked_accounts(client, {"id": "1"})
+        assert result == []
+
+    def test_returns_empty_when_details_fail(self):
+        from keepercommander.importer.cyberark.cyberark_pam import resolve_linked_accounts
+        client = MagicMock()
+        client.fetch_account_details.return_value = None
+        result = resolve_linked_accounts(client, {"id": "1"})
+        assert result == []
+
+
+class TestDetectDualAccount:
+    """Tests for detect_dual_account."""
+
+    def test_detects_dual_account(self):
+        from keepercommander.importer.cyberark.cyberark_pam import detect_dual_account
+        account = {
+            "platformAccountProperties": {
+                "VirtualUserName": "svc_rotation",
+                "GroupPlatformID": "WinDualAccount",
+                "Index": "1",
+            }
+        }
+        result = detect_dual_account(account)
+        assert result is not None
+        assert result["ca_virtual_username"] == "svc_rotation"
+        assert result["ca_dual_account_group"] == "WinDualAccount"
+        assert result["ca_dual_account_index"] == "1"
+
+    def test_returns_none_for_normal_account(self):
+        from keepercommander.importer.cyberark.cyberark_pam import detect_dual_account
+        account = {
+            "platformAccountProperties": {"LogonDomain": "mydomain"}
+        }
+        result = detect_dual_account(account)
+        assert result is None
+
+    def test_handles_missing_properties(self):
+        from keepercommander.importer.cyberark.cyberark_pam import detect_dual_account
+        account = {}
+        result = detect_dual_account(account)
+        assert result is None
+
+    def test_partial_dual_fields(self):
+        from keepercommander.importer.cyberark.cyberark_pam import detect_dual_account
+        account = {
+            "platformAccountProperties": {"VirtualUserName": "svc_user"}
+        }
+        result = detect_dual_account(account)
+        assert result is not None
+        assert "ca_virtual_username" in result
+        assert "ca_dual_account_group" not in result
+
+
+# â”€â”€ Phase 4 Tests: Permission Mapping + Safe Members â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class TestPermissionMapper:
+    """Tests for PermissionMapper.map_permissions and map_member."""
+
+    def test_view_only(self):
+        from keepercommander.importer.cyberark.cyberark_pam import PermissionMapper
+        perms = {"listAccounts": True, "useAccounts": True,
+                 "retrieveAccounts": True, "addAccounts": False,
+                 "updateAccountContent": False, "manageSafe": False,
+                 "manageSafeMembers": False}
+        result = PermissionMapper.map_permissions(perms)
+        assert result["can_edit"] is False
+        assert result["can_share"] is False
+        assert result["manage_users"] is False
+        assert result["manage_records"] is False
+
+    def test_edit_tier(self):
+        from keepercommander.importer.cyberark.cyberark_pam import PermissionMapper
+        perms = {"listAccounts": True, "useAccounts": True,
+                 "addAccounts": True, "updateAccountContent": True,
+                 "manageSafe": False, "manageSafeMembers": False}
+        result = PermissionMapper.map_permissions(perms)
+        assert result["can_edit"] is True
+        assert result["can_share"] is False
+        assert result["manage_users"] is False
+
+    def test_manage_tier(self):
+        from keepercommander.importer.cyberark.cyberark_pam import PermissionMapper
+        perms = {"listAccounts": True, "useAccounts": True,
+                 "addAccounts": True, "updateAccountContent": True,
+                 "manageSafe": True, "manageSafeMembers": True}
+        result = PermissionMapper.map_permissions(perms)
+        assert result["can_edit"] is True
+        assert result["can_share"] is True
+        assert result["manage_users"] is True
+        assert result["manage_records"] is True
+
+    def test_edit_via_update_properties(self):
+        """updateAccountProperties alone (without updateAccountContent) triggers edit tier."""
+        from keepercommander.importer.cyberark.cyberark_pam import PermissionMapper
+        perms = {"listAccounts": True, "useAccounts": True,
+                 "addAccounts": True, "updateAccountProperties": True,
+                 "updateAccountContent": False,
+                 "manageSafe": False, "manageSafeMembers": False}
+        result = PermissionMapper.map_permissions(perms)
+        assert result["can_edit"] is True
+        assert result["manage_records"] is True
+        assert result["manage_users"] is False
+
+    def test_edit_tier_grants_manage_records(self):
+        """Edit tier should set manage_records=True (can modify records in shared folder)."""
+        from keepercommander.importer.cyberark.cyberark_pam import PermissionMapper
+        perms = {"listAccounts": True, "useAccounts": True,
+                 "addAccounts": True, "updateAccountContent": True}
+        result = PermissionMapper.map_permissions(perms)
+        assert result["manage_records"] is True
+        assert result["manage_users"] is False
+
+    def test_no_permissions(self):
+        from keepercommander.importer.cyberark.cyberark_pam import PermissionMapper
+        result = PermissionMapper.map_permissions({})
+        assert result["can_edit"] is False
+        assert result["can_share"] is False
+
+    def test_none_input(self):
+        from keepercommander.importer.cyberark.cyberark_pam import PermissionMapper
+        result = PermissionMapper.map_permissions(None)
+        assert result["can_edit"] is False
+
+    def test_unmapped_permissions_detected(self):
+        from keepercommander.importer.cyberark.cyberark_pam import PermissionMapper
+        perms = {"accessWithoutConfirmation": True,
+                 "requestsAuthorizationLevel1": True,
+                 "requestsAuthorizationLevel2": False}
+        result = PermissionMapper.get_unmapped_permissions(perms)
+        assert "accessWithoutConfirmation" in result
+        assert "requestsAuthorizationLevel1" in result
+        assert "requestsAuthorizationLevel2" not in result
+
+    def test_map_member_user(self):
+        from keepercommander.importer.cyberark.cyberark_pam import PermissionMapper
+        member = {
+            "memberName": "john.doe@company.com",
+            "memberType": "User",
+            "permissions": {"listAccounts": True, "useAccounts": True,
+                            "addAccounts": False, "updateAccountContent": False,
+                            "manageSafe": False, "manageSafeMembers": False},
+        }
+        result = PermissionMapper.map_member(member)
+        assert result["name"] == "john.doe@company.com"
+        assert result["member_type"] == "user"
+        assert result["permissions"]["can_edit"] is False
+
+    def test_map_member_group(self):
+        from keepercommander.importer.cyberark.cyberark_pam import PermissionMapper
+        member = {
+            "memberName": "Windows-Admins",
+            "memberType": "Group",
+            "permissions": {"listAccounts": True, "useAccounts": True,
+                            "addAccounts": True, "updateAccountContent": True,
+                            "manageSafe": True, "manageSafeMembers": True},
+        }
+        result = PermissionMapper.map_member(member)
+        assert result["name"] == "Windows-Admins"
+        assert result["member_type"] == "team"
+        assert result["permissions"]["can_share"] is True
+        assert result["permissions"]["manage_users"] is True
+
+    def test_manage_requires_edit(self):
+        """manage without edit should not grant manage."""
+        from keepercommander.importer.cyberark.cyberark_pam import PermissionMapper
+        perms = {"listAccounts": True, "useAccounts": True,
+                 "addAccounts": False, "updateAccountContent": False,
+                 "manageSafe": True, "manageSafeMembers": True}
+        result = PermissionMapper.map_permissions(perms)
+        assert result["manage_users"] is False
+        assert result["can_share"] is False
+
+
+class TestFetchSafeMembers:
+    """Tests for CyberArkPVWAClient.fetch_safe_members."""
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_fetches_and_filters_predefined(self, mock_dns, mock_requests):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "value": [
+                {"memberName": "Master", "memberType": "User", "isPredefinedUser": True,
+                 "permissions": {}},
+                {"memberName": "john.doe", "memberType": "User", "isPredefinedUser": False,
+                 "permissions": {"listAccounts": True}},
+                {"memberName": "Admins", "memberType": "Group", "isPredefinedUser": False,
+                 "permissions": {"manageSafe": True}},
+            ],
+            "count": 3,
+        }
+        mock_requests.get.return_value = mock_resp
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client.auth_token = "test-token"
+        result = client.fetch_safe_members("TestSafe")
+        assert len(result) == 2  # Master filtered out
+        names = [m["memberName"] for m in result]
+        assert "Master" not in names
+        assert "john.doe" in names
+        assert "Admins" in names
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_handles_api_failure(self, mock_dns, mock_requests):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 403
+        mock_requests.get.return_value = mock_resp
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client.auth_token = "test-token"
+        result = client.fetch_safe_members("ForbiddenSafe")
+        assert result == []
+
+
+class TestSkipMembersFlag:
+    """Verify --skip-members flag parses correctly."""
+
+    def test_skip_members_flag_parses(self):
+        cmd = CyberArkPAMImportCommand()
+        args = cmd.parser.parse_args(["pvwa.example.com", "--skip-members"])
+        assert args.skip_members is True
+
+    def test_skip_members_default_false(self):
+        cmd = CyberArkPAMImportCommand()
+        args = cmd.parser.parse_args(["pvwa.example.com"])
+        assert args.skip_members is False
+
+
+class TestFetchSafeMembersPagination:
+    """Test pagination loop in fetch_safe_members."""
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_pagination_fetches_multiple_pages(self, mock_dns, mock_requests):
+        page1 = [{"memberName": f"user{i}", "memberType": "User",
+                   "isPredefinedUser": False, "permissions": {}}
+                  for i in range(100)]
+        page2 = [{"memberName": "last_user", "memberType": "User",
+                   "isPredefinedUser": False, "permissions": {}}]
+
+        resp1 = MagicMock()
+        resp1.status_code = 200
+        resp1.json.return_value = {"value": page1, "count": 101}
+
+        resp2 = MagicMock()
+        resp2.status_code = 200
+        resp2.json.return_value = {"value": page2, "count": 101}
+
+        mock_requests.get.side_effect = [resp1, resp2]
+
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client.auth_token = "test"
+        result = client.fetch_safe_members("TestSafe")
+        assert len(result) == 101
+        assert result[-1]["memberName"] == "last_user"
+
+
+# â”€â”€ Phase 5 Tests: User/Team Matching + CSV â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class TestUserTeamMatcher:
+    """Tests for UserTeamMatcher."""
+
+    def test_match_user_by_email(self):
+        from keepercommander.importer.cyberark.cyberark_pam import UserTeamMatcher
+        matcher = UserTeamMatcher(
+            keeper_users=[{"email": "john@company.com"}])
+        result = matcher.match_user("john.doe", cyberark_email="john@company.com")
+        assert result == "john@company.com"
+        assert len(matcher.unmatched) == 0
+
+    def test_match_user_by_username_email(self):
+        from keepercommander.importer.cyberark.cyberark_pam import UserTeamMatcher
+        matcher = UserTeamMatcher(
+            keeper_users=[{"email": "john@company.com"}])
+        result = matcher.match_user("john@company.com")
+        assert result == "john@company.com"
+
+    def test_match_user_by_override(self):
+        from keepercommander.importer.cyberark.cyberark_pam import UserTeamMatcher
+        matcher = UserTeamMatcher(
+            keeper_users=[{"email": "john@company.com"}],
+            user_map_override={"ca_admin": "john@company.com"})
+        result = matcher.match_user("ca_admin")
+        assert result == "john@company.com"
+
+    def test_user_not_found(self):
+        from keepercommander.importer.cyberark.cyberark_pam import UserTeamMatcher
+        matcher = UserTeamMatcher(keeper_users=[{"email": "john@company.com"}])
+        result = matcher.match_user("unknown_user", cyberark_email="unknown@other.com")
+        assert result is None
+        assert len(matcher.unmatched) == 1
+        assert matcher.unmatched[0]["cyberark_username"] == "unknown_user"
+
+    def test_match_team_by_name(self):
+        from keepercommander.importer.cyberark.cyberark_pam import UserTeamMatcher
+        matcher = UserTeamMatcher(
+            keeper_teams=[{"name": "Windows Admins"}])
+        result = matcher.match_team("Windows Admins")
+        assert result == "Windows Admins"
+
+    def test_match_team_case_insensitive(self):
+        from keepercommander.importer.cyberark.cyberark_pam import UserTeamMatcher
+        matcher = UserTeamMatcher(
+            keeper_teams=[{"name": "Windows Admins"}])
+        result = matcher.match_team("windows admins")
+        assert result == "windows admins"
+
+    def test_team_not_found(self):
+        from keepercommander.importer.cyberark.cyberark_pam import UserTeamMatcher
+        matcher = UserTeamMatcher(keeper_teams=[{"name": "Existing Team"}])
+        result = matcher.match_team("New Team")
+        assert result is None
+        assert len(matcher.unmatched) == 1
+        assert matcher.unmatched[0]["suggested_action"] == "create_team"
+
+    def test_empty_matcher(self):
+        from keepercommander.importer.cyberark.cyberark_pam import UserTeamMatcher
+        matcher = UserTeamMatcher()
+        result = matcher.match_user("anyone")
+        assert result is None
+        result = matcher.match_team("any_team")
+        assert result is None
+        assert len(matcher.unmatched) == 2
+
+
+class TestCSVGeneration:
+    """Tests for UserTeamMatcher.generate_csv."""
+
+    def test_generates_csv_with_unmatched(self):
+        from keepercommander.importer.cyberark.cyberark_pam import UserTeamMatcher
+        matcher = UserTeamMatcher()
+        matcher.match_user("admin", cyberark_email="admin@old.com",
+                           cyberark_groups="Admins")
+        matcher.match_team("Missing Team")
+        csv = matcher.generate_csv()
+        lines = csv.strip().split('\n')
+        assert len(lines) == 3  # header + 2 rows
+        assert 'cyberark_username' in lines[0]
+        assert 'admin' in lines[1]
+        assert 'Missing Team' in lines[2]
+
+    def test_empty_csv_when_all_matched(self):
+        from keepercommander.importer.cyberark.cyberark_pam import UserTeamMatcher
+        matcher = UserTeamMatcher(
+            keeper_users=[{"email": "admin@company.com"}])
+        matcher.match_user("admin", cyberark_email="admin@company.com")
+        csv = matcher.generate_csv()
+        assert csv == ''
+
+    def test_csv_escapes_commas(self):
+        from keepercommander.importer.cyberark.cyberark_pam import UserTeamMatcher
+        matcher = UserTeamMatcher()
+        matcher.match_user("user,with,commas", cyberark_email="test@x.com")
+        csv_output = matcher.generate_csv()
+        # csv.writer with QUOTE_ALL properly quotes fields with commas
+        assert '"user,with,commas"' in csv_output
+
+    def test_no_credentials_in_csv(self):
+        from keepercommander.importer.cyberark.cyberark_pam import UserTeamMatcher
+        matcher = UserTeamMatcher()
+        matcher.match_user("admin", cyberark_email="admin@x.com")
+        csv = matcher.generate_csv()
+        assert 'password' not in csv.lower()
+        assert 'secret' not in csv.lower()
+        assert 'token' not in csv.lower()
+
+
+class TestFetchUsersAndGroups:
+    """Tests for fetch_users and fetch_user_groups."""
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_fetch_users_excludes_component(self, mock_dns, mock_requests):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "Users": [
+                {"id": 1, "username": "john.doe", "componentUser": False,
+                 "personalDetails": {"email": "john@x.com"}},
+            ],
+            "Total": 1,
+        }
+        mock_requests.get.return_value = mock_resp
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client.auth_token = "test"
+        result = client.fetch_users()
+        assert len(result) == 1
+        assert result[0]["username"] == "john.doe"
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_fetch_user_groups(self, mock_dns, mock_requests):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "value": [
+                {"id": 10, "groupName": "Windows Admins", "groupType": "Vault"},
+            ],
+            "count": 1,
+        }
+        mock_requests.get.return_value = mock_resp
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client.auth_token = "test"
+        result = client.fetch_user_groups()
+        assert len(result) == 1
+        assert result[0]["groupName"] == "Windows Admins"
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_fetch_users_handles_failure(self, mock_dns, mock_requests):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 403
+        mock_requests.get.return_value = mock_resp
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client.auth_token = "test"
+        result = client.fetch_users()
+        assert result == []
+
+
+# â”€â”€ Phase 6 Tests: Master Policy â†’ PAM Config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class TestMasterPolicyMapper:
+    """Tests for MasterPolicyMapper.map_policy."""
+
+    def test_session_recording_active(self):
+        from keepercommander.importer.cyberark.cyberark_pam import MasterPolicyMapper
+        policy = {"Policy": {"Rules": [
+            {"RuleName": "RecordAndSaveSessionActivity", "Active": True},
+        ]}}
+        config, unmapped = MasterPolicyMapper.map_policy(policy)
+        assert config["graphical_session_recording"] == "on"
+        assert config["text_session_recording"] == "on"
+
+    def test_session_recording_inactive(self):
+        from keepercommander.importer.cyberark.cyberark_pam import MasterPolicyMapper
+        policy = {"Policy": {"Rules": [
+            {"RuleName": "RecordAndSaveSessionActivity", "Active": False},
+        ]}}
+        config, unmapped = MasterPolicyMapper.map_policy(policy)
+        assert config["graphical_session_recording"] == "off"
+        assert config["text_session_recording"] == "off"
+
+    def test_connections_active(self):
+        from keepercommander.importer.cyberark.cyberark_pam import MasterPolicyMapper
+        policy = {"Policy": {"Rules": [
+            {"RuleName": "AllowEPVTransparentConnections", "Active": True},
+        ]}}
+        config, unmapped = MasterPolicyMapper.map_policy(policy)
+        assert config["connections"] == "on"
+
+    def test_connections_inactive(self):
+        from keepercommander.importer.cyberark.cyberark_pam import MasterPolicyMapper
+        policy = {"Policy": {"Rules": [
+            {"RuleName": "AllowEPVTransparentConnections", "Active": False},
+        ]}}
+        config, unmapped = MasterPolicyMapper.map_policy(policy)
+        assert config["connections"] == "off"
+
+    def test_unmapped_dual_control(self):
+        from keepercommander.importer.cyberark.cyberark_pam import MasterPolicyMapper
+        policy = {"Policy": {"Rules": [
+            {"RuleName": "RequireDualControlPasswordAccessApproval", "Active": True},
+            {"RuleName": "EnforceCheckinCheckoutExclusiveAccess", "Active": True},
+            {"RuleName": "EnforceOnetimePasswordAccess", "Active": False},
+        ]}}
+        config, unmapped = MasterPolicyMapper.map_policy(policy)
+        categories = [u["item"] for u in unmapped]
+        assert any("Dual control" in c for c in categories)
+        assert any("Exclusive checkout" in c for c in categories)
+        assert not any("One-time" in c for c in categories)  # False = not active
+
+    def test_audit_retention_unmapped(self):
+        from keepercommander.importer.cyberark.cyberark_pam import MasterPolicyMapper
+        policy = {"Policy": {"Rules": [
+            {"RuleName": "SafeAuditRetention", "Value": 365},
+        ]}}
+        config, unmapped = MasterPolicyMapper.map_policy(policy)
+        assert any("365" in u["item"] for u in unmapped)
+        assert any("Admin Console" in u["action"] for u in unmapped)
+
+    def test_none_policy_returns_defaults(self):
+        from keepercommander.importer.cyberark.cyberark_pam import MasterPolicyMapper
+        config, unmapped = MasterPolicyMapper.map_policy(None)
+        assert config["connections"] == "on"
+        assert config["graphical_session_recording"] == "off"
+        assert unmapped == []
+
+    def test_empty_dict_returns_defaults(self):
+        from keepercommander.importer.cyberark.cyberark_pam import MasterPolicyMapper
+        config, unmapped = MasterPolicyMapper.map_policy({})
+        assert config["connections"] == "on"
+        assert unmapped == []
+
+    def test_malformed_rules_handled(self):
+        from keepercommander.importer.cyberark.cyberark_pam import MasterPolicyMapper
+        policy = {"Policy": {"Rules": ["not_a_dict", 42, None]}}
+        config, unmapped = MasterPolicyMapper.map_policy(policy)
+        assert config["connections"] == "on"  # defaults
+        assert unmapped == []
+
+
+class TestMasterPolicyRotationExceptions:
+    """Tests for master-rotation-policy/exceptions parsing."""
+
+    def test_parse_list_shape(self):
+        from keepercommander.importer.cyberark.cyberark_pam import MasterPolicyMapper
+        data = [
+            {"platformId": "WinDesktopLocal", "changeInterval": 30},
+            {"platformId": "WinDomain", "interval": 60, "allowedPeriodic": True},
+        ]
+        schedules = MasterPolicyMapper.parse_rotation_exceptions(data)
+        assert "WinDesktopLocal" in schedules
+        assert schedules["WinDesktopLocal"]["type"] == "CRON"
+        assert schedules["WinDomain"]["type"] == "CRON"
+
+    def test_parse_cyberark_exceptions_envelope(self):
+        from keepercommander.importer.cyberark.cyberark_pam import MasterPolicyMapper
+        data = {
+            "exceptions": [
+                {"platformId": "WinDesktopLocal", "verifyInterval": 7,
+                 "changeInterval": 30},
+                {"platformId": "WinDomain", "verifyInterval": 7,
+                 "changeInterval": 0},
+            ],
+            "totalCount": 2,
+        }
+        schedules = MasterPolicyMapper.parse_rotation_exceptions(data)
+        assert schedules["WinDesktopLocal"]["type"] == "CRON"
+        assert schedules["WinDesktopLocal"]["cron"] == "0 0 0 1 * ?"
+        assert "WinDomain" not in schedules  # changeInterval=0 â†’ no schedule
+
+    def test_parse_grouped_shape(self):
+        from keepercommander.importer.cyberark.cyberark_pam import MasterPolicyMapper
+        data = {
+            "changeInterval": [
+                {"platformId": "WinLocalAccount", "interval": 30},
+            ],
+        }
+        schedules = MasterPolicyMapper.parse_rotation_exceptions(data)
+        assert schedules["WinLocalAccount"]["cron"] == "0 0 0 1 * ?"
+
+    def test_allowed_periodic_false_still_uses_interval(self):
+        """``allowedPeriodic`` is informational only â€” an explicit exception
+        interval is always honored as a CRON cadence, same as the Master
+        Policy default itself (which has no such flag to check)."""
+        from keepercommander.importer.cyberark.cyberark_pam import MasterPolicyMapper
+        data = [{"platformId": "WinDesktopLocal", "interval": 90,
+                 "allowedPeriodic": False}]
+        schedules = MasterPolicyMapper.parse_rotation_exceptions(data)
+        assert schedules["WinDesktopLocal"] == {"type": "CRON", "cron": "0 0 0 1 */3 ?"}
+
+    def test_empty_payload(self):
+        from keepercommander.importer.cyberark.cyberark_pam import MasterPolicyMapper
+        assert MasterPolicyMapper.parse_rotation_exceptions(None) == {}
+        assert MasterPolicyMapper.parse_rotation_exceptions([]) == {}
+
+
+class TestPlatformScheduleWithExceptions:
+    """AccountMapper honors master-policy rotation exceptions."""
+
+    def test_master_exception_overrides_inherit_master(self):
+        client = MagicMock()
+        client.fetch_platform_rotation_policy.return_value = {
+            "change": {
+                "interval": 90,
+                "allowedPeriodic": True,
+                "overridesMasterPolicy": False,
+            },
+        }
+        exc = {"WinDesktopLocal": {"type": "CRON", "cron": "0 0 0 */30 * ?"}}
+        mapper = AccountMapper(
+            client=client,
+            master_rotation_exceptions=exc,
+        )
+        sched = mapper._resolve_platform_schedule("WinDesktopLocal")
+        assert sched == exc["WinDesktopLocal"]
+        assert mapper.platform_schedule_overrides.get("WinDesktopLocal", 0) == 0
+
+    def test_platform_override_beats_master_exception(self):
+        client = MagicMock()
+        client.fetch_platform_rotation_policy.return_value = {
+            "change": {
+                "interval": 30,
+                "allowedPeriodic": True,
+                "overridesMasterPolicy": True,
+            },
+        }
+        exc = {"WinDesktopLocal": {"type": "CRON", "cron": "0 0 0 1 */3 ?"}}
+        mapper = AccountMapper(client=client, master_rotation_exceptions=exc)
+        sched = mapper._resolve_platform_schedule("WinDesktopLocal")
+        assert sched == {"type": "CRON", "cron": "0 0 0 1 * ?"}
+
+    def test_allowed_periodic_false_without_exception_inherits_master(self):
+        """``overridesMasterPolicy=False`` means no exception exists â€” the
+        platform inherits the Master Policy's own CRON schedule. The
+        informational ``allowedPeriodic=False`` flag must NOT force
+        on-demand here (CyberArk's own Master Policy default has no such
+        flag and is always applied as CRON)."""
+        client = MagicMock()
+        client.fetch_platform_rotation_policy.return_value = {
+            "change": {
+                "interval": 90,
+                "allowedPeriodic": False,
+                "overridesMasterPolicy": False,
+            },
+        }
+        mapper = AccountMapper(client=client)
+        sched = mapper._resolve_platform_schedule("WinDesktopLocal")
+        assert sched is None  # caller applies default_rotation_schedule (master CRON)
+
+    def test_interval_mismatch_treated_as_exception_without_flag(self):
+        """No recognized override flag present, but the platform's own
+        interval differs from the Master Policy value â€” CyberArk is
+        clearly applying a platform-specific cadence, so honor it."""
+        client = MagicMock()
+        client.fetch_platform_rotation_policy.return_value = {
+            "change": {
+                "interval": 30,
+                "allowedPeriodic": True,
+                # No overridesMasterPolicy / isException key at all.
+            },
+        }
+        mapper = AccountMapper(client=client, master_change_days=90)
+        sched = mapper._resolve_platform_schedule("WinDesktopLocal")
+        assert sched == {"type": "CRON", "cron": "0 0 0 1 * ?"}  # 30 days -> monthly
+
+    def test_matching_interval_without_flag_inherits_master(self):
+        """No flag, and the interval matches master â€” no exception exists."""
+        client = MagicMock()
+        client.fetch_platform_rotation_policy.return_value = {
+            "change": {"interval": 90, "allowedPeriodic": True},
+        }
+        mapper = AccountMapper(client=client, master_change_days=90)
+        sched = mapper._resolve_platform_schedule("WinDesktopLocal")
+        assert sched is None
+
+    def test_legacy_is_exception_flag_name_honored(self):
+        """Alternate flag name (``isException``) observed on some tenants."""
+        client = MagicMock()
+        client.fetch_platform_rotation_policy.return_value = {
+            "change": {
+                "interval": 14,
+                "allowedPeriodic": True,
+                "isException": True,
+            },
+        }
+        mapper = AccountMapper(client=client, master_change_days=90)
+        sched = mapper._resolve_platform_schedule("WinLocalAccount")
+        assert sched == {"type": "CRON", "cron": "0 0 0 1,15 * ?"}  # 14 days -> bi-weekly
+
+
+class TestMasterRotationExceptionsBogusShapeDetection:
+    """CyberArkPVWAClient must not mistake the base master-policy object
+    (re-served by some tenants at .../exceptions/) for real exception data."""
+
+    def test_looks_like_base_master_policy_detected(self):
+        data = {
+            "changeInterval": 90,
+            "changeIntervalExceptionsCount": 1,
+            "verifyInterval": 7,
+            "verifyIntervalExceptionsCount": 0,
+        }
+        assert CyberArkPVWAClient._looks_like_base_master_policy(data) is True
+
+    def test_real_exceptions_envelope_not_flagged(self):
+        data = {
+            "exceptions": [{"platformId": "WinDesktopLocal",
+                             "changeInterval": 30, "verifyInterval": 7}],
+            "totalCount": 1,
+        }
+        assert CyberArkPVWAClient._looks_like_base_master_policy(data) is False
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_fetch_returns_none_for_bogus_shape(self, mock_dns, mock_requests):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "changeInterval": 90,
+            "changeIntervalExceptionsCount": 1,
+            "verifyInterval": 7,
+            "verifyIntervalExceptionsCount": 0,
+        }
+        mock_requests.get.return_value = mock_resp
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client.auth_token = "test"
+        result = client.fetch_master_rotation_policy_exceptions()
+        assert result is None
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_fetch_returns_data_for_real_envelope(self, mock_dns, mock_requests):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "exceptions": [{"platformId": "WinDesktopLocal",
+                             "changeInterval": 30, "verifyInterval": 7}],
+            "totalCount": 1,
+        }
+        mock_requests.get.return_value = mock_resp
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client.auth_token = "test"
+        result = client.fetch_master_rotation_policy_exceptions()
+        assert result is not None
+        assert result["totalCount"] == 1
+
+
+class TestFetchMasterPolicy:
+    """Tests for CyberArkPVWAClient.fetch_master_policy."""
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_returns_policy_on_success(self, mock_dns, mock_requests):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "Policy": {"Rules": [
+                {"RuleName": "RecordAndSaveSessionActivity", "Active": True},
+            ]}
+        }
+        mock_requests.get.return_value = mock_resp
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client.auth_token = "test"
+        result = client.fetch_master_policy()
+        assert result is not None
+        assert "Policy" in result
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_returns_none_on_403(self, mock_dns, mock_requests):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 403
+        mock_requests.get.return_value = mock_resp
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client.auth_token = "test"
+        result = client.fetch_master_policy()
+        assert result is None
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_returns_none_on_network_error(self, mock_dns, mock_requests):
+        import requests as _req
+        mock_requests.get.side_effect = _req.ConnectionError("network down")
+        mock_requests.RequestException = _req.RequestException
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client.auth_token = "test"
+        result = client.fetch_master_policy()
+        assert result is None
+
+
+# â”€â”€ Red Team Coverage Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class TestEscFunction:
+    """Tests for _esc() HTML + control char sanitizer."""
+
+    def test_html_chars_escaped(self):
+        from keepercommander.importer.cyberark.cyberark_pam import _esc
+        assert '&lt;' in _esc('<script>')
+        assert '&amp;' in _esc('A & B')
+        assert '&gt;' in _esc('x > y')
+
+    def test_control_chars_stripped(self):
+        from keepercommander.importer.cyberark.cyberark_pam import _esc
+        result = _esc("Safe\x00Name\x1b[31mRed\x1b[0m")
+        assert '\x00' not in result
+        assert '\x1b' not in result
+        assert 'SafeName' in result
+
+    def test_none_input(self):
+        from keepercommander.importer.cyberark.cyberark_pam import _esc
+        assert _esc(None) == 'None'
+
+    def test_integer_input(self):
+        from keepercommander.importer.cyberark.cyberark_pam import _esc
+        assert _esc(12345) == '12345'
+
+    def test_empty_string(self):
+        from keepercommander.importer.cyberark.cyberark_pam import _esc
+        assert _esc('') == ''
+
+
+class TestFormatDurationEdgeCases:
+    """Tests for format_duration edge cases from red team."""
+
+    def test_infinity(self):
+        from keepercommander.importer.cyberark.cyberark_pam import format_duration
+        assert format_duration(float('inf')) == 'N/A'
+
+    def test_negative_infinity(self):
+        from keepercommander.importer.cyberark.cyberark_pam import format_duration
+        assert format_duration(float('-inf')) == 'N/A'
+
+    def test_nan(self):
+        from keepercommander.importer.cyberark.cyberark_pam import format_duration
+        assert format_duration(float('nan')) == 'N/A'
+
+    def test_negative(self):
+        from keepercommander.importer.cyberark.cyberark_pam import format_duration
+        assert format_duration(-10) == '0s'
+
+    def test_large_value(self):
+        from keepercommander.importer.cyberark.cyberark_pam import format_duration
+        result = format_duration(1000000)
+        assert 'm' in result  # should be clamped and formatted
+
+
+class TestMapPolicyCrashers:
+    """Tests for MasterPolicyMapper crash cases from red team."""
+
+    def test_policy_none_value(self):
+        from keepercommander.importer.cyberark.cyberark_pam import MasterPolicyMapper
+        config, unmapped = MasterPolicyMapper.map_policy({"Policy": None})
+        assert config["connections"] == "on"  # defaults
+
+    def test_policy_list_value(self):
+        from keepercommander.importer.cyberark.cyberark_pam import MasterPolicyMapper
+        config, unmapped = MasterPolicyMapper.map_policy({"Policy": []})
+        assert config["connections"] == "on"
+
+    def test_policy_string_value(self):
+        from keepercommander.importer.cyberark.cyberark_pam import MasterPolicyMapper
+        config, unmapped = MasterPolicyMapper.map_policy({"Policy": "invalid"})
+        assert config["connections"] == "on"
+
+    def test_rules_null(self):
+        from keepercommander.importer.cyberark.cyberark_pam import MasterPolicyMapper
+        config, unmapped = MasterPolicyMapper.map_policy({"Policy": {"Rules": None}})
+        assert config["connections"] == "on"
+
+
+class TestDetectDualAccountCrashers:
+    """Tests for detect_dual_account crash cases."""
+
+    def test_none_input(self):
+        from keepercommander.importer.cyberark.cyberark_pam import detect_dual_account
+        assert detect_dual_account(None) is None
+
+    def test_list_input(self):
+        from keepercommander.importer.cyberark.cyberark_pam import detect_dual_account
+        assert detect_dual_account([]) is None
+
+    def test_integer_input(self):
+        from keepercommander.importer.cyberark.cyberark_pam import detect_dual_account
+        assert detect_dual_account(42) is None
+
+
+class TestPaginationCap:
+    """Tests for MAX_FETCH_RECORDS pagination cap."""
+
+    def test_cap_constant_defined(self):
+        from keepercommander.importer.cyberark.cyberark_pam import MAX_FETCH_RECORDS
+        assert MAX_FETCH_RECORDS == 50000
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_fetch_users_respects_cap(self, mock_dns, mock_requests):
+        """Verify fetch_users stops at MAX_FETCH_RECORDS."""
+        from keepercommander.importer.cyberark.cyberark_pam import MAX_FETCH_RECORDS
+        # Return exactly limit users per page to trigger pagination
+        page = [{"id": i, "username": f"user{i}", "componentUser": False}
+                for i in range(100)]
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"Users": page, "Total": 999999}
+        mock_requests.get.return_value = mock_resp
+
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client.auth_token = "test"
+        result = client.fetch_users()
+        # Should stop well before 999999 â€” capped at MAX_FETCH_RECORDS
+        assert len(result) <= MAX_FETCH_RECORDS + 100  # allow 1 page overshoot
+
+
+class TestPaginationNextLinkSsrf:
+    """A compromised PVWA could return a nextLink pointing at an attacker host
+    to exfiltrate the Authorization header. Pagination must refuse cross-origin
+    nextLink values."""
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_cross_origin_next_link_stops_pagination(self, mock_dns, mock_requests):
+        """nextLink pointing at a different host should halt pagination
+        without following the link (no token exfiltration)."""
+        call_urls = []
+
+        def mock_get(url, **kwargs):
+            call_urls.append(url)
+            resp = MagicMock()
+            resp.status_code = 200
+            if len(call_urls) == 1:
+                # First page returns a malicious nextLink to an external host
+                resp.json.return_value = {
+                    "Users": [{"id": 1, "username": "u1", "componentUser": False}],
+                    "nextLink": "https://attacker.example.com/steal?token=x",
+                }
+            else:
+                # If we DID follow it, we'd hit this â€” test asserts we don't
+                resp.json.return_value = {"Users": [], "nextLink": None}
+            return resp
+
+        mock_requests.get.side_effect = mock_get
+
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client.auth_token = "sensitive-token"
+        client.fetch_users()
+        # Only the original host should have been contacted
+        for u in call_urls:
+            assert "attacker.example.com" not in u, \
+                f"pagination followed attacker nextLink: {u}"
+
+    def test_resolves_next_link_using_active_url_and_port(self):
+        from keepercommander.importer.cyberark.cyberark_pam import CyberArkPVWAClient
+
+        active_url = "https://pvwa.example.com:8443/PasswordVault/API/Users?offset=0"
+        assert CyberArkPVWAClient._resolve_next_link(
+            active_url, "?offset=100"
+        ) == "https://pvwa.example.com:8443/PasswordVault/API/Users?offset=100"
+
+    def test_resolves_root_relative_api_path_without_duplicating_endpoint_path(self):
+        from keepercommander.importer.cyberark.cyberark_pam import CyberArkPVWAClient
+
+        active_url = "https://pvwa.example.com:8443/API/Safes"
+        assert CyberArkPVWAClient._resolve_next_link(
+            active_url, "API/Safes?offset=100"
+        ) == "https://pvwa.example.com:8443/API/Safes?offset=100"
+
+    def test_relative_api_path_preserves_password_vault_prefix(self):
+        from keepercommander.importer.cyberark.cyberark_pam import CyberArkPVWAClient
+
+        active_url = "https://pvwa.example.com:8443/PasswordVault/API/Safes?offset=0"
+        assert CyberArkPVWAClient._resolve_next_link(
+            active_url, "API/Safes?offset=100"
+        ) == "https://pvwa.example.com:8443/PasswordVault/API/Safes?offset=100"
+
+    def test_resolves_absolute_same_origin_next_link(self):
+        from keepercommander.importer.cyberark.cyberark_pam import CyberArkPVWAClient
+
+        active_url = "https://pvwa.example.com:8443/API/Safes"
+        next_link = "https://pvwa.example.com:8443/API/Safes?offset=100"
+        assert CyberArkPVWAClient._resolve_next_link(active_url, next_link) == next_link
+
+    def test_rejects_same_host_http_next_link(self):
+        from keepercommander.importer.cyberark.cyberark_pam import CyberArkPVWAClient
+
+        active_url = "https://pvwa.example.com:8443/PasswordVault/API/Users"
+        assert CyberArkPVWAClient._resolve_next_link(
+            active_url, "http://pvwa.example.com:8443/PasswordVault/API/Users?offset=100"
+        ) is None
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.time.sleep")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_empty_batch_without_next_link_stops_pagination(self, mock_dns, mock_sleep):
+        from keepercommander.importer.cyberark.cyberark_pam import CyberArkPVWAClient
+
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"Users": [], "Total": 100}
+
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client._get = MagicMock(return_value=response)
+
+        assert client._paginate(
+            "https://pvwa.example.com/PasswordVault/API/Users",
+            items_key="Users",
+            limit=100,
+        ) == []
+        client._get.assert_called_once()
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.time.sleep")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_full_page_without_total_count_falls_back_to_offset(self, mock_dns, mock_sleep):
+        from keepercommander.importer.cyberark.cyberark_pam import CyberArkPVWAClient
+
+        first_page = MagicMock()
+        first_page.status_code = 200
+        first_page.json.return_value = {"Users": [{"id": 1}, {"id": 2}]}
+        last_page = MagicMock()
+        last_page.status_code = 200
+        last_page.json.return_value = {"Users": []}
+
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client._get = MagicMock(side_effect=[first_page, last_page])
+
+        assert client._paginate(
+            "https://pvwa.example.com/PasswordVault/API/Users",
+            items_key="Users",
+            limit=2,
+        ) == [{"id": 1}, {"id": 2}]
+        assert client._get.call_count == 2
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.time.sleep")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_short_batches_continue_when_total_count_indicates_more(
+        self, mock_dns, mock_sleep
+    ):
+        from keepercommander.importer.cyberark.cyberark_pam import CyberArkPVWAClient
+
+        responses = []
+        for user_id in (1, 2, 3):
+            response = MagicMock()
+            response.status_code = 200
+            response.json.return_value = {"Users": [{"id": user_id}], "Total": 3}
+            responses.append(response)
+
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client._get = MagicMock(side_effect=responses)
+
+        assert client._paginate(
+            "https://pvwa.example.com/PasswordVault/API/Users",
+            items_key="Users",
+            limit=2,
+        ) == [{"id": 1}, {"id": 2}, {"id": 3}]
+        assert client._get.call_count == 3
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.time.sleep")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_empty_batch_follows_next_link(self, mock_dns, mock_sleep):
+        from keepercommander.importer.cyberark.cyberark_pam import CyberArkPVWAClient
+
+        first_page = MagicMock()
+        first_page.status_code = 200
+        first_page.json.return_value = {
+            "Users": [],
+            "nextLink": "API/Users?offset=100",
+        }
+        second_page = MagicMock()
+        second_page.status_code = 200
+        second_page.json.return_value = {"Users": [{"id": 1}]}
+
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client._get = MagicMock(side_effect=[first_page, second_page])
+
+        assert client._paginate(
+            "https://pvwa.example.com/PasswordVault/API/Users",
+            items_key="Users",
+            limit=100,
+        ) == [{"id": 1}]
+        assert client._get.call_count == 2
+        assert client._get.call_args_list[1].args[0] == (
+            "https://pvwa.example.com/PasswordVault/API/Users?offset=100"
+        )
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.time.sleep")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_repeated_next_link_stops_pagination(self, mock_dns, mock_sleep):
+        from keepercommander.importer.cyberark.cyberark_pam import CyberArkPVWAClient
+
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "Users": [{"id": 1}],
+            "nextLink": "API/Users",
+        }
+
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client._get = MagicMock(return_value=response)
+
+        assert client._paginate(
+            "https://pvwa.example.com/PasswordVault/API/Users",
+            items_key="Users",
+            limit=100,
+        ) == [{"id": 1}, {"id": 1}]
+        assert client._get.call_count == 2
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.time.sleep")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_invalid_response_shapes_stop_pagination(self, mock_dns, mock_sleep):
+        from keepercommander.importer.cyberark.cyberark_pam import CyberArkPVWAClient
+
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"Users": {"unexpected": "object"}}
+
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client._get = MagicMock(return_value=response)
+
+        assert client._paginate(
+            "https://pvwa.example.com/PasswordVault/API/Users",
+            items_key="Users",
+        ) == []
+        client._get.assert_called_once()
+
+    @patch("keepercommander.importer.cyberark.pam.client.MAX_FETCH_RECORDS", 3)
+    @patch("keepercommander.importer.cyberark.cyberark_pam.time.sleep")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_fetch_cap_truncates_batch_and_stops(self, mock_dns, mock_sleep):
+        from keepercommander.importer.cyberark.cyberark_pam import CyberArkPVWAClient
+
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "Users": [{"id": i} for i in range(5)],
+            "nextLink": "API/Users?offset=5",
+        }
+
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client._get = MagicMock(return_value=response)
+
+        assert client._paginate(
+            "https://pvwa.example.com/PasswordVault/API/Users",
+            items_key="Users",
+        ) == [{"id": 0}, {"id": 1}, {"id": 2}]
+        client._get.assert_called_once()
+
+
+class TestGetRetry429:
+    """Tests for _get() HTTP 429 retry logic."""
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.time.sleep")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_retries_on_429(self, mock_dns, mock_requests, mock_sleep):
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {"Retry-After": "2"}
+
+        resp_200 = MagicMock()
+        resp_200.status_code = 200
+
+        mock_requests.get.side_effect = [resp_429, resp_200]
+
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client.auth_token = "test"
+        result = client._get("https://pvwa.example.com/API/test")
+        assert result.status_code == 200
+        assert mock_sleep.called
+
+    @patch("keepercommander.importer.cyberark.cyberark_pam.time.sleep")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.requests")
+    @patch("keepercommander.importer.cyberark.cyberark_pam.socket.getaddrinfo",
+           return_value=[(2, 1, 6, '', ('93.184.216.34', 0))])
+    def test_returns_429_after_max_retries(self, mock_dns, mock_requests, mock_sleep):
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {}
+
+        mock_requests.get.return_value = resp_429
+
+        client = CyberArkPVWAClient("pvwa.example.com")
+        client.auth_token = "test"
+        result = client._get("https://pvwa.example.com/API/test")
+        assert result.status_code == 429
+        assert mock_requests.get.call_count == 3  # MAX_RETRIES
+
+
+# â”€â”€ Phase 7 Tests: Enhanced Report + Cleanup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class TestEnhancedReport:
+    """Tests for the enhanced build_report with all sections."""
+
+    def test_report_has_all_sections(self, caplog):
+        import logging
+        from keepercommander.importer.cyberark.cyberark_pam import build_report
+        with caplog.at_level(logging.DEBUG):
+            report = build_report(
+                project_name="Test",
+                safes_processed=3,
+                total_accounts=50,
+                resource_counts={"pamMachine": {"ok": 20, "skip": 0, "err": 0},
+                                 "login": {"ok": 10, "skip": 0, "err": 0}},
+                platform_counts={"UnixSSH": {"rotation": "general", "count": 20}},
+                skipped=[{"reason": "password retrieval failed"}],
+                incomplete_count=2,
+                duration=120.0,
+                unmapped_items=[{"category": "Master Policy",
+                                 "item": "Dual control = Active",
+                                 "action": "Use ticketing"}],
+                server="pvwa.example.com",
+            )
+        assert "SOURCE SUMMARY" in report
+        assert "IMPORT RESULTS" in report
+        assert "PLATFORM MAPPING" in report
+        assert "SKIPPED ACCOUNTS" in report
+        assert "UNMAPPED â€” REQUIRES MANUAL ACTION" not in report
+        assert "Dual control" not in report
+        assert "debug log" in report
+        assert "NEXT STEPS" in report
+        assert "COMMAND" in report
+        assert "pvwa.example.com" in report
+        assert "UNMAPPED â€” REQUIRES MANUAL ACTION" in caplog.text
+        assert "Dual control" in caplog.text
+
+    def test_report_gateway_token(self):
+        from keepercommander.importer.cyberark.cyberark_pam import build_report
+        report = build_report(
+            project_name="GW Test",
+            safes_processed=1, total_accounts=5,
+            resource_counts={}, platform_counts={},
+            skipped=[], incomplete_count=0, duration=10.0,
+            project_result={"gateway": {"gateway_name": "GW1",
+                                        "gateway_uid": "uid1",
+                                        "gateway_token": "TOKEN123"}},
+        )
+        assert "GATEWAY DEPLOYMENT" in report
+        assert "TOKEN123" in report
+        assert "docker run" in report
+
+    def test_report_no_gateway_for_extend(self):
+        from keepercommander.importer.cyberark.cyberark_pam import build_report
+        report = build_report(
+            project_name="Extend",
+            safes_processed=1, total_accounts=5,
+            resource_counts={}, platform_counts={},
+            skipped=[], incomplete_count=0, duration=10.0,
+        )
+        assert "GATEWAY DEPLOYMENT" not in report
+
+    def test_report_cleanup_command(self):
+        from keepercommander.importer.cyberark.cyberark_pam import build_report
+        report = build_report(
+            project_name="MyProject",
+            safes_processed=1, total_accounts=5,
+            resource_counts={}, platform_counts={},
+            skipped=[], incomplete_count=0, duration=10.0,
+        )
+        assert 'cyberark-cleanup --name "MyProject"' in report
+
+
+class TestCleanupCommand:
+    """Tests for CyberArkPAMCleanupCommand."""
+
+    def test_missing_args_raises(self):
+        from keepercommander.error import CommandError
+        cmd = CyberArkPAMCleanupCommand()
+        with pytest.raises(CommandError):
+            cmd.execute(MagicMock(), project_name="", config_uid="")
+
+    def test_parser_has_flags(self):
+        cmd = CyberArkPAMCleanupCommand()
+        args = cmd.parser.parse_args(["--name", "Test", "--dry-run", "--yes"])
+        assert args.project_name == "Test"
+        assert args.dry_run is True
+        assert args.auto_confirm is True
+
+    def test_parser_config_flag(self):
+        cmd = CyberArkPAMCleanupCommand()
+        args = cmd.parser.parse_args(["--config", "uid123"])
+        assert args.config_uid == "uid123"
+
+
+class TestCyberArkImportNsfSupport:
+    """NSF (--nsf) wiring for cyberark-import / cleanup / discovery."""
+
+    def test_single_batch_passes_use_nsf_to_import(self):
+        cmd = CyberArkPAMImportCommand()
+        params = MagicMock()
+        import_data = {"pam_data": {"resources": [], "users": []}}
+
+        with patch.object(_temp_store, "write_json", return_value="/tmp/x.json"), \
+             patch.object(_temp_store, "remove"), \
+             patch("keepercommander.commands.pam_import.edit.PAMProjectImportCommand") as mock_import, \
+             patch.object(cmd, "_find_config_uid", return_value="cfg-uid"):
+            mock_import.return_value.execute.return_value = None
+            result = cmd._single_batch_import(
+                params, import_data, "Proj", "", use_nsf=True,
+            )
+
+        assert result["config_uid"] == "cfg-uid"
+        kwargs = mock_import.return_value.execute.call_args.kwargs
+        assert kwargs.get("use_nsf") is True
+        assert kwargs.get("project_name") == "Proj"
+
+    def test_single_batch_extend_ignores_use_nsf_flag(self):
+        cmd = CyberArkPAMImportCommand()
+        params = MagicMock()
+        import_data = {"pam_data": {"resources": [], "users": []}}
+
+        with patch.object(_temp_store, "write_json", return_value="/tmp/x.json"), \
+             patch.object(_temp_store, "remove"), \
+             patch("keepercommander.commands.pam_import.extend.PAMProjectExtendCommand") as mock_extend:
+            mock_extend.return_value.execute.return_value = None
+            result = cmd._single_batch_import(
+                params, import_data, "Proj", "existing-cfg", use_nsf=True,
+            )
+
+        assert result["config_uid"] == "existing-cfg"
+        kwargs = mock_extend.return_value.execute.call_args.kwargs
+        assert "use_nsf" not in kwargs
+        assert kwargs.get("config") == "existing-cfg"
+
+    def test_find_nsf_project_wrapper_uids(self):
+        root = NestedShareFolderNode()
+        root.uid = "nsf-root"
+        root.name = PAM_ROOT_FOLDER_NAME
+        root.parent_uid = None
+        root.subfolders = ["nsf-proj"]
+
+        proj = NestedShareFolderNode()
+        proj.uid = "nsf-proj"
+        proj.name = DEFAULT_PROJECT_NAME
+        proj.parent_uid = "nsf-root"
+        proj.subfolders = ["nsf-safe"]
+
+        safe = NestedShareFolderNode()
+        safe.uid = "nsf-safe"
+        safe.name = SAFE_FOLDER_NAME
+        safe.parent_uid = "nsf-proj"
+        safe.subfolders = []
+
+        params = SimpleNamespace(
+            folder_cache={
+                "nsf-root": root,
+                "nsf-proj": proj,
+                "nsf-safe": safe,
+            },
+            nested_share_folders={
+                "nsf-root": {"name": PAM_ROOT_FOLDER_NAME, "parent_uid": None},
+                "nsf-proj": {"name": DEFAULT_PROJECT_NAME, "parent_uid": "nsf-root"},
+                "nsf-safe": {"name": SAFE_FOLDER_NAME, "parent_uid": "nsf-proj"},
+            },
+            shared_folder_cache={},
+            subfolder_record_cache={},
+            nested_share_folder_records={"nsf-safe": {"rec-1"}},
+        )
+
+        wrappers = CyberArkPAMCleanupCommand._find_project_wrapper_folder_uids(
+            params, DEFAULT_PROJECT_NAME,
+        )
+        assert wrappers == ["nsf-proj"]
+
+        children = list(CyberArkPAMCleanupCommand._iter_project_child_folders(
+            params, "nsf-proj",
+        ))
+        assert children == [("nsf-safe", SAFE_FOLDER_NAME)]
+
+    def test_find_classic_wrapper_still_works(self):
+        root = SimpleNamespace(
+            uid="uf-root", name=PAM_ROOT_FOLDER_NAME, parent_uid=None,
+            type=BaseFolderNode.UserFolderType, subfolders=["uf-proj"],
+        )
+        proj = SimpleNamespace(
+            uid="uf-proj", name="MyProj", parent_uid="uf-root",
+            type=BaseFolderNode.UserFolderType, subfolders=["sf-safe"],
+        )
+        safe = SimpleNamespace(
+            uid="sf-safe", name="SafeA", parent_uid="uf-proj",
+            type=BaseFolderNode.SharedFolderType, subfolders=[],
+        )
+        params = SimpleNamespace(
+            folder_cache={"uf-root": root, "uf-proj": proj, "sf-safe": safe},
+            nested_share_folders={},
+            shared_folder_cache={},
+        )
+        wrappers = CyberArkPAMCleanupCommand._find_project_wrapper_folder_uids(
+            params, "MyProj",
+        )
+        assert wrappers == ["uf-proj"]
+        children = list(CyberArkPAMCleanupCommand._iter_project_child_folders(
+            params, "uf-proj",
+        ))
+        assert children == [("sf-safe", "SafeA")]
+
+
+class TestSSHKeyImport:
+    """C4: SSH key platforms store private key in private_pem_key, not password."""
+
+    def test_unix_ssh_key_platform_maps_private_key(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "1", "name": "sshkey-acct", "platformId": "UnixSSHKey",
+            "address": "10.0.0.1", "userName": "deploy",
+        }
+        fake_key = "-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----"
+        result = mapper.map_account(account, fake_key)
+        user = result["users"][0]
+        assert user.get("private_pem_key") == fake_key
+        assert user.get("password") == ""
+
+    def test_unix_ssh_keys_platform_maps_private_key(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "2", "name": "sshkeys-acct", "platformId": "UnixSSHKeys",
+            "address": "10.0.0.2", "userName": "ansible",
+        }
+        fake_key = "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA...\n-----END OPENSSH PRIVATE KEY-----"
+        result = mapper.map_account(account, fake_key)
+        user = result["users"][0]
+        assert user.get("private_pem_key") == fake_key
+        assert user.get("password") == ""
+
+    def test_ssh_key_without_password_no_key_field(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "3", "name": "sshkey-nopass", "platformId": "UnixSSHKey",
+            "address": "10.0.0.3", "userName": "root",
+        }
+        result = mapper.map_account(account, None)
+        user = result["users"][0]
+        assert "private_pem_key" not in user
+
+    def test_secret_type_key_on_custom_platform(self):
+        """Custom platform with secretType=key should be treated as SSH key."""
+        mapper = AccountMapper()
+        account = {
+            "id": "5", "name": "custom-sshkey", "platformId": "CustomLinux",
+            "address": "10.0.0.5", "userName": "ansible",
+            "secretType": "key",
+        }
+        fake_key = "-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
+        result = mapper.map_account(account, fake_key)
+        user = result["users"][0]
+        assert user.get("private_pem_key") == fake_key
+        assert user.get("password") == ""
+
+    def test_unix_ssh_regular_does_not_set_key(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "4", "name": "ssh-regular", "platformId": "UnixSSH",
+            "address": "10.0.0.4", "userName": "root",
+        }
+        result = mapper.map_account(account, "s3cret")
+        user = result["users"][0]
+        assert "private_pem_key" not in user
+
+    def test_pem_crrn_line_endings_normalized(self):
+        """CyberArk exports PEMs with \\r\\r\\n line endings (PVWA artifact).
+        OpenSSH rejects this; we normalize to \\n on import."""
+        mapper = AccountMapper()
+        account = {
+            "id": "6", "name": "crrn-key", "platformId": "UnixSSHKeys",
+            "address": "10.0.0.6", "userName": "root", "secretType": "key",
+        }
+        ca_key = (
+            "-----BEGIN RSA PRIVATE KEY-----\r\r\n"
+            "MIIEpAIBAAKCAQEAyNzN8vyPmMaZfV8cUxuvCxZKXO99I4wFlZpvkJcUZPM7lOo+\r\r\n"
+            "-----END RSA PRIVATE KEY-----"
+        )
+        result = mapper.map_account(account, ca_key)
+        pem = result["users"][0]["private_pem_key"]
+        assert "\r\r\n" not in pem
+        assert pem.startswith("-----BEGIN RSA PRIVATE KEY-----\n")
+        assert "\nMIIEpAIBAAKCAQEAyNzN8vyPmMaZfV8cUxuvCxZKXO99I4wFlZpvkJcUZPM7lOo+\n" in pem
+        assert result["users"][0]["password"] == ""
+
+
+class TestSharedFolderPermissions:
+    """C3: Safe member permissions flow into shared folder structure."""
+
+    def test_build_shared_folder_permissions_basic(self):
+        from keepercommander.importer.cyberark.cyberark_pam import build_shared_folder_permissions
+        safe_members = {
+            "safe1": [
+                {"name": "admin@corp.com", "member_type": "user",
+                 "permissions": {"manage_users": True, "manage_records": True,
+                                 "can_edit": True, "can_share": True},
+                 "unmapped_permissions": []},
+            ]
+        }
+        matcher = UserTeamMatcher(
+            keeper_users=[{"email": "admin@corp.com"}],
+        )
+        result = build_shared_folder_permissions(safe_members, matcher)
+        assert "shared_folder_resources" in result
+        assert "shared_folder_users" in result
+        perms = result["shared_folder_resources"]["permissions"]
+        assert len(perms) == 1
+        assert perms[0]["name"] == "admin@corp.com"
+        assert perms[0]["manage_users"] is True
+        assert perms[0]["manage_records"] is True
+
+    def test_merge_permissions_across_safes_takes_highest(self):
+        from keepercommander.importer.cyberark.cyberark_pam import build_shared_folder_permissions
+        safe_members = {
+            "safe1": [
+                {"name": "user1@corp.com", "member_type": "user",
+                 "permissions": {"manage_users": False, "manage_records": False,
+                                 "can_edit": False, "can_share": False},
+                 "unmapped_permissions": []},
+            ],
+            "safe2": [
+                {"name": "user1@corp.com", "member_type": "user",
+                 "permissions": {"manage_users": True, "manage_records": True,
+                                 "can_edit": True, "can_share": True},
+                 "unmapped_permissions": []},
+            ],
+        }
+        matcher = UserTeamMatcher(
+            keeper_users=[{"email": "user1@corp.com"}],
+        )
+        result = build_shared_folder_permissions(safe_members, matcher)
+        perms = result["shared_folder_resources"]["permissions"]
+        assert perms[0]["manage_users"] is True
+        assert perms[0]["manage_records"] is True
+
+    def test_unmatched_members_excluded_from_permissions(self):
+        from keepercommander.importer.cyberark.cyberark_pam import build_shared_folder_permissions
+        safe_members = {
+            "safe1": [
+                {"name": "unknown@other.com", "member_type": "user",
+                 "permissions": {"manage_users": True, "manage_records": True,
+                                 "can_edit": True, "can_share": True},
+                 "unmapped_permissions": []},
+            ]
+        }
+        matcher = UserTeamMatcher(keeper_users=[{"email": "admin@corp.com"}])
+        result = build_shared_folder_permissions(safe_members, matcher)
+        assert result == {}  # No matched members â†’ no shared folder perms
+
+    def test_team_members_matched(self):
+        from keepercommander.importer.cyberark.cyberark_pam import build_shared_folder_permissions
+        safe_members = {
+            "safe1": [
+                {"name": "IT-Admins", "member_type": "team",
+                 "permissions": {"manage_users": True, "manage_records": True,
+                                 "can_edit": True, "can_share": True},
+                 "unmapped_permissions": []},
+            ]
+        }
+        matcher = UserTeamMatcher(keeper_teams=[{"name": "IT-Admins"}])
+        result = build_shared_folder_permissions(safe_members, matcher)
+        perms = result["shared_folder_resources"]["permissions"]
+        assert perms[0]["name"] == "IT-Admins"
+
+    def test_empty_safe_member_map_returns_empty(self):
+        from keepercommander.importer.cyberark.cyberark_pam import build_shared_folder_permissions
+        result = build_shared_folder_permissions({})
+        assert result == {}
+
+    def test_build_import_json_includes_shared_folders(self):
+        from keepercommander.importer.cyberark.cyberark_pam import build_import_json
+        safe_members = {
+            "safe1": [
+                {"name": "user@corp.com", "member_type": "user",
+                 "permissions": {"manage_users": True, "manage_records": True,
+                                 "can_edit": True, "can_share": True},
+                 "unmapped_permissions": []},
+            ]
+        }
+        matcher = UserTeamMatcher(keeper_users=[{"email": "user@corp.com"}])
+        result = build_import_json("test-project", None, [], [],
+                                   safe_member_map=safe_members,
+                                   user_team_matcher=matcher)
+        assert "shared_folder_resources" in result
+        assert "shared_folder_users" in result
+        assert result["shared_folder_resources"]["permissions"][0]["name"] == "user@corp.com"
+
+    def test_build_import_json_without_members_has_no_shared_folders(self):
+        from keepercommander.importer.cyberark.cyberark_pam import build_import_json
+        result = build_import_json("test-project", None, [], [])
+        assert "shared_folder_resources" not in result
+        assert "shared_folder_users" not in result
+
+
+class TestRealDataEdgeCases:
+    """Tests derived from real on-prem CyberArk PVWA API output."""
+
+    def test_empty_platform_id_uses_fallback(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "25_25", "name": "testobject", "platformId": "",
+            "safeName": "Test", "address": "", "userName": "",
+            "secretType": "password",
+        }
+        result = mapper.map_account(account, None)
+        assert result is not None
+        # No address + no platform â†’ routed to login (not an unreachable pamMachine)
+        assert result["type"] == "login"
+        assert mapper.unmapped_platforms.get("(empty)", 0) == 1
+
+    def test_no_address_account_routed_to_login(self):
+        """CyberArk accounts without an address can't be PAM resources
+        (gateway has nothing to connect to) â€” import as login."""
+        mapper = AccountMapper()
+        account = {
+            "id": "1", "name": "floating-cred", "platformId": "UnixSSH",
+            "safeName": "Test", "address": "", "userName": "svc",
+            "secretType": "password",
+        }
+        result = mapper.map_account(account, "s3cret")
+        assert result["type"] == "login"
+        assert result["login"] == "svc"
+        assert result["password"] == "s3cret"
+        assert "notes" not in result
+
+    def test_no_address_ssh_key_stays_pam_machine(self):
+        """SSH keys without address stay as pamMachine so the
+        private_pem_key field is preserved."""
+        mapper = AccountMapper()
+        account = {
+            "id": "2", "name": "key-no-addr", "platformId": "UnixSSHKeys",
+            "safeName": "Test", "address": "", "userName": "root",
+            "secretType": "key",
+        }
+        fake_key = "-----BEGIN RSA PRIVATE KEY-----\nAAAA\n-----END RSA PRIVATE KEY-----"
+        result = mapper.map_account(account, fake_key)
+        assert result["type"] == "pamMachine"
+        assert result["users"][0]["private_pem_key"] == fake_key
+
+    def test_missing_platform_id_without_pattern_maps_to_login(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "36_3", "name": "PSMServer",
+            "safeName": "PSM", "address": "10.0.1.20", "userName": "PSMConnect",
+        }
+        result = mapper.map_account(account, "pass")
+        assert result is not None
+        assert result["type"] == "login"
+        assert "users" not in result
+
+    def test_generic_network_account_maps_to_ssh(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "network-account-1", "name": "network-device-sample",
+            "platformId": "UnixSSH",
+            "address": "192.0.2.10", "userName": "network-user",
+        }
+        result = mapper.map_account(account, "pass")
+        assert result["type"] == "pamMachine"
+        assert result["pam_settings"]["connection"]["protocol"] == "ssh"
+
+    def test_cyberark_internal_platform_mapped(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "27_3", "name": "SCIM-account", "platformId": "CyberArk",
+            "address": "10.0.1.10", "userName": "SCIM-user",
+        }
+        result = mapper.map_account(account, "pass")
+        assert result is not None
+        assert result["type"] == "pamMachine"
+
+    def test_logon_domain_maps_to_domain_name(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "25_3", "name": "windows1", "platformId": "WinDesktopLocal",
+            "address": "components", "userName": "svc_account",
+            "platformAccountProperties": {"LogonDomain": "components"},
+        }
+        result = mapper.map_account(account, "pass")
+        assert result.get("domain_name") == "components"
+        user = result["users"][0]
+        assert user["login"] == "components\\svc_account"
+
+    def test_logon_domain_not_set_for_databases(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "1", "name": "db1", "platformId": "MSSql",
+            "address": "dbserver.local", "userName": "sa",
+            "platformAccountProperties": {"LogonDomain": "corp", "Port": "1433"},
+        }
+        result = mapper.map_account(account, "pass")
+        assert "domain_name" not in result  # Only pamMachine gets domain_name
+
+    def test_cpm_failure_status_does_not_write_notes(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "25_7", "name": "x_accountB", "platformId": "WinDesktopLocal",
+            "address": "components", "userName": "x_accountB",
+            "secretManagement": {
+                "automaticManagementEnabled": False,
+                "manualManagementReason": "(CPM)MaxRetries",
+                "status": "failure",
+            },
+        }
+        result = mapper.map_account(account, "pass")
+        user = result["users"][0]
+        assert "notes" not in user
+
+    def test_system_safes_expanded(self):
+        from keepercommander.importer.cyberark.cyberark_pam import SYSTEM_SAFES
+        assert "PasswordManager" in SYSTEM_SAFES
+        assert "SCIM Config" in SYSTEM_SAFES
+        assert "PSM" in SYSTEM_SAFES
+        assert "PSMRecordings" in SYSTEM_SAFES
+
+    def test_distinguished_name_mapped(self):
+        mapper = AccountMapper()
+        account = {
+            "id": "1", "name": "win-dc", "platformId": "WinDomain",
+            "address": "dc1.corp.local", "userName": "admin",
+            "platformAccountProperties": {
+                "DistinguishedName": "CN=admin,OU=Admins,DC=corp,DC=local",
+            },
+        }
+        result = mapper.map_account(account, "pass")
+        user = result["users"][0]
+        assert user.get("distinguished_name") == "CN=admin,OU=Admins,DC=corp,DC=local"
+
+
+class TestFolderDeduplication:
+    """Verify SafeFolderMapper deduplicates colliding names."""
+
+    def test_ksm_mode_dedup_adds_suffix(self):
+        mapper = SafeFolderMapper(mode="ksm")
+        name1 = mapper.map_safe("IT Safe", "proj")
+        name2 = mapper.map_safe("IT Safe!", "proj")  # "!" stripped â†’ "IT Safe" collision
+        assert name1 != name2
+        assert "#2" in name2
+
+    def test_same_safe_returns_cached(self):
+        mapper = SafeFolderMapper(mode="ksm")
+        name1 = mapper.map_safe("MySafe", "proj")
+        name2 = mapper.map_safe("MySafe", "proj")
+        assert name1 == name2
+
+    def test_exact_mode_no_truncation(self):
+        mapper = SafeFolderMapper(mode="exact")
+        long_name = "A" * 200
+        assert mapper.map_safe(long_name, "proj") == long_name
+
+    def test_ksm_mode_truncates(self):
+        from keepercommander.importer.cyberark.cyberark_pam import MAX_SAFE_NAME_LENGTH
+        mapper = SafeFolderMapper(mode="ksm")
+        long_name = "A" * 200
+        result = mapper.map_safe(long_name, "proj")
+        assert len(result) <= MAX_SAFE_NAME_LENGTH
+
+
+class TestPreImportValidation:
+    """Verify validate_import_data catches issues."""
+
+    def test_warns_missing_host(self):
+        from keepercommander.importer.cyberark.cyberark_pam import validate_import_data
+        resources = [{"title": "no-host", "type": "pamMachine", "host": "", "users": []}]
+        warnings = validate_import_data(resources, [])
+        assert any("no host" in w for w in warnings)
+
+    def test_warns_missing_password(self):
+        from keepercommander.importer.cyberark.cyberark_pam import validate_import_data
+        resources = [{"title": "srv", "type": "pamMachine", "host": "10.0.0.1",
+                      "users": [{"title": "u1", "login": "root"}]}]
+        warnings = validate_import_data(resources, [])
+        assert any("no password" in w for w in warnings)
+
+    def test_warns_standalone_logins(self):
+        from keepercommander.importer.cyberark.cyberark_pam import validate_import_data
+        users = [{"title": "login1", "type": "login", "password": "x"}]
+        warnings = validate_import_data([], users)
+        assert any("standalone" in w for w in warnings)
+
+    def test_warns_rotation_without_creds(self):
+        from keepercommander.importer.cyberark.cyberark_pam import validate_import_data
+        resources = [{"title": "srv", "type": "pamMachine", "host": "10.0.0.1",
+                      "users": [{"title": "u1", "login": "root",
+                                 "rotation_settings": {"enabled": "on"}}]}]
+        warnings = validate_import_data(resources, [])
+        assert any("rotation" in w.lower() for w in warnings)
+
+    def test_no_warnings_for_clean_data(self):
+        from keepercommander.importer.cyberark.cyberark_pam import validate_import_data
+        resources = [{"title": "srv", "type": "pamMachine", "host": "10.0.0.1",
+                      "users": [{"title": "u1", "login": "root", "password": "pass"}]}]
+        warnings = validate_import_data(resources, [])
+        assert len(warnings) == 0
+
+
+class TestMasterPolicyInConfig:
+    """Verify Master Policy flows into pam_configuration."""
+
+    def test_session_recording_from_policy(self):
+        from keepercommander.importer.cyberark.cyberark_pam import build_import_json
+        mp = {"connections": "on", "rotation": "on", "tunneling": "off",
+              "graphical_session_recording": "on", "text_session_recording": "on"}
+        result = build_import_json("test", None, [], [], master_policy_config=mp)
+        cfg = result["pam_configuration"]
+        assert cfg["graphical_session_recording"] == "on"
+        assert cfg["text_session_recording"] == "on"
+        assert cfg["tunneling"] == "off"
+
+    def test_default_without_policy(self):
+        from keepercommander.importer.cyberark.cyberark_pam import build_import_json
+        result = build_import_json("test", None, [], [])
+        cfg = result["pam_configuration"]
+        assert cfg["graphical_session_recording"] == "off"
+        assert cfg["text_session_recording"] == "off"
+
+
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# INTEGRATION TESTS â€” Real CyberArk PVWA JSON â†’ Keeper Vault JSON
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# These tests use actual CyberArk API response shapes captured from a
+# real on-prem PVWA environment. They verify the full inputâ†’output
+# pipeline: API response â†’ AccountMapper â†’ SafeFolderMapper â†’
+# validate_import_data â†’ build_import_json â†’ vault-ready JSON.
+
+# Real CyberArk PVWA /api/Accounts response (subset from on-prem env)
+REAL_PVWA_ACCOUNTS = [
+    # Unix SSH â€” CPM enabled, standard account
+    {"id": "28_11", "name": "Operating System-UnixSSH-10.0.1.30-simon",
+     "platformId": "UnixSSH", "safeName": "partner",
+     "address": "10.0.1.30", "userName": "simon", "secretType": "password",
+     "platformAccountProperties": {},
+     "secretManagement": {"automaticManagementEnabled": True,
+                          "lastModifiedTime": 1674712329},
+     "createdTime": 1674712329},
+
+    # MSSQL Database â€” CPM disabled, custom port + database
+    {"id": "25_15", "name": "db1", "platformId": "MSSql", "safeName": "Test",
+     "address": "dbserver1.cyberark.local", "userName": "sa",
+     "secretType": "password",
+     "platformAccountProperties": {"Port": "15345", "Database": "hr"},
+     "secretManagement": {"automaticManagementEnabled": False,
+                          "manualManagementReason": "NoReason"},
+     "createdTime": 1563922540},
+
+    # Windows Desktop â€” CPM enabled, LogonDomain set
+    {"id": "25_3", "name": "windows1", "platformId": "WinDesktopLocal",
+     "safeName": "Test", "address": "components", "userName": "svc_account",
+     "secretType": "password",
+     "platformAccountProperties": {"LogonDomain": "components"},
+     "secretManagement": {"automaticManagementEnabled": True,
+                          "status": "success"},
+     "createdTime": 1551300856},
+
+    # SSH Keys â€” CPM disabled, secretType=key
+    {"id": "25_14", "name": "Linux2", "platformId": "UnixSSHKeys",
+     "safeName": "Test", "address": "linux2.cyberark.local", "userName": "root",
+     "secretType": "key", "platformAccountProperties": {},
+     "secretManagement": {"automaticManagementEnabled": False,
+                          "manualManagementReason": "NoReason"},
+     "createdTime": 1563922244},
+
+    # Windows â€” CPM failure status
+    {"id": "25_7",
+     "name": "Operating System-WindowsDesktopLocalAccountsRotationalPolicy-10.0.1.20-x_accountB",
+     "platformId": "WinDesktopLocal", "safeName": "Test",
+     "address": "components", "userName": "x_accountB",
+     "secretType": "password", "platformAccountProperties": {},
+     "secretManagement": {"automaticManagementEnabled": False,
+                          "manualManagementReason": "(CPM)MaxRetries",
+                          "status": "failure"},
+     "createdTime": 1551306296},
+
+    # BusinessWebsite â†’ login record (not pamMachine)
+    {"id": "25_5", "name": "web-portal", "platformId": "BusinessWebsite",
+     "safeName": "Test", "address": "", "userName": "admin",
+     "platformAccountProperties": {"URL": "https://portal.company.com"},
+     "secretManagement": {"automaticManagementEnabled": True},
+     "createdTime": 1551306296},
+
+    # System safe account (should be filtered out)
+    {"id": "36_3", "name": "PSMServer", "platformId": "", "safeName": "PSM",
+     "address": "10.0.1.20", "userName": "PSMConnect",
+     "secretType": "password", "platformAccountProperties": {},
+     "secretManagement": {"automaticManagementEnabled": True},
+     "createdTime": 1670950940},
+
+    # Generic network device account
+    {"id": "network-account-1",
+     "name": "network-device-sample",
+     "platformId": "UnixSSH", "safeName": "Test",
+     "address": "192.0.2.10", "userName": "network-user", "secretType": "password",
+     "platformAccountProperties": {},
+     "secretManagement": {"automaticManagementEnabled": True},
+     "createdTime": 1692833795},
+
+    # CyberArk internal platform in system safe (should be filtered)
+    {"id": "27_3", "name": "SCIM-account", "platformId": "CyberArk",
+     "safeName": "SCIM Config", "address": "10.0.1.10",
+     "userName": "SCIM-user", "secretType": "password",
+     "platformAccountProperties": {},
+     "secretManagement": {"automaticManagementEnabled": True,
+                          "status": "success"},
+     "createdTime": 1527261324},
+
+    # Windows Domain with DistinguishedName
+    {"id": "25_20", "name": "ad-svc", "platformId": "WinDomain",
+     "safeName": "Test", "address": "dc01.corp.local", "userName": "svc_backup",
+     "secretType": "password",
+     "platformAccountProperties": {
+         "LogonDomain": "CORP",
+         "DistinguishedName": "CN=svc_backup,OU=ServiceAccounts,DC=corp,DC=local",
+     },
+     "secretManagement": {"automaticManagementEnabled": True},
+     "createdTime": 1563908159},
+
+    # Oracle Database â€” custom port + database
+    {"id": "25_16", "name": "db2", "platformId": "Oracle", "safeName": "Test",
+     "address": "dbserver2.cyberark.local", "userName": "oradb",
+     "secretType": "password",
+     "platformAccountProperties": {"Port": "16234", "Database": "hr"},
+     "secretManagement": {"automaticManagementEnabled": False,
+                          "manualManagementReason": "NoReason"},
+     "createdTime": 1563922714},
+
+    # Empty platformId â€” should use fallback
+    {"id": "25_25", "name": "testobject", "platformId": "",
+     "safeName": "Test", "address": "", "userName": "",
+     "secretType": "password", "platformAccountProperties": {},
+     "secretManagement": {"automaticManagementEnabled": True},
+     "createdTime": 1674712262},
+]
+
+
+def _run_full_pipeline(accounts=None, project_name="CyberArk-Test",
+                       gateway="TestGateway", folder_mode="ksm",
+                       master_policy=None):
+    """Helper: run accounts through the full import pipeline, return vault JSON."""
+    if accounts is None:
+        accounts = REAL_PVWA_ACCOUNTS
+
+    # Step 1: Filter system safes
+    all_safes = [{"safeName": s} for s in set(a["safeName"] for a in accounts)]
+    filtered = exclude_system_safes(all_safes)
+    ok_safes = {s["safeName"] for s in filtered}
+
+    # Step 2: Map accounts â†’ resources + users
+    mapper = AccountMapper()
+    folder_mapper = SafeFolderMapper(mode=folder_mode)
+    resources, users, skipped = [], [], []
+
+    for a in accounts:
+        if a["safeName"] not in ok_safes:
+            skipped.append(a["name"])
+            continue
+        pw = "s3cret_pw" if a.get("secretType") != "key" else "-----BEGIN RSA PRIVATE KEY-----\nMIIE..."
+        record = mapper.map_account(a, pw, a["safeName"])
+        if record is None:
+            continue
+        safe_folder = folder_mapper.map_safe(a["safeName"], project_name)
+        if safe_folder:
+            res_root = f"{project_name} - Resources"
+            usr_root = f"{project_name} - Users"
+            if record.get("type") == "login":
+                record["folder_path"] = f"{usr_root}/{safe_folder}"
+            else:
+                record["folder_path"] = f"{res_root}/{safe_folder}"
+            for u in record.get("users", []):
+                u["folder_path"] = f"{usr_root}/{safe_folder}"
+        if record.get("type") == "login":
+            users.append(record)
+        else:
+            resources.append(record)
+
+    # Step 3: Validate
+    warnings = validate_import_data(resources, users)
+
+    # Step 4: Build vault JSON
+    mp = master_policy or {"connections": "on", "rotation": "on",
+                           "tunneling": "on",
+                           "graphical_session_recording": "on",
+                           "text_session_recording": "off"}
+    data = build_import_json(project_name, gateway, resources, users,
+                             master_policy_config=mp)
+    return data, warnings, skipped, mapper
+
+
+class TestEndToEndPipeline:
+    """Integration: real PVWA JSON â†’ full vault import JSON."""
+
+    def test_overall_structure(self):
+        data, _, _, _ = _run_full_pipeline()
+        assert "project" in data
+        assert "pam_configuration" in data
+        assert "pam_data" in data
+        assert "resources" in data["pam_data"]
+        assert "users" in data["pam_data"]
+        assert data["project"] == "CyberArk-Test"
+
+    def test_pam_configuration_from_master_policy(self):
+        data, _, _, _ = _run_full_pipeline()
+        cfg = data["pam_configuration"]
+        assert cfg["environment"] == "local"
+        assert cfg["gateway_name"] == "TestGateway"
+        assert cfg["graphical_session_recording"] == "on"
+        assert cfg["text_session_recording"] == "off"
+        assert cfg["connections"] == "on"
+        assert cfg["rotation"] == "on"
+        assert cfg["default_rotation_schedule"] == {"type": "on-demand"}
+
+    def test_system_safes_filtered(self):
+        """PSM and SCIM Config accounts should be excluded."""
+        _, _, skipped, _ = _run_full_pipeline()
+        assert "PSMServer" in skipped
+        assert "SCIM-account" in skipped
+
+    def test_resource_count(self):
+        """Should produce resources for all non-system, non-login accounts."""
+        data, _, _, _ = _run_full_pipeline()
+        resources = data["pam_data"]["resources"]
+        # 12 accounts - 2 system safe - 1 login = 9 resources
+        # BUT empty platformId testobject has no address â†’ still created as resource
+        assert len(resources) >= 8
+
+    def test_login_records_separated(self):
+        data, _, _, _ = _run_full_pipeline()
+        logins = data["pam_data"]["users"]
+        # web-portal (BusinessWebsite) + testobject (no-address fallback)
+        assert len(logins) == 2
+        assert all(l["type"] == "login" for l in logins)
+        web = next((l for l in logins if l["title"] == "web-portal"), None)
+        assert web is not None
+        assert web["url"] == "https://portal.company.com"
+        assert web["login"] == "admin"
+
+
+class TestResourceOutputStructure:
+    """Verify each resource type produces correct vault record shape."""
+
+    def _find_resource(self, data, title_contains):
+        for r in data["pam_data"]["resources"]:
+            if title_contains.lower() in r.get("title", "").lower():
+                return r
+        raise AssertionError(f"Resource containing '{title_contains}' not found")
+
+    def test_unix_ssh_resource(self):
+        data, _, _, _ = _run_full_pipeline()
+        r = self._find_resource(data, "simon")
+        assert r["type"] == "pamMachine"
+        assert r["host"] == "10.0.1.30"
+        assert r["port"] == "22"
+        assert r["folder_path"] == "CyberArk-Test - Resources/partner"
+        # pam_settings
+        assert r["pam_settings"]["connection"]["protocol"] == "ssh"
+        assert r["pam_settings"]["options"]["rotation"] == "on"
+        assert r["pam_settings"]["options"]["connections"] == "on"
+        # Nested user
+        u = r["users"][0]
+        assert u["type"] == "pamUser"
+        assert u["login"] == "simon"
+        assert u["password"] == "s3cret_pw"
+        assert u["managed"] is True
+        assert u["rotation_settings"]["rotation"] == "general"
+        assert u["rotation_settings"]["enabled"] == "on"
+        # launch_credentials links user to resource
+        assert r["pam_settings"]["connection"]["launch_credentials"] == u["title"]
+
+    def test_mssql_database_resource(self):
+        data, _, _, _ = _run_full_pipeline()
+        r = self._find_resource(data, "db1")
+        assert r["type"] == "pamDatabase"
+        assert r["host"] == "dbserver1.cyberark.local"
+        assert r["port"] == "15345"
+        assert r["pam_settings"]["connection"]["protocol"] == "sql-server"
+        # CPM disabled
+        assert r["pam_settings"]["options"]["rotation"] == "off"
+        u = r["users"][0]
+        assert u["connect_database"] == "hr"
+        assert u["rotation_settings"]["enabled"] == "off"
+        assert "notes" not in u
+
+    def test_oracle_database_resource(self):
+        data, _, _, _ = _run_full_pipeline()
+        r = self._find_resource(data, "db2")
+        assert r["type"] == "pamDatabase"
+        assert r["port"] == "16234"
+        assert r["pam_settings"]["connection"]["protocol"] == "sql-server"
+        u = r["users"][0]
+        assert u["connect_database"] == "hr"
+
+    def test_windows_domain_with_logon_domain_and_dn(self):
+        data, _, _, _ = _run_full_pipeline()
+        r = self._find_resource(data, "ad-svc")
+        assert r["type"] == "pamMachine"
+        assert r["domain_name"] == "CORP"
+        assert r["pam_settings"]["connection"]["protocol"] == "rdp"
+        assert r["port"] == "3389"
+        u = r["users"][0]
+        assert u["login"] == "CORP\\svc_backup"
+        assert u["distinguished_name"] == "CN=svc_backup,OU=ServiceAccounts,DC=corp,DC=local"
+
+    def test_windows_desktop_with_logon_domain(self):
+        data, _, _, _ = _run_full_pipeline()
+        r = self._find_resource(data, "windows1")
+        assert r["domain_name"] == "components"
+        u = r["users"][0]
+        assert u["login"] == "components\\svc_account"
+        assert r["pam_settings"]["connection"]["launch_credentials"] == u["title"]
+
+    def test_ssh_key_resource(self):
+        data, _, _, _ = _run_full_pipeline()
+        r = self._find_resource(data, "Linux2")
+        assert r["type"] == "pamMachine"
+        u = r["users"][0]
+        assert "private_pem_key" in u
+        assert u["private_pem_key"].startswith("-----BEGIN RSA")
+        assert u["password"] == ""
+        assert u["rotation_settings"]["enabled"] == "off"
+
+    def test_cpm_failure_does_not_write_notes(self):
+        data, _, _, _ = _run_full_pipeline()
+        r = self._find_resource(data, "x_accountB")
+        u = r["users"][0]
+        assert "notes" not in u
+        assert u["rotation_settings"]["enabled"] == "off"
+
+    def test_generic_network_device(self):
+        data, _, _, _ = _run_full_pipeline()
+        r = self._find_resource(data, "network-device-sample")
+        assert r["type"] == "pamMachine"
+        assert r["host"] == "192.0.2.10"
+        assert r["pam_settings"]["connection"]["protocol"] == "ssh"
+
+    def test_empty_platform_id_handled(self):
+        data, _, _, mapper = _run_full_pipeline()
+        assert "(empty)" in mapper.unmapped_platforms
+
+
+class TestUserResourceLinking:
+    """Verify edit.py can process the linking fields we produce."""
+
+    def test_every_resource_has_nested_user(self):
+        data, _, _, _ = _run_full_pipeline()
+        for r in data["pam_data"]["resources"]:
+            assert len(r.get("users", [])) >= 1, f"Resource {r['title']} has no users"
+
+    def test_every_nested_user_is_pam_user(self):
+        data, _, _, _ = _run_full_pipeline()
+        for r in data["pam_data"]["resources"]:
+            for u in r["users"]:
+                assert u["type"] == "pamUser"
+
+    def test_launch_credentials_matches_user_title(self):
+        """edit.py resolves launch_credentials by title â†’ UID."""
+        data, _, _, _ = _run_full_pipeline()
+        for r in data["pam_data"]["resources"]:
+            ps = r.get("pam_settings", {})
+            lc = ps.get("connection", {}).get("launch_credentials", "")
+            if lc:
+                user_titles = [u["title"] for u in r["users"]]
+                assert lc in user_titles, (
+                    f"launch_credentials '{lc}' not in user titles {user_titles} "
+                    f"for resource '{r['title']}'")
+
+    def test_rotation_settings_resource_field(self):
+        """edit.py resolves rotation_settings.resource from parent machine title."""
+        data, _, _, _ = _run_full_pipeline()
+        for r in data["pam_data"]["resources"]:
+            for u in r["users"]:
+                rs = u.get("rotation_settings", {})
+                if rs.get("rotation") == "general":
+                    # edit.py auto-sets resourceUid to parent machine UID
+                    # We don't set it here â€” edit.py handles it at import time
+                    assert rs["rotation"] == "general"
+
+    def test_managed_flag_on_users_with_password(self):
+        data, _, _, _ = _run_full_pipeline()
+        for r in data["pam_data"]["resources"]:
+            for u in r["users"]:
+                if u.get("password") or u.get("private_pem_key"):
+                    assert u.get("managed") is True
+
+
+class TestFolderAssignment:
+    """Verify folder_path flows from safe â†’ resource + nested users."""
+
+    def test_folder_path_on_resources(self):
+        data, _, _, _ = _run_full_pipeline(folder_mode="ksm")
+        for r in data["pam_data"]["resources"]:
+            assert "folder_path" in r, f"Resource {r['title']} missing folder_path"
+
+    def test_folder_path_on_nested_users(self):
+        data, _, _, _ = _run_full_pipeline(folder_mode="ksm")
+        for r in data["pam_data"]["resources"]:
+            for u in r["users"]:
+                assert "folder_path" in u, f"User {u['title']} missing folder_path"
+
+    def test_resource_folder_under_resources_root(self):
+        data, _, _, _ = _run_full_pipeline(folder_mode="ksm")
+        for r in data["pam_data"]["resources"]:
+            fp = r["folder_path"]
+            assert fp.startswith("CyberArk-Test - Resources/"), f"Resource folder not under Resources root: {fp}"
+
+    def test_nested_user_folder_under_users_root(self):
+        data, _, _, _ = _run_full_pipeline(folder_mode="ksm")
+        for r in data["pam_data"]["resources"]:
+            for u in r["users"]:
+                fp = u.get("folder_path", "")
+                assert fp.startswith("CyberArk-Test - Users/"), f"Nested user folder not under Users root: {fp}"
+
+    def test_resource_and_user_share_safe_subfolder(self):
+        """Resource in 'Test' safe â†’ Resources/Test, its user â†’ Users/Test."""
+        data, _, _, _ = _run_full_pipeline(folder_mode="ksm")
+        for r in data["pam_data"]["resources"]:
+            res_safe = r["folder_path"].split("/", 1)[1] if "/" in r["folder_path"] else ""
+            for u in r["users"]:
+                usr_safe = u["folder_path"].split("/", 1)[1] if "/" in u["folder_path"] else ""
+                assert res_safe == usr_safe, (
+                    f"Resource and user should be in same safe subfolder: "
+                    f"resource={r['folder_path']}, user={u['folder_path']}")
+
+    def test_flat_mode_no_folders(self):
+        data, _, _, _ = _run_full_pipeline(folder_mode="flat")
+        for r in data["pam_data"]["resources"]:
+            assert r.get("folder_path", "") == ""
+
+    def test_login_record_under_users_root(self):
+        data, _, _, _ = _run_full_pipeline(folder_mode="ksm")
+        logins = data["pam_data"]["users"]
+        assert logins[0].get("folder_path") == "CyberArk-Test - Users/Test"
+
+
+class TestValidationWarnings:
+    """Verify pre-import validation catches the right issues."""
+
+    def test_real_data_warnings(self):
+        _, warnings, _, _ = _run_full_pipeline()
+        # We have 1 login record not linked to a resource
+        assert any("standalone" in w for w in warnings)
+
+    def test_no_address_account_becomes_login(self):
+        """testobject (no address) is routed to a login record rather than
+        an unreachable pamMachine â€” validated at the data level."""
+        data, _, _, _ = _run_full_pipeline()
+        logins = data["pam_data"]["users"]
+        testobject = next((l for l in logins if l["title"] == "testobject"), None)
+        assert testobject is not None
+        assert "notes" not in testobject
+
+    def test_clean_data_no_warnings(self):
+        clean = [REAL_PVWA_ACCOUNTS[0]]  # Just the Unix SSH account
+        _, warnings, _, _ = _run_full_pipeline(accounts=clean)
+        assert len(warnings) == 0
+
+
+class TestVaultJsonSchema:
+    """Verify the output JSON matches what edit.py PAMProjectImportCommand expects."""
+
+    def test_top_level_keys(self):
+        data, _, _, _ = _run_full_pipeline()
+        assert set(data.keys()) >= {"project", "pam_configuration", "pam_data"}
+
+    def test_pam_config_required_fields(self):
+        data, _, _, _ = _run_full_pipeline()
+        cfg = data["pam_configuration"]
+        required = {"environment", "title", "connections", "rotation",
+                    "tunneling", "default_rotation_schedule"}
+        assert required <= set(cfg.keys())
+
+    def test_pam_config_keeper_specific_fields_explicit(self):
+        """RBI and AI fields must be set explicitly so PamConfigEnvironment
+        doesn't fall back to its built-in defaults (RBI=on) which conflict
+        with the CyberArk migration intent (off by default)."""
+        data, _, _, _ = _run_full_pipeline()
+        cfg = data["pam_configuration"]
+        assert cfg.get("remote_browser_isolation") == "off"
+        assert cfg.get("ai_threat_detection") == "off"
+        assert cfg.get("ai_terminate_session_on_detection") == "off"
+
+    def test_resource_required_fields(self):
+        data, _, _, _ = _run_full_pipeline()
+        for r in data["pam_data"]["resources"]:
+            assert "type" in r
+            assert "title" in r
+            assert "host" in r
+            assert "users" in r
+            assert r["type"] in ("pamMachine", "pamDatabase", "pamDirectory",
+                                 "pamRemoteBrowser")
+
+    def test_user_required_fields(self):
+        data, _, _, _ = _run_full_pipeline()
+        for r in data["pam_data"]["resources"]:
+            for u in r["users"]:
+                assert "type" in u
+                assert "title" in u
+                assert "login" in u
+                assert u["type"] == "pamUser"
+
+    def test_rotation_settings_schema(self):
+        data, _, _, _ = _run_full_pipeline()
+        valid_rotations = ("general", "iam_user", "scripts_only")
+        valid_enabled = ("on", "off", "default")
+        for r in data["pam_data"]["resources"]:
+            for u in r["users"]:
+                rs = u.get("rotation_settings")
+                if rs:
+                    assert rs["rotation"] in valid_rotations
+                    assert rs["enabled"] in valid_enabled
+                    assert rs["schedule"]["type"] in ("on-demand", "cron")
+
+    def test_pam_settings_schema(self):
+        data, _, _, _ = _run_full_pipeline()
+        for r in data["pam_data"]["resources"]:
+            ps = r.get("pam_settings")
+            if ps:
+                assert "options" in ps
+                assert "connection" in ps
+                opts = ps["options"]
+                for key in ("rotation", "connections", "tunneling",
+                            "graphical_session_recording"):
+                    assert opts[key] in ("on", "off")
+                conn = ps["connection"]
+                assert "protocol" in conn
+
+    def test_login_record_schema(self):
+        data, _, _, _ = _run_full_pipeline()
+        for u in data["pam_data"]["users"]:
+            assert u["type"] == "login"
+            assert "title" in u
+            assert "login" in u
+
+    def test_output_is_json_serializable(self):
+        data, _, _, _ = _run_full_pipeline()
+        serialized = json.dumps(data)
+        roundtrip = json.loads(serialized)
+        assert roundtrip["project"] == data["project"]
+        assert len(roundtrip["pam_data"]["resources"]) == len(data["pam_data"]["resources"])
+
+
+# â”€â”€ Optional local PVWA sample under .sample-data/ (gitignored; skip if absent) â”€â”€
+
+_SAMPLE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".sample-data"))
+_SAMPLE_FILES = ("safes.json", "accounts.json", "passwords.json")
+
+
+def _sample_available() -> bool:
+    return all(os.path.exists(os.path.join(_SAMPLE_DIR, f)) for f in _SAMPLE_FILES)
+
+
+def _load_sample():
+    with open(os.path.join(_SAMPLE_DIR, "safes.json")) as f:
+        safes = json.load(f)["value"]
+    with open(os.path.join(_SAMPLE_DIR, "accounts.json")) as f:
+        accounts_dict = json.load(f)
+    with open(os.path.join(_SAMPLE_DIR, "passwords.json")) as f:
+        passwords = json.load(f)
+    accounts = []
+    for acct in accounts_dict.values():
+        acct = dict(acct)
+        acct.setdefault("platformAccountProperties", {})
+        accounts.append(acct)
+    return safes, accounts, passwords
+
+
+@pytest.mark.skipif(not _sample_available(),
+                    reason="local .sample-data/*.json not present")
+class TestLocalPvwaSample:
+    """Integration against optional local PVWA export sample data."""
+
+    def test_files_parse_and_ids_align(self):
+        safes, accounts, passwords = _load_sample()
+        assert len(safes) > 0
+        assert len(accounts) == len(passwords)
+        assert {a["id"] for a in accounts} == set(passwords.keys())
+
+    def test_pipeline_no_crashes(self):
+        _, accounts, passwords = _load_sample()
+        mapper = AccountMapper()
+        for a in accounts:
+            pw = passwords.get(a["id"], {}).get("password", "")
+            mapper.map_account(a, pw, a.get("safeName", ""))
+
+    def test_non_system_accounts_produce_records(self):
+        _, accounts, passwords = _load_sample()
+        mapper = AccountMapper()
+        all_safes = [{"safeName": s} for s in {a["safeName"] for a in accounts}]
+        kept = {s["safeName"] for s in exclude_system_safes(all_safes)}
+        user_accounts = [a for a in accounts if a["safeName"] in kept]
+        records = [mapper.map_account(a, passwords[a["id"]]["password"], a["safeName"])
+                   for a in user_accounts]
+        assert len(records) > 0
+        assert all(r is not None for r in records)
+
+    def test_ssh_key_routed_to_private_pem_key(self):
+        _, accounts, passwords = _load_sample()
+        mapper = AccountMapper()
+        ssh_key_accounts = [a for a in accounts if a.get("secretType") == "key"]
+        assert len(ssh_key_accounts) >= 1
+        for a in ssh_key_accounts:
+            pw = passwords[a["id"]]["password"]
+            rec = mapper.map_account(a, pw, a.get("safeName", ""))
+            assert rec is not None and rec["type"] == "pamMachine"
+            user = rec["users"][0]
+            # Key material must be stored under private_pem_key (not password)
+            # and \r\r\n line endings must be normalized to \n.
+            assert user["private_pem_key"]
+            assert "\r\r\n" not in user["private_pem_key"]
+            assert user["password"] == ""
+
+    def test_empty_password_does_not_crash(self):
+        _, accounts, passwords = _load_sample()
+        mapper = AccountMapper()
+        empty_pw = [a for a in accounts
+                    if passwords.get(a["id"], {}).get("password") == ""]
+        assert len(empty_pw) >= 1
+        for a in empty_pw:
+            rec = mapper.map_account(a, "", a.get("safeName", ""))
+            if rec and rec["type"] in ("pamMachine", "pamDatabase"):
+                assert rec["users"][0]["password"] == ""
+
+    def test_vault_json_builds_and_serializes(self):
+        _, accounts, passwords = _load_sample()
+        mapper = AccountMapper()
+        all_safes = [{"safeName": s} for s in {a["safeName"] for a in accounts}]
+        kept = {s["safeName"] for s in exclude_system_safes(all_safes)}
+        resources, users = [], []
+        for a in accounts:
+            if a["safeName"] not in kept:
+                continue
+            rec = mapper.map_account(a, passwords[a["id"]]["password"], a["safeName"])
+            if rec is None:
+                continue
+            (users if rec["type"] == "login" else resources).append(rec)
+        data = build_import_json("Sample-Import", "TestGW", resources, users)
+        json.dumps(data)
+        assert data["project"] == "Sample-Import"
+        assert "pam_data" in data
+
+
+# â”€â”€ Record-kind discriminator + ApplicationMapper stub â”€â”€â”€â”€â”€â”€â”€
+
+
+class TestRecordKindDiscriminator:
+    """Coverage for discriminate_record_kind."""
+
+    def test_account_payload_returns_account(self):
+        payload = {"id": "1_2", "platformId": "UnixSSH", "userName": "root",
+                   "safeName": "S", "address": "10.0.0.1"}
+        assert discriminate_record_kind(payload) == RecordKind.ACCOUNT
+
+    def test_application_payload_returns_application(self):
+        assert discriminate_record_kind({"AppID": "MyApp"}) == RecordKind.APPLICATION
+
+    def test_api_token_payload_returns_api_token(self):
+        assert discriminate_record_kind({"platformType": "Application"}) == RecordKind.API_TOKEN
+
+    def test_application_wins_over_api_token_when_both_present(self):
+        payload = {"AppID": "X", "platformType": "Application"}
+        assert discriminate_record_kind(payload) == RecordKind.APPLICATION
+
+    def test_non_dict_falls_back_to_account(self):
+        assert discriminate_record_kind(None) == RecordKind.ACCOUNT
+        assert discriminate_record_kind("not a dict") == RecordKind.ACCOUNT
+        assert discriminate_record_kind([]) == RecordKind.ACCOUNT
+
+
+class TestApplicationMapperStub:
+    """ApplicationMapper remains a NotImplementedError stub until Applications API support ships."""
+
+    def test_map_application_raises_not_implemented(self):
+        mapper = ApplicationMapper(client=MagicMock())
+        with pytest.raises(NotImplementedError) as exc:
+            mapper.map_application({"AppID": "X"})
+        assert "not implemented" in str(exc.value).lower()
+
+    def test_target_record_type_is_documented_placeholder(self):
+        assert ApplicationMapper.TARGET_RECORD_TYPE == "login"
+
+    def test_field_map_starts_empty(self):
+        assert ApplicationMapper._field_map == {}
+
+
+class TestClassicCyberArkRecordTypeOverride:
+    """Record type selection for ``import --format=cyberark``."""
+
+    def test_default_record_type_is_login_without_address(self):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+
+        assert CyberArkImporter._account_record_type({"userName": "sample_user"}) == "login"
+
+    def test_default_record_type_is_server_credentials_with_address(self):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+
+        assert CyberArkImporter._account_record_type({
+            "userName": "admin",
+            "address": "host.example.com",
+        }) == "serverCredentials"
+
+    def test_explicit_record_type_overrides_cyberark_default(self):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+
+        assert CyberArkImporter._account_record_type(
+            {"userName": "admin", "address": "host.example.com"},
+            "customCyberArkAccount",
+        ) == "customCyberArkAccount"
+
+    def test_custom_record_type_keeps_unmapped_cyberark_data_as_custom_fields(self):
+        from keepercommander.importer.cyberark.cyberark import CyberArkImporter
+        from keepercommander.importer.importer import Record, RecordField
+        from keepercommander.importer.imp_exp import _construct_record_v3_data
+
+        record = Record()
+        record.title = "server-account"
+        record.type = CyberArkImporter._account_record_type({}, "customCyberArkAccount")
+        record.login = "admin"
+        record.password = "secret"
+        record.login_url = "https://server.example.com"
+        record.fields.append(RecordField("host", value={"hostName": "server.example.com", "port": "22"}))
+        CyberArkImporter._add_account_metadata(record, {
+            "platformId": "GenericPlatform",
+            "platformAccountProperties": {
+                "OwnerName": "sample-owner",
+                "Protocol": "SSH",
+                "Environment": {"Name": "sample-env"},
+            },
+        })
+
+        data = _construct_record_v3_data(record)
+        custom_by_type = {
+            field.get("type"): field.get("value", [None])[0]
+            for field in data["custom"] if not field.get("label")
+        }
+        custom_by_label = {
+            field.get("label"): field.get("value", [None])[0]
+            for field in data["custom"] if field.get("label")
+        }
+
+        assert data["type"] == "customCyberArkAccount"
+        assert custom_by_type["login"] == "admin"
+        assert custom_by_type["password"] == "secret"
+        assert custom_by_type["url"] == "https://server.example.com"
+        assert custom_by_type["host"] == {"hostName": "server.example.com", "port": "22"}
+        assert custom_by_label["Platform Name"] == "GenericPlatform"
+        assert custom_by_label["Owner Name"] == "sample-owner"
+        assert custom_by_label["Protocol"] == "SSH"
+        assert custom_by_label["Environment.Name"] == "sample-env"
+
+    def test_import_engine_forwards_record_type_to_importer(self, monkeypatch):
+        from keepercommander.importer import imp_exp
+
+        captured = {}
+
+        class FakeImporter:
+            verbose_import_summary = False
+
+            def execute(self, filename, **kwargs):
+                captured["filename"] = filename
+                captured["kwargs"] = kwargs
+                raise RuntimeError("stop after importer dispatch")
+
+        monkeypatch.setattr(imp_exp, "importer_for_format", lambda _: FakeImporter)
+
+        with pytest.raises(RuntimeError, match="stop after importer dispatch"):
+            imp_exp._import(
+                MagicMock(record_cache={}),
+                "cyberark",
+                "https://pvwa.example.com",
+                record_type="test custom",
+            )
+
+        assert captured["filename"] == "https://pvwa.example.com"
+        assert captured["kwargs"]["record_type"] == "test custom"

@@ -1,0 +1,838 @@
+"""
+Unit tests for PAM RBI Edit command - KC-1034 Feature Parity
+
+Tests the new CLI arguments added to expose RBI settings:
+- Browser Settings: --allow-url-navigation, --ignore-server-cert, --allow-file-uploads, --allow-file-downloads (on/off/default)
+- URL Filtering: --allowed-urls, --allowed-resource-urls (multi-value)
+- Autofill: --autofill-targets (multi-value)
+- Clipboard: --allow-copy, --allow-paste (on/off/default)
+- Supply user / clipboard size: --allow-supply-user (on/off/default), --clipboard-buffer-size (256kb/1mb/10mb/50mb/default)
+- Audio: --disable-audio (on/off/default), --audio-channels, --audio-bit-depth, --audio-sample-rate
+
+Note: Tests require Python 3.8+ due to pydantic dependency in tunnel_and_connections imports.
+"""
+
+import sys
+import unittest
+from unittest import mock
+
+# Try to import the module - skip tests if it fails (Python < 3.8 or missing pydantic)
+skip_tests = False
+skip_reason = ""
+try:
+    from keepercommander.commands.tunnel_and_connections import PAMRbiEditCommand
+    from keepercommander.error import CommandError
+    from keepercommander import vault
+except ImportError as e:
+    skip_tests = True
+    skip_reason = f"Cannot import tunnel_and_connections: {e}"
+
+
+def mock_sync_decorator(cls):
+    """Decorator to add sync mocking to test classes that execute PAM commands."""
+    original_setup = cls.setUp if hasattr(cls, 'setUp') else None
+    original_teardown = cls.tearDown if hasattr(cls, 'tearDown') else None
+
+    def new_setup(self):
+        if original_setup:
+            original_setup(self)
+        # Mock sync and load operations
+        self.sync_patcher = mock.patch('keepercommander.commands.tunnel_and_connections.sync_down_preserving_nsf_keys')
+        self.sync_patcher.start()
+        self.load_patcher = mock.patch('keepercommander.commands.pam_import.record_loader.load_pam_record')
+        self.load_patcher.start()
+
+    def new_teardown(self):
+        self.sync_patcher.stop()
+        self.load_patcher.stop()
+        if original_teardown:
+            original_teardown(self)
+
+    cls.setUp = new_setup
+    cls.tearDown = new_teardown
+    return cls
+
+
+@unittest.skipIf(skip_tests, skip_reason)
+class TestPamRbiEditArguments(unittest.TestCase):
+    """Tests for PAMRbiEditCommand argument parsing."""
+
+    def setUp(self):
+        """Set up parser for testing."""
+        self.parser = PAMRbiEditCommand.parser
+
+    def test_allow_url_navigation_on(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--allow-url-navigation', 'on'])
+        self.assertEqual(args.allow_url_navigation, 'on')
+
+    def test_allow_url_navigation_off(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--allow-url-navigation', 'off'])
+        self.assertEqual(args.allow_url_navigation, 'off')
+
+    def test_allow_url_navigation_default(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--allow-url-navigation', 'default'])
+        self.assertEqual(args.allow_url_navigation, 'default')
+
+    def test_allow_url_navigation_invalid(self):
+        with self.assertRaises(SystemExit):
+            self.parser.parse_args(['--record', 'test-record', '--allow-url-navigation', 'invalid'])
+
+    def test_allow_url_navigation_not_provided(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--key-events', 'on'])
+        self.assertIsNone(args.allow_url_navigation)
+
+    def test_ignore_server_cert_on(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--ignore-server-cert', 'on'])
+        self.assertEqual(args.ignore_server_cert, 'on')
+
+    def test_ignore_server_cert_off(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--ignore-server-cert', 'off'])
+        self.assertEqual(args.ignore_server_cert, 'off')
+
+    def test_ignore_server_cert_default(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--ignore-server-cert', 'default'])
+        self.assertEqual(args.ignore_server_cert, 'default')
+
+    def test_allow_file_uploads_on(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--allow-file-uploads', 'on'])
+        self.assertEqual(args.allow_file_uploads, 'on')
+
+    def test_allow_file_uploads_off(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--allow-file-uploads', 'off'])
+        self.assertEqual(args.allow_file_uploads, 'off')
+
+    def test_allow_file_uploads_default(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--allow-file-uploads', 'default'])
+        self.assertEqual(args.allow_file_uploads, 'default')
+
+    def test_allow_file_uploads_invalid(self):
+        with self.assertRaises(SystemExit):
+            self.parser.parse_args(['--record', 'test-record', '--allow-file-uploads', 'invalid'])
+
+    def test_allow_file_uploads_not_provided(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--key-events', 'on'])
+        self.assertIsNone(args.allow_file_uploads)
+
+    def test_allow_file_downloads_on(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--allow-file-downloads', 'on'])
+        self.assertEqual(args.allow_file_downloads, 'on')
+
+    def test_allow_file_downloads_off(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--allow-file-downloads', 'off'])
+        self.assertEqual(args.allow_file_downloads, 'off')
+
+    def test_allow_file_downloads_default(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--allow-file-downloads', 'default'])
+        self.assertEqual(args.allow_file_downloads, 'default')
+
+    def test_allow_file_downloads_invalid(self):
+        with self.assertRaises(SystemExit):
+            self.parser.parse_args(['--record', 'test-record', '--allow-file-downloads', 'invalid'])
+
+    def test_allow_file_downloads_not_provided(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--key-events', 'on'])
+        self.assertIsNone(args.allow_file_downloads)
+
+    def test_allowed_urls_single(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--allowed-urls', '*.example.com'])
+        self.assertEqual(args.allowed_urls, ['*.example.com'])
+
+    def test_allowed_urls_multiple(self):
+        args = self.parser.parse_args([
+            '--record', 'test-record',
+            '--allowed-urls', '*.example.com',
+            '--allowed-urls', '*.test.com',
+            '--allowed-urls', '*.dev.com'
+        ])
+        self.assertEqual(args.allowed_urls, ['*.example.com', '*.test.com', '*.dev.com'])
+
+    def test_allowed_urls_not_provided(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--key-events', 'on'])
+        self.assertIsNone(args.allowed_urls)
+
+    def test_allowed_resource_urls_single(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--allowed-resource-urls', '*.cdn.example.com'])
+        self.assertEqual(args.allowed_resource_urls, ['*.cdn.example.com'])
+
+    def test_allowed_resource_urls_multiple(self):
+        args = self.parser.parse_args([
+            '--record', 'test-record',
+            '--allowed-resource-urls', '*.cdn.example.com',
+            '--allowed-resource-urls', '*.static.test.com'
+        ])
+        self.assertEqual(args.allowed_resource_urls, ['*.cdn.example.com', '*.static.test.com'])
+
+    def test_autofill_targets_single(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--autofill-targets', '#username'])
+        self.assertEqual(args.autofill_targets, ['#username'])
+
+    def test_autofill_targets_multiple(self):
+        args = self.parser.parse_args([
+            '--record', 'test-record',
+            '--autofill-targets', '#username',
+            '--autofill-targets', '#password',
+            '--autofill-targets', 'input[name=email]'
+        ])
+        self.assertEqual(args.autofill_targets, ['#username', '#password', 'input[name=email]'])
+
+    def test_allow_copy_on(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--allow-copy', 'on'])
+        self.assertEqual(args.allow_copy, 'on')
+
+    def test_allow_copy_off(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--allow-copy', 'off'])
+        self.assertEqual(args.allow_copy, 'off')
+
+    def test_allow_copy_default(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--allow-copy', 'default'])
+        self.assertEqual(args.allow_copy, 'default')
+
+    def test_allow_paste_on(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--allow-paste', 'on'])
+        self.assertEqual(args.allow_paste, 'on')
+
+    def test_allow_paste_off(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--allow-paste', 'off'])
+        self.assertEqual(args.allow_paste, 'off')
+
+    def test_allow_paste_default(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--allow-paste', 'default'])
+        self.assertEqual(args.allow_paste, 'default')
+
+    def test_combine_multiple_new_args(self):
+        args = self.parser.parse_args([
+            '--record', 'test-record',
+            '--allow-url-navigation', 'on',
+            '--ignore-server-cert', 'off',
+            '--allowed-urls', '*.example.com',
+            '--allow-copy', 'on',
+            '--allow-paste', 'off'
+        ])
+        self.assertEqual(args.allow_url_navigation, 'on')
+        self.assertEqual(args.ignore_server_cert, 'off')
+        self.assertEqual(args.allowed_urls, ['*.example.com'])
+        self.assertEqual(args.allow_copy, 'on')
+        self.assertEqual(args.allow_paste, 'off')
+
+    def test_combine_new_args_with_existing(self):
+        args = self.parser.parse_args([
+            '--record', 'test-record',
+            '--key-events', 'on',
+            '--allow-url-navigation', 'on',
+            '--allowed-urls', '*.example.com'
+        ])
+        self.assertEqual(args.key_events, 'on')
+        self.assertEqual(args.allow_url_navigation, 'on')
+        self.assertEqual(args.allowed_urls, ['*.example.com'])
+
+    def test_allow_supply_user_choices(self):
+        for v in ('on', 'off', 'default'):
+            args = self.parser.parse_args(['--record', 'test-record', '--allow-supply-user', v])
+            self.assertEqual(args.allow_supply_user, v)
+
+    def test_allow_supply_user_invalid(self):
+        with self.assertRaises(SystemExit):
+            self.parser.parse_args(['--record', 'test-record', '--allow-supply-user', 'invalid'])
+
+    def test_allow_supply_user_not_provided(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--key-events', 'on'])
+        self.assertIsNone(args.allow_supply_user)
+
+    def test_clipboard_buffer_size_allowed_values(self):
+        for v in ('256kb', '1mb', '10mb', '50mb'):
+            args = self.parser.parse_args(['--record', 'test-record', '--clipboard-buffer-size', v])
+            self.assertEqual(args.clipboard_buffer_size, v)
+
+    def test_clipboard_buffer_size_case_insensitive(self):
+        for v, expected in (('256KB', '256kb'), ('1Mb', '1mb'), ('10MB', '10mb'), ('DEFAULT', 'default')):
+            args = self.parser.parse_args(['--record', 'test-record', '--clipboard-buffer-size', v])
+            self.assertEqual(args.clipboard_buffer_size, expected)
+
+    def test_clipboard_buffer_size_default(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--clipboard-buffer-size', 'default'])
+        self.assertEqual(args.clipboard_buffer_size, 'default')
+
+    def test_clipboard_buffer_size_rejects_other_values(self):
+        for v in ('12345', '10485760', '0', '-1', '2mb', '100mb', 'abc'):
+            with self.assertRaises(SystemExit, msg=v):
+                self.parser.parse_args(['--record', 'test-record', '--clipboard-buffer-size', v])
+
+    def test_clipboard_buffer_size_not_provided(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--key-events', 'on'])
+        self.assertIsNone(args.clipboard_buffer_size)
+
+    def test_session_persistence_none(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--session-persistence', 'none'])
+        self.assertEqual(args.session_persistence, 'none')
+
+    def test_session_persistence_user(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--session-persistence', 'user'])
+        self.assertEqual(args.session_persistence, 'user')
+
+    def test_session_persistence_resource(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--session-persistence', 'resource'])
+        self.assertEqual(args.session_persistence, 'resource')
+
+    def test_session_persistence_default(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--session-persistence', 'default'])
+        self.assertEqual(args.session_persistence, 'default')
+
+    def test_session_persistence_short_flag(self):
+        args = self.parser.parse_args(['--record', 'test-record', '-sp', 'user'])
+        self.assertEqual(args.session_persistence, 'user')
+
+    def test_session_persistence_invalid(self):
+        with self.assertRaises(SystemExit):
+            self.parser.parse_args(['--record', 'test-record', '--session-persistence', 'invalid'])
+
+    def test_session_persistence_not_provided(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--key-events', 'on'])
+        self.assertIsNone(args.session_persistence)
+
+
+@mock_sync_decorator
+@unittest.skipIf(skip_tests, skip_reason)
+class TestPamRbiEditExecute(unittest.TestCase):
+    """Tests for PAMRbiEditCommand.execute() method."""
+
+    def setUp(self):
+        self.command = PAMRbiEditCommand()
+        self.mock_record = mock.MagicMock(spec=vault.TypedRecord)
+        self.mock_record.record_uid = 'test-record-uid'
+        self.mock_record.record_type = 'pamRemoteBrowser'
+        self.pam_settings = {'connection': {'protocol': 'http', 'httpCredentialsUid': ''}}
+        self.mock_field = mock.MagicMock()
+        self.mock_field.value = [self.pam_settings]
+        self.mock_record.get_typed_field.return_value = self.mock_field
+        self.mock_params = mock.MagicMock()
+        # Use REAL dicts for caches so sync/reload operations work
+        self.mock_params.record_cache = {'test-record-uid': self.mock_record}
+        self.mock_params.nested_share_record_data = {}
+        self.mock_params.nested_share_records = {}
+        # Parent class decorator handles sync/load mocking in setUp
+
+    def test_no_param_raises_error_with_new_settings_check(self):
+        with self.assertRaises(CommandError) as context:
+            self.command.execute(self.mock_params, record='test-record')
+        self.assertIn('At least one parameter is required', str(context.exception))
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_allow_url_navigation_on_sets_true(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', allow_url_navigation='on')
+        self.assertEqual(self.pam_settings['connection'].get('allowUrlManipulation'), True)
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_allow_url_navigation_off_sets_false(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', allow_url_navigation='off')
+        self.assertEqual(self.pam_settings['connection'].get('allowUrlManipulation'), False)
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_allow_url_navigation_default_removes_field(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.pam_settings['connection']['allowUrlManipulation'] = True
+        self.command.execute(self.mock_params, record='test-record', allow_url_navigation='default')
+        self.assertNotIn('allowUrlManipulation', self.pam_settings['connection'])
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_ignore_server_cert_on_sets_true(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', ignore_server_cert='on')
+        self.assertEqual(self.pam_settings['connection'].get('ignoreInitialSslCert'), True)
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_allow_file_uploads_on_sets_true(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', allow_file_uploads='on')
+        self.assertEqual(self.pam_settings['connection'].get('allowFileUploads'), True)
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_allow_file_uploads_off_sets_false(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', allow_file_uploads='off')
+        self.assertEqual(self.pam_settings['connection'].get('allowFileUploads'), False)
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_allow_file_uploads_default_removes_field(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.pam_settings['connection']['allowFileUploads'] = True
+        self.command.execute(self.mock_params, record='test-record', allow_file_uploads='default')
+        self.assertNotIn('allowFileUploads', self.pam_settings['connection'])
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_allow_file_downloads_on_sets_true(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', allow_file_downloads='on')
+        self.assertEqual(self.pam_settings['connection'].get('allowFileDownloads'), True)
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_allow_file_downloads_off_sets_false(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', allow_file_downloads='off')
+        self.assertEqual(self.pam_settings['connection'].get('allowFileDownloads'), False)
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_allow_file_downloads_default_removes_field(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.pam_settings['connection']['allowFileDownloads'] = True
+        self.command.execute(self.mock_params, record='test-record', allow_file_downloads='default')
+        self.assertNotIn('allowFileDownloads', self.pam_settings['connection'])
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_allowed_urls_joins_with_newlines(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', allowed_urls=['*.example.com', '*.test.com'])
+        self.assertEqual(self.pam_settings['connection'].get('allowedUrlPatterns'), '*.example.com\n*.test.com')
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_allowed_resource_urls_joins_with_newlines(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', allowed_resource_urls=['*.cdn.example.com'])
+        self.assertEqual(self.pam_settings['connection'].get('allowedResourceUrlPatterns'), '*.cdn.example.com')
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_autofill_targets_joins_with_newlines(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', autofill_targets=['#username', '#password'])
+        self.assertEqual(self.pam_settings['connection'].get('autofillConfiguration'), '#username\n#password')
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_session_persistence_sets_value(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', session_persistence='user')
+        self.assertEqual(self.pam_settings['connection'].get('sessionPersistence'), 'user')
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_session_persistence_none_sets_literal(self, mock_update, mock_resolve):
+        # 'none' is a real enum value (no persistence), not a removal sentinel
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', session_persistence='none')
+        self.assertEqual(self.pam_settings['connection'].get('sessionPersistence'), 'none')
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_session_persistence_default_removes_field(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.pam_settings['connection']['sessionPersistence'] = 'user'
+        self.command.execute(self.mock_params, record='test-record', session_persistence='default')
+        self.assertNotIn('sessionPersistence', self.pam_settings['connection'])
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_session_persistence_default_removes_present_but_null(self, mock_update, mock_resolve):
+        # A present-but-null value must still be removed (membership check, not None check)
+        mock_resolve.return_value = self.mock_record
+        self.pam_settings['connection']['sessionPersistence'] = None
+        self.command.execute(self.mock_params, record='test-record', session_persistence='default')
+        self.assertNotIn('sessionPersistence', self.pam_settings['connection'])
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_allow_supply_user_on_sets_true(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', allow_supply_user='on')
+        self.assertIs(self.pam_settings['connection'].get('allowSupplyUser'), True)
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_allow_supply_user_off_sets_false(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', allow_supply_user='off')
+        self.assertIs(self.pam_settings['connection'].get('allowSupplyUser'), False)
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_allow_supply_user_default_removes_field(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.pam_settings['connection']['allowSupplyUser'] = True
+        self.command.execute(self.mock_params, record='test-record', allow_supply_user='default')
+        self.assertNotIn('allowSupplyUser', self.pam_settings['connection'])
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_clipboard_buffer_size_sets_value(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', clipboard_buffer_size='10mb')
+        self.assertEqual(self.pam_settings['connection'].get('clipboardBufferSize'), 10485760)
+        mock_update.assert_called_once()
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_clipboard_buffer_size_converts_all_names_to_bytes(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        for name, size in (('256KB', 262144), ('1MB', 1048576), ('10mb', 10485760), ('50Mb', 52428800)):
+            self.command.execute(self.mock_params, record='test-record', clipboard_buffer_size=name)
+            self.assertEqual(self.pam_settings['connection'].get('clipboardBufferSize'), size)
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_clipboard_buffer_size_default_removes_field(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.pam_settings['connection']['clipboardBufferSize'] = 1048576
+        self.command.execute(self.mock_params, record='test-record', clipboard_buffer_size='default')
+        self.assertNotIn('clipboardBufferSize', self.pam_settings['connection'])
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_clipboard_buffer_size_invalid_raises(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        with self.assertRaises(CommandError):
+            self.command.execute(self.mock_params, record='test-record', clipboard_buffer_size='12345')
+        self.assertNotIn('clipboardBufferSize', self.pam_settings['connection'])
+        mock_update.assert_not_called()
+
+
+@mock_sync_decorator
+@unittest.skipIf(skip_tests, skip_reason)
+class TestPamRbiEditClipboardInversion(unittest.TestCase):
+    """Tests for clipboard inversion logic."""
+
+    def setUp(self):
+        self.command = PAMRbiEditCommand()
+        self.mock_record = mock.MagicMock(spec=vault.TypedRecord)
+        self.mock_record.record_uid = 'test-record-uid'
+        self.mock_record.record_type = 'pamRemoteBrowser'
+        self.pam_settings = {'connection': {'protocol': 'http', 'httpCredentialsUid': ''}}
+        self.mock_field = mock.MagicMock()
+        self.mock_field.value = [self.pam_settings]
+        self.mock_record.get_typed_field.return_value = self.mock_field
+        self.mock_params = mock.MagicMock()
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_allow_copy_on_sets_disable_copy_false(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', allow_copy='on')
+        self.assertEqual(self.pam_settings['connection'].get('disableCopy'), False)
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_allow_copy_off_sets_disable_copy_true(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', allow_copy='off')
+        self.assertEqual(self.pam_settings['connection'].get('disableCopy'), True)
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_allow_copy_default_removes_field(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.pam_settings['connection']['disableCopy'] = True
+        self.command.execute(self.mock_params, record='test-record', allow_copy='default')
+        self.assertNotIn('disableCopy', self.pam_settings['connection'])
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_allow_paste_on_sets_disable_paste_false(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', allow_paste='on')
+        self.assertEqual(self.pam_settings['connection'].get('disablePaste'), False)
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_allow_paste_off_sets_disable_paste_true(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', allow_paste='off')
+        self.assertEqual(self.pam_settings['connection'].get('disablePaste'), True)
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_clipboard_both_on(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', allow_copy='on', allow_paste='on')
+        self.assertEqual(self.pam_settings['connection'].get('disableCopy'), False)
+        self.assertEqual(self.pam_settings['connection'].get('disablePaste'), False)
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_clipboard_both_off(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', allow_copy='off', allow_paste='off')
+        self.assertEqual(self.pam_settings['connection'].get('disableCopy'), True)
+        self.assertEqual(self.pam_settings['connection'].get('disablePaste'), True)
+
+
+@mock_sync_decorator
+@unittest.skipIf(skip_tests, skip_reason)
+class TestPamRbiEditRecordUpdate(unittest.TestCase):
+    """Tests for record update behavior."""
+
+    def setUp(self):
+        self.command = PAMRbiEditCommand()
+        self.mock_record = mock.MagicMock(spec=vault.TypedRecord)
+        self.mock_record.record_uid = 'test-record-uid'
+        self.mock_record.record_type = 'pamRemoteBrowser'
+        self.pam_settings = {'connection': {'protocol': 'http', 'httpCredentialsUid': ''}}
+        self.mock_field = mock.MagicMock()
+        self.mock_field.value = [self.pam_settings]
+        self.mock_record.get_typed_field.return_value = self.mock_field
+        self.mock_params = mock.MagicMock()
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_record_update_called_when_field_changes(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', allow_url_navigation='on')
+        mock_update.assert_called_once()
+        args, kwargs = mock_update.call_args
+        self.assertEqual(kwargs.get('command'), 'pam rbi edit')
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_multiple_fields_single_update(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', allow_url_navigation='on',
+                           ignore_server_cert='off', allow_copy='on', allowed_urls=['*.example.com'])
+        mock_update.assert_called_once()
+
+    @mock.patch('keepercommander.commands.pam.vault_target.record_management.update_record')
+    @mock.patch('keepercommander.commands.pam_import.nsf_helpers.sync_down_preserving_nsf_keys')
+    @mock.patch('keepercommander.nested_share_folder.record_api.update_record_v3',
+                return_value={'success': True})
+    @mock.patch('keepercommander.vault_extensions.extract_typed_record_data',
+                return_value={'type': 'pamRemoteBrowser', 'title': 'NSF RBI', 'fields': []})
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    def test_nsf_rbi_edit_routes_to_update_record_v3(self, mock_resolve, _extract, mock_update_v3,
+                                                     mock_nsf_sync, mock_classic_update):
+        """Regression: NSF pamRemoteBrowser edits must use NSF v3 update, not classic update_record."""
+        record_uid = 'nsf-rbi-uid'
+        record = vault.TypedRecord(version=3)
+        record.record_uid = record_uid
+        record.type_name = 'pamRemoteBrowser'
+        record.title = 'NSF RBI'
+        record.fields.append(vault.TypedField.new_field('trafficEncryptionSeed', 'seed', ''))
+        record.fields.append(vault.TypedField.new_field(
+            'pamRemoteBrowserSettings',
+            {'connection': {'protocol': 'http', 'sessionPersistence': 'resource'}},
+            ''))
+
+        params = mock.MagicMock()
+        params.nested_share_records = {record_uid: {'revision': 1}}
+        params.nested_share_record_data = {}
+        mock_resolve.return_value = record
+
+        self.command.execute(params, record=record_uid, session_persistence='user')
+
+        mock_update_v3.assert_called_once()
+        self.assertEqual(mock_update_v3.call_args.args[1], record_uid)
+        mock_nsf_sync.assert_called_once_with(params)
+        mock_classic_update.assert_not_called()
+        self.assertEqual(
+            record.get_typed_field('pamRemoteBrowserSettings').value[0]['connection']['sessionPersistence'],
+            'user')
+
+
+@unittest.skipIf(skip_tests, skip_reason)
+class TestPamRbiEditHelp(unittest.TestCase):
+    """Test that help text is correct for new arguments."""
+
+    def test_help_includes_new_arguments(self):
+        help_text = PAMRbiEditCommand.parser.format_help()
+        self.assertIn('--allow-url-navigation', help_text)
+        self.assertIn('--ignore-server-cert', help_text)
+        self.assertIn('--allow-file-uploads', help_text)
+        self.assertIn('--allow-file-downloads', help_text)
+        self.assertIn('--allowed-urls', help_text)
+        self.assertIn('--allowed-resource-urls', help_text)
+        self.assertIn('--autofill-targets', help_text)
+        self.assertIn('--allow-copy', help_text)
+        self.assertIn('--allow-paste', help_text)
+        self.assertIn('--disable-audio', help_text)
+        self.assertIn('--audio-channels', help_text)
+        self.assertIn('--audio-bit-depth', help_text)
+        self.assertIn('--audio-sample-rate', help_text)
+
+    def test_help_shows_choices(self):
+        help_text = PAMRbiEditCommand.parser.format_help()
+        self.assertIn('on/off/default', help_text.lower().replace('{', '').replace('}', '').replace(',', '/'))
+
+
+@unittest.skipIf(skip_tests, skip_reason)
+class TestPamRbiEditAliases(unittest.TestCase):
+    """Tests for short alias arguments."""
+
+    def setUp(self):
+        self.parser = PAMRbiEditCommand.parser
+
+    def test_alias_nav(self):
+        args = self.parser.parse_args(['--record', 'test-record', '-nav', 'on'])
+        self.assertEqual(args.allow_url_navigation, 'on')
+
+    def test_alias_isc(self):
+        args = self.parser.parse_args(['--record', 'test-record', '-isc', 'on'])
+        self.assertEqual(args.ignore_server_cert, 'on')
+
+    def test_alias_fu(self):
+        args = self.parser.parse_args(['--record', 'test-record', '-fu', 'on'])
+        self.assertEqual(args.allow_file_uploads, 'on')
+
+    def test_alias_fd(self):
+        args = self.parser.parse_args(['--record', 'test-record', '-fd', 'on'])
+        self.assertEqual(args.allow_file_downloads, 'on')
+
+    def test_alias_au(self):
+        args = self.parser.parse_args(['--record', 'test-record', '-au', '*.example.com'])
+        self.assertEqual(args.allowed_urls, ['*.example.com'])
+
+    def test_alias_aru(self):
+        args = self.parser.parse_args(['--record', 'test-record', '-aru', '*.cdn.example.com'])
+        self.assertEqual(args.allowed_resource_urls, ['*.cdn.example.com'])
+
+    def test_alias_at(self):
+        args = self.parser.parse_args(['--record', 'test-record', '-at', '#username'])
+        self.assertEqual(args.autofill_targets, ['#username'])
+
+    def test_alias_cpy(self):
+        args = self.parser.parse_args(['--record', 'test-record', '-cpy', 'on'])
+        self.assertEqual(args.allow_copy, 'on')
+
+    def test_alias_p(self):
+        args = self.parser.parse_args(['--record', 'test-record', '-p', 'on'])
+        self.assertEqual(args.allow_paste, 'on')
+
+    def test_alias_da(self):
+        args = self.parser.parse_args(['--record', 'test-record', '-da', 'on'])
+        self.assertEqual(args.disable_audio, 'on')
+
+    def test_alias_ac(self):
+        args = self.parser.parse_args(['--record', 'test-record', '-ac', '2'])
+        self.assertEqual(args.audio_channels, 2)
+
+    def test_alias_bd(self):
+        args = self.parser.parse_args(['--record', 'test-record', '-bd', '16'])
+        self.assertEqual(args.audio_bit_depth, 16)
+
+    def test_alias_sr(self):
+        args = self.parser.parse_args(['--record', 'test-record', '-sr', '44100'])
+        self.assertEqual(args.audio_sample_rate, 44100)
+
+
+@mock_sync_decorator
+@unittest.skipIf(skip_tests, skip_reason)
+class TestPamRbiEditAudioSettings(unittest.TestCase):
+    """Tests for audio settings."""
+
+    def setUp(self):
+        self.parser = PAMRbiEditCommand.parser
+        self.command = PAMRbiEditCommand()
+        self.mock_record = mock.MagicMock(spec=vault.TypedRecord)
+        self.mock_record.record_uid = 'test-record-uid'
+        self.mock_record.record_type = 'pamRemoteBrowser'
+        self.pam_settings = {'connection': {'protocol': 'http', 'httpCredentialsUid': ''}}
+        self.mock_field = mock.MagicMock()
+        self.mock_field.value = [self.pam_settings]
+        self.mock_record.get_typed_field.return_value = self.mock_field
+        self.mock_params = mock.MagicMock()
+
+    def test_disable_audio_on(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--disable-audio', 'on'])
+        self.assertEqual(args.disable_audio, 'on')
+
+    def test_disable_audio_off(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--disable-audio', 'off'])
+        self.assertEqual(args.disable_audio, 'off')
+
+    def test_disable_audio_default(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--disable-audio', 'default'])
+        self.assertEqual(args.disable_audio, 'default')
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_disable_audio_on_sets_true(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', disable_audio='on')
+        self.assertEqual(self.pam_settings['connection'].get('disableAudio'), True)
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_disable_audio_off_sets_false(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', disable_audio='off')
+        self.assertEqual(self.pam_settings['connection'].get('disableAudio'), False)
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_disable_audio_default_removes_field(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.pam_settings['connection']['disableAudio'] = True
+        self.command.execute(self.mock_params, record='test-record', disable_audio='default')
+        self.assertNotIn('disableAudio', self.pam_settings['connection'])
+
+    def test_audio_channels_argument(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--audio-channels', '2'])
+        self.assertEqual(args.audio_channels, 2)
+
+    def test_audio_channels_mono(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--audio-channels', '1'])
+        self.assertEqual(args.audio_channels, 1)
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_audio_channels_sets_field(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', audio_channels=2)
+        self.assertEqual(self.pam_settings['connection'].get('audioChannels'), 2)
+
+    def test_audio_bit_depth_8(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--audio-bit-depth', '8'])
+        self.assertEqual(args.audio_bit_depth, 8)
+
+    def test_audio_bit_depth_16(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--audio-bit-depth', '16'])
+        self.assertEqual(args.audio_bit_depth, 16)
+
+    def test_audio_bit_depth_invalid(self):
+        with self.assertRaises(SystemExit):
+            self.parser.parse_args(['--record', 'test-record', '--audio-bit-depth', '24'])
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_audio_bit_depth_sets_field(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', audio_bit_depth=16)
+        self.assertEqual(self.pam_settings['connection'].get('audioBps'), 16)
+
+    def test_audio_sample_rate_44100(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--audio-sample-rate', '44100'])
+        self.assertEqual(args.audio_sample_rate, 44100)
+
+    def test_audio_sample_rate_48000(self):
+        args = self.parser.parse_args(['--record', 'test-record', '--audio-sample-rate', '48000'])
+        self.assertEqual(args.audio_sample_rate, 48000)
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_audio_sample_rate_sets_field(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', audio_sample_rate=48000)
+        self.assertEqual(self.pam_settings['connection'].get('audioSampleRate'), 48000)
+
+    @mock.patch('keepercommander.commands.tunnel_and_connections.RecordMixin.resolve_single_record')
+    @mock.patch('keepercommander.commands.tunnel_and_connections.update_pam_record')
+    def test_all_audio_settings_combined(self, mock_update, mock_resolve):
+        mock_resolve.return_value = self.mock_record
+        self.command.execute(self.mock_params, record='test-record', disable_audio='off',
+                           audio_channels=2, audio_bit_depth=16, audio_sample_rate=44100)
+        self.assertEqual(self.pam_settings['connection'].get('disableAudio'), False)
+        self.assertEqual(self.pam_settings['connection'].get('audioChannels'), 2)
+        self.assertEqual(self.pam_settings['connection'].get('audioBps'), 16)
+        self.assertEqual(self.pam_settings['connection'].get('audioSampleRate'), 44100)
+
+
+if __name__ == '__main__':
+    unittest.main()

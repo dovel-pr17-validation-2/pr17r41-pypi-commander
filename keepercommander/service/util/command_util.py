@@ -1,0 +1,440 @@
+#  _  __
+# | |/ /___ ___ _ __  ___ _ _ ®
+# | ' </ -_) -_) '_ \/ -_) '_|
+# |_|\_\___\___| .__/\___|_|
+#              |_|
+#
+# Keeper Commander
+# Copyright 2024 Keeper Security Inc.
+# Contact: ops@keepersecurity.com
+#
+
+import io, html
+import os
+import sys
+import json
+import logging
+from typing import Any, Tuple, Optional
+from .config_reader import ConfigReader
+from .exceptions import CommandExecutionError
+from .parse_keeper_response import parse_keeper_response, ensure_record_add_json_format
+from .throttle import (
+    RESULT_EDGE_429,
+    RESULT_THROTTLED,
+    is_throttle_error,
+    throttle_error_response,
+)
+from .protected_records import (
+    get_protected_folder_uids,
+    get_protected_record_uids,
+    hide_from_folder_cache,
+    hide_from_record_cache,
+    resolve_sync_down_exempt_uid,
+)
+from .verified_command import Verifycommand
+from ..core.globals import get_current_params
+from ..decorators.logging import logger, debug_decorator, sanitize_debug_data, sanitize_command_fields
+from ... import cli, utils
+from ...crypto import encrypt_aes_v2
+from ...error import CommandError, KeeperApiError
+
+
+MAX_SERVICE_MODE_JSON_RESPONSE_BYTES = 10 * 1024 * 1024
+MAX_SERVICE_MODE_JSON_LOG_BYTES = 1024 * 1024
+
+
+def is_pam_debug_dump_command(command_tokens) -> bool:
+    """Return True for `pam action|a debug dump|d` token sequences."""
+    return (
+        len(command_tokens) >= 4
+        and command_tokens[0].lower() == 'pam'
+        and command_tokens[1].lower() in ('action', 'a')
+        and command_tokens[2].lower() == 'debug'
+        and command_tokens[3].lower() in ('dump', 'd')
+    )
+
+
+class ServiceModeOutputLimitExceeded(Exception):
+    """Raised when a bulk JSON command would exceed its response-size budget."""
+
+
+class _OutputByteBudget:
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self.bytes_written = 0
+        self.exceeded = False
+
+    def consume(self, value: str):
+        if self.exceeded:
+            raise ServiceModeOutputLimitExceeded
+        byte_count = len(value.encode('utf-8', errors='replace'))
+        if self.bytes_written + byte_count > self.max_bytes:
+            self.exceeded = True
+            raise ServiceModeOutputLimitExceeded
+        self.bytes_written += byte_count
+
+
+class _BoundedStringIO(io.StringIO):
+    """StringIO that rejects writes exceeding a UTF-8 byte limit."""
+
+    def __init__(self, budget: _OutputByteBudget):
+        super().__init__()
+        self.budget = budget
+
+    def write(self, value: str) -> int:
+        self.budget.consume(value)
+        return super().write(value)
+
+
+class _TruncatedStringIO(io.StringIO):
+    """Keep a bounded diagnostic log buffer without interrupting command work."""
+
+    def __init__(self, max_bytes: int):
+        super().__init__()
+        self.max_bytes = max_bytes
+        self.bytes_written = 0
+        self.truncated = False
+
+    def write(self, value: str) -> int:
+        if self.truncated:
+            return len(value)
+        byte_count = len(value.encode('utf-8', errors='replace'))
+        if self.bytes_written + byte_count > self.max_bytes:
+            self.truncated = True
+            return len(value)
+        self.bytes_written += byte_count
+        return super().write(value)
+
+
+class CommandExecutor:
+    @staticmethod
+    def _is_bulk_json_command(command: str) -> bool:
+        """Whether this command returns a potentially large JSON document."""
+        try:
+            tokens = Verifycommand.tokenize_service_command(command)
+        except ValueError:
+            return False
+
+        if not tokens:
+            return False
+        if tokens[0].lower() == 'export':
+            return True
+        return is_pam_debug_dump_command(tokens)
+
+    @staticmethod
+    @debug_decorator
+    def validate_command(command: str) -> Optional[Tuple[dict, int]]:
+        if not command:
+            return {"error": "No command provided."}, 400
+        return None
+
+    @staticmethod
+    @debug_decorator
+    def validate_session() -> Optional[Tuple[dict, int]]:
+        params = get_current_params()
+        if not params:
+            return {"error": "No active session. Please log in through the CLI first."}, 401
+        return None
+
+    @staticmethod
+    @debug_decorator
+    def capture_output_and_logs(params: Any, command: str) -> Tuple[Any, str, str]:
+        """Capture command output, bounding bulk JSON responses in Service Mode."""
+        max_response_bytes = (
+            MAX_SERVICE_MODE_JSON_RESPONSE_BYTES
+            if CommandExecutor._is_bulk_json_command(command)
+            else None
+        )
+        if max_response_bytes is not None:
+            response_budget = _OutputByteBudget(max_response_bytes)
+            captured_stdout = _BoundedStringIO(response_budget)
+            captured_stderr = _BoundedStringIO(response_budget)
+            captured_logs = _TruncatedStringIO(MAX_SERVICE_MODE_JSON_LOG_BYTES)
+        else:
+            response_budget = None
+            captured_stdout = io.StringIO()
+            captured_stderr = io.StringIO()
+            captured_logs = io.StringIO()
+        
+        # Create a temporary log handler to capture command logs
+        temp_handler = logging.StreamHandler(captured_logs)
+        temp_handler.setFormatter(logging.Formatter('%(message)s'))
+        
+        # Get the root logger to capture all logging output
+        root_logger = logging.getLogger()
+        original_level = root_logger.level
+        original_handlers = root_logger.handlers[:]
+        
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        
+        sys.stdout = captured_stdout
+        sys.stderr = captured_stderr
+        
+        try:
+            # Add our temporary handler and set appropriate level
+            root_logger.addHandler(temp_handler)
+            root_logger.setLevel(logging.INFO)
+            
+            return_value = cli.do_command(params, command)
+            if response_budget is not None and response_budget.exceeded:
+                raise ServiceModeOutputLimitExceeded
+            
+            stdout_content = captured_stdout.getvalue()
+            stderr_content = captured_stderr.getvalue()
+            log_content = captured_logs.getvalue()
+            
+            # Combine stdout and stderr
+            stdout_clean = stdout_content.strip()
+            stderr_clean = stderr_content.strip()
+            log_clean = log_content.strip()
+            
+            if stderr_clean and stdout_clean:
+                combined_output = stderr_clean + '\n' + stdout_clean
+            else:
+                combined_output = stderr_clean or stdout_clean
+            if getattr(captured_logs, 'truncated', False):
+                log_clean = f'{log_clean}\n[Service Mode diagnostic logs truncated]'.strip()
+            
+            return return_value, combined_output, log_clean
+        except ServiceModeOutputLimitExceeded:
+            raise
+        except Exception as e:
+            # If there's an exception, capture any error output
+            stderr_content = captured_stderr.getvalue()
+            log_content = captured_logs.getvalue()
+            error_output = stderr_content.strip()
+            
+            if error_output:
+                raise CommandExecutionError(f"Command failed: {error_output}")
+            raise
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            # Restore original logging configuration
+            root_logger.removeHandler(temp_handler)
+            root_logger.setLevel(original_level)
+            temp_handler.close()
+
+
+    @staticmethod
+    @debug_decorator
+    def encrypt_response(response: Any) -> bytes:
+        encryption_key = ConfigReader.read_config('encryption_private_key')
+        if encryption_key:
+            try:
+                encryption_key_bytes = encryption_key.encode('utf-8')
+                response_bytes = json.dumps(response).encode('utf-8')
+                return encrypt_aes_v2(response_bytes, encryption_key_bytes)
+            except Exception as e:
+                raise
+        return response
+
+    @staticmethod
+    def _status_code_from_response(response: dict) -> int:
+        if 'status_code' in response:
+            return response.pop('status_code')
+        if response.get('status') in ('error', 'warning'):
+            return 400
+        return 200
+
+    @classmethod
+    def _finalize_parsed_response(cls, response: Any) -> Tuple[Any, int]:
+        if not isinstance(response, dict):
+            return response, 200
+
+        status_code = cls._status_code_from_response(response)
+        result_code = response.get('result_code')
+        if status_code == 429 or result_code in (RESULT_THROTTLED, RESULT_EDGE_429):
+            body, status_code = throttle_error_response(response.get('error'), result_code)
+            if 'command' in response:
+                body['command'] = response['command']
+            return body, status_code
+        return response, status_code
+
+    @classmethod
+    def execute(cls, command: str, temp_files: Optional[list] = None) -> Tuple[Any, int]:
+        logger.debug(f"Executing command: {sanitize_command_fields(command)}")
+        validation_error = cls.validate_command(command)
+        if validation_error:
+            return validation_error
+
+        from ..core.globals import ensure_params_loaded
+        params = None
+        try:
+            params = ensure_params_loaded()
+            # Set service mode flag to bypass master password enforcement
+            if params:
+                params.service_mode = True
+
+            command = ensure_record_add_json_format(html.unescape(command))
+
+            try:
+                # Check the raw command before environment expansion: Service
+                # Mode explicitly forbids this syntax, and expansion must not
+                # erase evidence of it before the restriction check.
+                raw_command_tokens = Verifycommand.tokenize_service_command(command)
+            except ValueError:
+                return {"status": "error", "error": "Invalid command syntax"}, 400
+
+            blocked_command = raw_command_tokens[0] if raw_command_tokens else ''
+
+            def blocked(error):
+                logger.warning(
+                    f"Service Mode blocked command '{blocked_command}': {error}"
+                )
+                return {"status": "error", "error": error}, 403
+
+            expansion_error = Verifycommand.validate_service_mode_env_var_expansion_command(
+                raw_command_tokens
+            )
+            if expansion_error:
+                return blocked(expansion_error)
+
+            try:
+                command_tokens = Verifycommand.tokenize_service_command(
+                    command, params.environment_variables
+                )
+            except ValueError:
+                return {"status": "error", "error": "Invalid command syntax"}, 400
+
+            # This request's own FILEDATA directory - the only paths Service
+            # Mode will treat as safe, not the whole shared OS temp root.
+            request_temp_dir = os.path.dirname(temp_files[0]) if temp_files else None
+
+            # Apply every Service Mode restriction to the same tokens the
+            # CLI's Command.execute_args parser will receive.
+            service_mode_error = Verifycommand.validate_service_mode_restrictions(
+                command_tokens, request_temp_dir
+            )
+            if service_mode_error:
+                return blocked(service_mode_error)
+
+            force_error = Verifycommand.validate_enterprise_user_add_role_force(
+                command_tokens, params
+            )
+            if force_error:
+                return {"status": "error", "error": force_error}, 400
+
+            # Checked for every command (not a curated list) so no current or future
+            # command can be missed as a way to reference these records.
+            protected_uids = get_protected_record_uids(params)
+
+            # {slack,gchat}-app-setup --sync-down needs its own config record reachable.
+            sync_down_exempt_uid = resolve_sync_down_exempt_uid(command_tokens)
+            if sync_down_exempt_uid is not None:
+                protected_uids = {
+                    uid: title for uid, title in protected_uids.items() if uid != sync_down_exempt_uid
+                }
+
+            # Derived from the record set so the exemption above reaches the exempted integration's own folder too.
+            protected_folder_uids = get_protected_folder_uids(params, protected_uids)
+
+            protected_command_error = Verifycommand.validate_service_mode_protected_record_command(
+                command_tokens,
+                {**protected_uids, **{uid: '<protected folder>' for uid in protected_folder_uids}},
+            )
+            if protected_command_error:
+                return blocked(protected_command_error)
+
+            sailpoint_uid = (os.environ.get('SAILPOINT_RECORD') or '').strip()
+            sailpoint_enabled = bool(sailpoint_uid)
+
+            # Only SailPoint's own record is exempt from handle_command's guard; every other
+            # protected record (and the folder cache, which has no exemption) stays hidden throughout.
+            handle_command_uids = {uid: title for uid, title in protected_uids.items() if uid != sailpoint_uid}
+
+            with hide_from_folder_cache(params, protected_folder_uids), \
+                    hide_from_record_cache(params, handle_command_uids):
+                if sailpoint_enabled:
+                    from ..commands.integrations.sailpoint.service import SailPointService
+                    command, sailpoint_response = SailPointService.handle_command(params, command)
+                    if sailpoint_response is not None:
+                        response, status_code = sailpoint_response
+                        response = CommandExecutor.encrypt_response(response)
+                        return response, status_code
+
+                with hide_from_record_cache(params, protected_uids):
+                    return_value, printed_output, log_output = CommandExecutor.capture_output_and_logs(params, command)
+            response = return_value if return_value else printed_output
+
+            # Debug logging with sanitization
+            sanitized_output = sanitize_debug_data(printed_output)
+            sanitized_logs = sanitize_debug_data(log_output)
+            logger.debug(f"After capture_output - return_value: '{return_value}', printed_output: '{sanitized_output}', log_output: '{sanitized_logs}'")
+            sanitized_response = sanitize_debug_data(str(response))
+            logger.debug(f"Final response: '{sanitized_response}', response type: {type(response)}")
+            
+            # Always let the parser handle the response (including empty responses and logs)
+            response = parse_keeper_response(command, response, log_output)
+            response, status_code = cls._finalize_parsed_response(response)
+
+            if status_code == 200 and sailpoint_enabled:
+                try:
+                    # Same rule as the pre-dispatch phase: every protected record except
+                    # SailPoint's own stays hidden here too.
+                    with hide_from_record_cache(params, handle_command_uids):
+                        SailPointService.after_command(params, command, success=True)
+                except Exception as e:
+                    logger.error(f'SailPoint post-process failed: {sanitize_debug_data(str(e))}')
+                    err = {
+                        'status': 'error',
+                        'error': (
+                            'Command succeeded but SailPoint pending entitlement '
+                            f'queue failed: {e}'
+                        ),
+                    }
+                    return CommandExecutor.encrypt_response(err), 500
+
+            response = CommandExecutor.encrypt_response(response)
+            if cls._is_bulk_json_command(command):
+                response_size = (
+                    len(response)
+                    if isinstance(response, bytes)
+                    else len(json.dumps(response).encode('utf-8'))
+                )
+                if response_size > MAX_SERVICE_MODE_JSON_RESPONSE_BYTES:
+                    return {
+                        "status": "error",
+                        "error": (
+                            'Command response exceeds the 10 MiB Service Mode limit '
+                            'and was discarded. Reduce the requested scope and retry.'
+                        ),
+                    }, 413
+            logger.debug(f"Command executed successfully")
+            return response, status_code
+        except ServiceModeOutputLimitExceeded:
+            return {
+                "status": "error",
+                "error": (
+                    'Command response exceeds the 10 MiB Service Mode limit and was discarded. '
+                    'Reduce the requested scope using supported command filters and retry.'
+                ),
+            }, 413
+        except CommandExecutionError as e:
+            # Return the actual command error instead of generic "server busy"
+            logger.error(f"Command execution error: {sanitize_debug_data(str(e))}")
+            if is_throttle_error(e):
+                return throttle_error_response(str(e))
+            return {"status": "error", "error": str(e)}, 400
+        except CommandError as e:
+            if (params is not None
+                    and getattr(params, 'service_mode', False)
+                    and cls._is_bulk_json_command(command)):
+                logger.warning(
+                    f"Service Mode command rejected: {sanitize_debug_data(str(e))}"
+                )
+                return {"status": "error", "error": str(e)}, 400
+            logger.error(f"Unexpected error during command execution: {sanitize_debug_data(str(e))}")
+            return {"status": "error", "error": f"Unexpected error: {str(e)}"}, 500
+        except KeeperApiError as e:
+            if is_throttle_error(e):
+                return throttle_error_response(e.message or str(e), e.result_code)
+            logger.error(f"Unexpected error during command execution: {sanitize_debug_data(str(e))}")
+            return {"status": "error", "error": f"Unexpected error: {str(e)}"}, 500
+        except Exception as e:
+            if is_throttle_error(e):
+                return throttle_error_response(str(e))
+            # Log unexpected errors and return a proper error response
+            logger.error(f"Unexpected error during command execution: {sanitize_debug_data(str(e))}")
+            return {"status": "error", "error": f"Unexpected error: {str(e)}"}, 500

@@ -1,0 +1,479 @@
+from __future__ import annotations
+import argparse
+from ..discover import PAMGatewayActionDiscoverCommandBase, GatewayContext
+from ...display import bcolors
+from . import load_pam_record
+from ...discovery_common.infrastructure import Infrastructure
+from ...discovery_common.record_link import RecordLink
+from ...discovery_common.types import UserAcl, DiscoveryObject, ServiceEnum
+from ...discovery_common.constants import PAM_USER, PAM_MACHINE, PAM_DATABASE, PAM_DIRECTORY
+from ...keeper_dag import EdgeType
+from .graph import PAMDebugGraphCommand
+import time
+import re
+import json
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ...vault import TypedRecord
+    from ...params import KeeperParams
+    from  ...discovery_common.types import UserAclServiceNames, UserAclServiceNamesItem
+
+
+class PAMDebugInfoCommand(PAMGatewayActionDiscoverCommandBase):
+    parser = argparse.ArgumentParser(prog='pam action debug info')
+
+    type_name_map = {
+        PAM_USER: "PAM User",
+        PAM_MACHINE: "PAM Machine",
+        PAM_DATABASE: "PAM Database",
+        PAM_DIRECTORY: "PAM Directory",
+    }
+
+    TITLES = {
+        ServiceEnum.service: "Service",
+        ServiceEnum.task: "Scheduled Task",
+        ServiceEnum.iis_pool: "IIS Pool",
+        ServiceEnum.com: "COM (Classic)",
+        ServiceEnum.dcom: "DCOM",
+        ServiceEnum.com_plus: "COM Plus",
+        ServiceEnum.scom: "SCOM",
+    }
+
+    # The record to base everything on.
+    parser.add_argument('--record-uid', '-i', '-r', required=True, dest='record_uid', action='store',
+                        help='Keeper PAM record UID.')
+
+    def get_parser(self):
+        return PAMDebugInfoCommand.parser
+
+    def execute(self, params: KeeperParams, **kwargs):
+
+        record_uid = kwargs.get("record_uid")
+        record = load_pam_record(params, record_uid)  # type: TypedRecord | None
+        if record is None:
+            print(f"{bcolors.FAIL}Record does not exists.{bcolors.ENDC}")
+            return
+
+        if record.record_type not in ["pamUser", "pamMachine", "pamDatabase", "pamDirectory"]:
+            if re.search(r'^pam.+Configuration$', record.record_type) is None:
+                print(f"{bcolors.FAIL}The record is a {record.record_type}. This is not a PAM record.{bcolors.ENDC}")
+                return
+
+        resource_uid = None
+        controller_uid = None
+
+        record_rotation = params.record_rotation_cache.get(record_uid)
+
+        # Rotation setting don't exist, check each configuration for an active record.
+        if record_rotation is None:
+            print(f"{bcolors.WARNING}PAM record does not have protobuf rotation settings, "
+                  f"checking all configurations.{bcolors.ENDC}")
+
+            # Get all the PAM configuration records in the Vault; configurations are version 6
+            configuration_records = GatewayContext.get_configuration_records(params=params)
+            if len(configuration_records) == 0:
+                print(f"{bcolors.FAIL}Cannot find any PAM configuration records in the Vault{bcolors.ENDC}")
+
+            for configuration_record in configuration_records:
+
+                record_link = RecordLink(record=configuration_record, params=params, use_per_graph_endpoints=False)
+                record_vertex = record_link.dag.get_vertex(record.record_uid)
+                if record_vertex is not None and record_vertex.active is True:
+                    controller_uid = configuration_record.record_uid
+                    break
+            if controller_uid is None:
+                print(f"{bcolors.FAIL}Could not find the record in any record linking graph; "
+                      f"checked all configuration records.{bcolors.ENDC}")
+                return
+
+        # Else just get information from the rotation settings
+        else:
+
+            controller_uid = record_rotation.get("configuration_uid")
+            if controller_uid is None:
+                print(f"{bcolors.FAIL}Record does not have the PAM Configuration set.{bcolors.ENDC}")
+                return
+
+            resource_uid = record_rotation.get("resource_uid")
+
+        configuration_record = load_pam_record(params, controller_uid)  # type: TypedRecord | None
+        if configuration_record is None:
+            print(f"{bcolors.FAIL}The configuration record {controller_uid} does not exist.{bcolors.ENDC}")
+            return
+
+        gateway_context = GatewayContext.from_configuration_uid(params, controller_uid)
+        if gateway_context is None:
+            print(f"{bcolors.FAIL}Could not find the gateway for configuration record.{controller_uid}{bcolors.ENDC}")
+            return
+
+        infra = Infrastructure(record=configuration_record, params=params, use_per_graph_endpoints=False)
+        infra.load()
+        record_link = RecordLink(record=configuration_record, params=params, use_per_graph_endpoints=False)
+
+        print("")
+        print(self._h("Record Information"))
+        print(f"  {self._b('Record UID')}: {record_uid}")
+        print(f"  {self._b('Record Title')}: {record.title}")
+        print(f"  {self._b('Record Type')}: {record.record_type}")
+        print(f"  {self._b('Configuration UID')}: {configuration_record.record_uid}")
+        print(f"  {self._b('Configuration Key Bytes Hex')}: {configuration_record.record_key.hex()}")
+        if resource_uid is not None:
+            print(f"  {self._b('Resource UID')}: {resource_uid}")
+
+        if gateway_context is not None:
+            print(f"  {self._b('Gateway Name')}: {gateway_context.gateway_name}")
+            print(f"  {self._b('Gateway UID')}: {gateway_context.gateway_uid}")
+        else:
+            print(f"  {self._f('Cannot get gateway information. Gateway may not be up.')}")
+        print("")
+
+        def _print_field(f):
+            if f.type == "password":
+                display_value = f"{bcolors.OKGREEN}Password is set{bcolors.ENDC}"
+                if f.value == 0 or len(f.value) == 0:
+                    display_value = f"{bcolors.WARNING}Password IS NOT set{bcolors.ENDC}"
+                print(f"   * Type: {f.type}, Label: {f.label or bcolors.OKBLUE + 'NO LABEL' + bcolors.ENDC}, "
+                      f"Value(s): {display_value}")
+            elif f.label == "privatePEMKey":
+                display_value = f"{bcolors.OKGREEN}Private Key is set{bcolors.ENDC}"
+                if field.value == 0 or len(f.value) == 0:
+                    display_value = f"{bcolors.WARNING}Private Key IS NOT set{bcolors.ENDC}"
+                print(f"   * Type: {f.type}, Label: {f.label or bcolors.OKBLUE + 'NO LABEL' + bcolors.ENDC}, "
+                      f"Value(s): {display_value}")
+            elif f.type == "secret":
+                display_value = f"{bcolors.OKGREEN}Secret value is set{bcolors.ENDC}"
+                if field.value == 0 or len(f.value) == 0:
+                    display_value = f"Secret value IS NOT set"
+                print(f"   * Type: {f.type}, Label: {f.label or bcolors.OKBLUE + 'NO LABEL' + bcolors.ENDC}, "
+                      f"Value(s): {display_value}")
+            else:
+                print(f"   * Type: {f.type}, Label: {f.label or bcolors.OKBLUE + 'NO LABEL' + bcolors.ENDC}, "
+                      f"Value(s): {f.value}")
+
+        print(self._h("Fields"))
+        print(self._b("  Record Type Fields"))
+        if record.fields is not None and len(record.fields) > 0:
+            for field in record.fields:
+                _print_field(field)
+        else:
+            print(f"{bcolors.FAIL}    Record does not have record type fields!{bcolors.ENDC}")
+        print("")
+        print(self._b("  Custom Fields"))
+        if record.custom is not None and len(record.custom) > 0:
+            for field in record.custom:
+                _print_field(field)
+        else:
+            print("    Record does not have custom fields.")
+        print("")
+
+        discovery_vertices = infra.dag.search_content({"record_uid": record.record_uid})
+        record_vertex = record_link.dag.get_vertex(record.record_uid)
+
+        if record_vertex is not None:
+            print(self._h("Record Linking Graph"))
+            graph = PAMDebugGraphCommand()
+            graph.do_list(params=params, gateway_context=gateway_context, graph_type="rl", debug_level=0,
+                          indent=1, show_data=True, record_uids=[record.record_uid])
+
+        else:
+            print(f"{bcolors.FAIL}Cannot find record in record linking.{bcolors.ENDC}")
+
+        # Only PAM User and PAM Machine can have services and tasks.
+        # This is really only Windows machines.
+        if record.record_type == PAM_USER or record.record_type == PAM_MACHINE:
+
+            # Get the user to service/task vertex.
+            record_vertex = record_link.dag.get_vertex(record_uid)
+
+            if record_vertex is not None:
+
+                # If the record is a PAM User
+                if record.record_type == PAM_USER:
+
+                    machines = []
+
+                    # Get a list of all the resources the user is the username/password on service/task.
+                    for machine_vertex in record_vertex.belongs_to_vertices():
+
+                        acl = record_link.get_acl(machine_vertex.uid, record_vertex.uid)
+                        if (acl is not None
+                                and acl.rotation_settings is not None
+                                and acl.controls_services):
+
+                            # Get the resource record
+                            machine_record = load_pam_record(params,
+                                                             machine_vertex.uid)  # type: TypedRecord | None
+
+                            # If the resource record does not exist.
+                            if machine_record is None:
+
+                                # Default the title to Unknown (in red).
+                                # See if we have an infrastructure vertex with this record UID.
+                                # If we do have it, use the title inside the first vertex's data content.
+                                title = self._f("Unknown")
+                                infra_resource_vertices = infra.dag.search_content(
+                                    {"record_uid": machine_vertex.uid})
+                                if len(infra_resource_vertices) > 0:
+                                    infra_resource_vertex = infra_resource_vertices[0]
+                                    if infra_resource_vertex.has_data is True:
+                                        content = DiscoveryObject.get_discovery_object(infra_resource_vertex)
+                                        title = content.title
+
+                                machines.append(f"  * Record {machine_vertex.uid}, {title} does not exists.")
+
+                            # Record exists; just use information from the record.
+                            else:
+                                text = f"  * {machine_record.title}, {machine_record.record_uid}, "\
+                                       f"vertex {machine_vertex.uid}"
+                                if acl.service_names is not None:
+                                    for service_name in acl.service_names:  # type: UserAclServiceNames
+                                        if len(service_name.items) > 0:
+                                            text += f"\n       + {PAMDebugInfoCommand.TITLES.get(service_name.type)}\n"
+                                            for service_item in service_name.items:
+                                                text += f"\n          . {service_item.name}"
+                                                if not service_item.via_discovery:
+                                                    text += f" (manual entry)"
+                                                text += "\n"
+                                machines.append(text)
+
+                    if len(machines) > 0:
+                        print(f"{bcolors.HEADER}Controls Services on Machine{bcolors.ENDC}")
+                        for item in machines:
+                            print(item)
+
+                # If the record is a PAM Machine
+                elif record.record_type == PAM_MACHINE:
+                    users = []
+
+                    # Get the users that are used for tasks/services on this machine.
+                    for user_vertex in record_vertex.has_vertices():
+                        user_record = load_pam_record(params, user_vertex.uid)  # type: TypedRecord | None
+                        acl = record_link.get_acl(record_vertex.uid, user_vertex.uid)
+                        if acl is not None and acl.controls_services:
+                            # If the user record does not exist.
+                            if user_record is None:
+
+                                # Default the title to Unknown (in red).
+                                # See if we have an infrastructure vertex with this record UID.
+                                # If we do have it, use the title inside the first vertex's data content.
+                                title = self._f("Unknown")
+                                infra_resource_vertices = infra.dag.search_content(
+                                    {"record_uid": user_vertex.uid})
+                                if len(infra_resource_vertices) > 0:
+                                    infra_resource_vertex = infra_resource_vertices[0]
+                                    if infra_resource_vertex.has_data is True:
+                                        content = DiscoveryObject.get_discovery_object(infra_resource_vertex)
+                                        title = content.title
+
+                                users.append(f"  * Record {user_vertex.uid}, {title} does not exists.")
+
+                            # Record exists; just use information from the record.
+                            else:
+                                users.append(f"  * {user_record.title}, {user_record.record_uid}, "
+                                             f"vertex {user_vertex.uid}")
+
+                    if len(users) > 0:
+                        print(f"{bcolors.HEADER}Users that are used for services{bcolors.ENDC}")
+                        for item in users:
+                            print(item)
+
+            else:
+                print(self._f("There are no services or schedule tasks associated with this record."))
+                print("")
+        try:
+            if len(discovery_vertices) == 0:
+                print(f"{bcolors.FAIL}Could not find any discovery infrastructure vertices for "
+                      f"{record.record_uid}{bcolors.ENDC}")
+            elif len(discovery_vertices) > 0:
+
+                if len(discovery_vertices) > 1:
+                    print(f"{bcolors.FAIL}Found multiple vertices with the record UID of "
+                          f"{record.record_uid}{bcolors.ENDC}")
+                    for vertex in discovery_vertices:
+                        print(f" * Infrastructure Vertex UID: {vertex.uid}")
+                    print("")
+
+                discovery_vertex = discovery_vertices[0]
+                content = DiscoveryObject.get_discovery_object(discovery_vertex)
+
+                missing_since = "NA"
+                if content.missing_since_ts is not None:
+                    missing_since = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(content.missing_since_ts))
+
+                print(self._h("Discovery Object Information"))
+                print(f"  {self._b('Vertex UID')}: {content.uid}")
+                print(f"  {self._b('Object ID')}: {content.id}")
+                print(f"  {self._b('Record UID')}: {content.record_uid}")
+                print(f"  {self._b('Parent Record UID')}: {content.parent_record_uid}")
+                print(f"  {self._b('Shared Folder UID')}: {content.shared_folder_uid}")
+                print(f"  {self._b('Record Type')}: {content.record_type}")
+                print(f"  {self._b('Object Type')}: {content.object_type_value}")
+                print(f"  {self._b('Ignore Object')}: {content.ignore_object}")
+                print(f"  {self._b('Rule Engine Result')}: {content.action_rules_result}")
+                print(f"  {self._b('Name')}: {content.name}")
+                print(f"  {self._b('Generated Title')}: {content.title}")
+                print(f"  {self._b('Generated Description')}: {content.description}")
+                print(f"  {self._b('Missing Since')}: {missing_since}")
+                print(f"  {self._b('Discovery Notes')}:")
+                for note in content.notes:
+                    print(f" * {note}")
+                if content.error is not None:
+                    print(f"{bcolors.FAIL}    Error: {content.error}{bcolors.ENDC}")
+                    if content.stacktrace is not None:
+                        print(f"{bcolors.FAIL}    Stack Trace:{bcolors.ENDC}")
+                        print(f"{bcolors.FAIL}{content.stacktrace}{bcolors.ENDC}")
+                print("")
+                print(f"{bcolors.HEADER}Record Type Specifics{bcolors.ENDC}")
+
+                if record.record_type == PAM_USER:
+                    print(f"  {self._b('User')}: {content.item.user}")
+                    print(f"  {self._b('DN')}: {content.item.dn}")
+                    print(f"  {self._b('Database')}: {content.item.database}")
+                    print(f"  {self._b('Active')}: {content.item.active}")
+                    print(f"  {self._b('Expired')}: {content.item.expired}")
+                    print(f"  {self._b('Source')}: {content.item.source}")
+                elif record.record_type == PAM_MACHINE:
+                    print(f"  {self._b('Host')}: {content.item.host}")
+                    print(f"  {self._b('IP')}: {content.item.ip}")
+                    print(f"  {self._b('Port')}: {content.item.port}")
+                    print(f"  {self._b('Operating System')}: {content.item.os}")
+                    print(f"  {self._b('Provider Region')}: {content.item.provider_region}")
+                    print(f"  {self._b('Provider Group')}: {content.item.provider_group}")
+                    print(f"  {self._b('Is the Gateway')}: {content.item.is_gateway}")
+                    print(f"  {self._b('Allows Admin')}: {content.item.allows_admin}")
+                    print(f"  {self._b('Admin Reason')}: {content.item.admin_reason}")
+                    print("")
+                    # If facts are not set, inside discover may not have been performed for the machine.
+                    if content.item.facts.id is not None and content.item.facts.name is not None:
+                        print(f"  {self._b('Machine Name')}: {content.item.facts.name}")
+                        print(f"  {self._b('Machine ID')}: {content.item.facts.id.machine_id}")
+                        print(f"  {self._b('Product ID')}: {content.item.facts.id.product_id}")
+                        print(f"  {self._b('Board Serial')}: {content.item.facts.id.board_serial}")
+                        print(f"  {self._b('Directories')}:")
+                        if content.item.facts.directories is not None and len(content.item.facts.directories) > 0:
+                            for directory in content.item.facts.directories:
+                                print(f"    * Directory Domain: {directory.domain}")
+                                print(f"      Software: {directory.software}")
+                                print(f"      Login Format: {directory.login_format}")
+                        else:
+                            print("    Machines is not using any directories.")
+
+                        print("")
+                        print(f"  {self._b('Services')} (Non Builtin Users):")
+                        if len(content.item.facts.services) > 0:
+                            for service in content.item.facts.services:
+                                print(f"    * {service.name} = {service.user}")
+                        else:
+                            print("    Machines has no services that are using non-builtin users.")
+
+                        print(f"  {self._b('Scheduled Tasks')} (Non Builtin Users)")
+                        if len(content.item.facts.tasks) > 0:
+                            for task in content.item.facts.tasks:
+                                print(f"    * {task.name} = {task.user}")
+                        else:
+                            print("    Machines has no schedules tasks that are using non-builtin users.")
+
+                        print(f"  {self._b('IIS Pools')} (Non Builtin Users)")
+                        if len(content.item.facts.iis_pools) > 0:
+                            for iis_pool in content.item.facts.iis_pools:
+                                print(f"    * {iis_pool.name} = {iis_pool.user}")
+                        else:
+                            print("    Machines has no IIS Pools that are using non-builtin users.")
+
+                        print(f"  {self._b('COM (classic)')} (Non Builtin Users)")
+                        if len(content.item.facts.coms) > 0:
+                            for com in content.item.facts.coms:
+                                print(f"    * {com.name} = {com.user}")
+                        else:
+                            print("    Machines has no COM (classic) applications that are using non-builtin users.")
+
+                        print(f"  {self._b('DCOM')} (Non Builtin Users)")
+                        if len(content.item.facts.dcoms) > 0:
+                            for dcom in content.item.facts.dcoms:
+                                print(f"    * {dcom.name} = {dcom.user}")
+                        else:
+                            print("    Machines has no DCOM applications that are using non-builtin users.")
+
+                        print(f"  {self._b('COM Plus')} (Non Builtin Users)")
+                        if len(content.item.facts.com_pluses) > 0:
+                            for com in content.item.facts.com_pluses:
+                                print(f"    * {com.name} = {com.user}")
+                        else:
+                            print("    Machines has no COM Plus applications that are using non-builtin users.")
+
+                        print(f"  {self._b('SCOM')} (Non Builtin Users)")
+                        if len(content.item.facts.scoms) > 0:
+                            for scom in content.item.facts.scoms:
+                                print(f"    * {scom.name} = {scom.user}")
+                        else:
+                            print("    Machines has no SCOM applications that are using non-builtin users.")
+
+                    else:
+                        print(f"{bcolors.FAIL}    Machine facts are not set. Discover inside may not have been "
+                              f"performed.{bcolors.ENDC}")
+                elif record.record_type == PAM_DATABASE:
+                    print(f"  {self._b('Host')}: {content.item.host}")
+                    print(f"  {self._b('IP')}: {content.item.ip}")
+                    print(f"  {self._b('Port')}: {content.item.port}")
+                    print(f"  {self._b('Database Type')}: {content.item.type}")
+                    print(f"  {self._b('Database')}: {content.item.database}")
+                    print(f"  {self._b('Use SSL')}: {content.item.use_ssl}")
+                    print(f"  {self._b('Provider Region')}: {content.item.provider_region}")
+                    print(f"  {self._b('Provider Group')}: {content.item.provider_group}")
+                    print(f"  {self._b('Allows Admin')}: {content.item.allows_admin}")
+                    print(f"  {self._b('Admin Reason')}: {content.item.admin_reason}")
+                elif record.record_type == PAM_DIRECTORY:
+                    print(f"  {self._b('Host')}: {content.item.host}")
+                    print(f"  {self._b('IP')}: {content.item.ip}")
+                    print(f"  {self._b('Port')}: {content.item.port}")
+                    print(f"  {self._b('Directory Type')}: {content.item.type}")
+                    print(f"  {self._b('Use SSL')}: {content.item.use_ssl}")
+                    print(f"  {self._b('Provider Region')}: {content.item.provider_region}")
+                    print(f"  {self._b('Provider Group')}: {content.item.provider_group}")
+                    print(f"  {self._b('Allows Admin')}: {content.item.allows_admin}")
+                    print(f"  {self._b('Admin Reason')}: {content.item.admin_reason}")
+                else:
+                    for k, v in content.item:
+                        print(f"  {self._b(k)}: {v}")
+
+                # Configuration records do not belong to other record; don't show.
+                if record.version != 6:
+                    print("")
+                    print(self._h("Belongs To Vertices (Parents)"))
+                    vertices = discovery_vertex.belongs_to_vertices()
+                    for vertex in vertices:
+                        try:
+                            content = DiscoveryObject.get_discovery_object(vertex)
+                            print(f"  * {content.description} ({vertex.uid})")
+                            for edge_type in [EdgeType.LINK, EdgeType.ACL, EdgeType.KEY, EdgeType.DELETION]:
+                                edge = discovery_vertex.get_edge(vertex, edge_type=edge_type)
+                                if edge is not None:
+                                    print(f"    . {edge_type}, active: {edge.active}")
+                        except Exception as err:
+                            print(f"{bcolors.FAIL}Could not get belongs to information: {err}{bcolors.ENDC}")
+
+                    if len(vertices) == 0:
+                        print(f"{bcolors.FAIL}  Does not belong to anyone{bcolors.ENDC}")
+
+                print("")
+                print(f"{bcolors.HEADER}Vertices Belonging To (Children){bcolors.ENDC}")
+                vertices = discovery_vertex.has_vertices()
+                for vertex in vertices:
+                    try:
+                        content = DiscoveryObject.get_discovery_object(vertex)
+                        print(f"  * {content.description} ({vertex.uid})")
+                        for edge_type in [EdgeType.LINK, EdgeType.ACL, EdgeType.KEY, EdgeType.DELETION]:
+                            edge = vertex.get_edge(discovery_vertex, edge_type=edge_type)
+                            if edge is not None:
+                                print(f"    . {edge_type}, active: {edge.active}")
+                    except Exception as err:
+                        print(f"{bcolors.FAIL}Could not get belonging to information: {err}{bcolors.ENDC}")
+                if len(vertices) == 0:
+                    print(f"  Does not have any children.")
+
+                print("")
+            else:
+                print(f"{bcolors.FAIL}Could not find infrastructure vertex.{bcolors.ENDC}")
+        except Exception as err:
+            print(f"{bcolors.FAIL}Could not get information on infrastructure: {err}{bcolors.ENDC}")
